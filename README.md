@@ -6,7 +6,7 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 
 - **Outbound only** — the agent opens a single WebSocket to Quilscan's backend; it never listens on any port.
 - **9-action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `restart_agent`, `update_agent`, `update_node`, `cleanup_residue`, `rescan`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
-- **Key files stay off-limits** — the agent does not edit or read key files such as `keys.yml`. It may read the node's `config.yml` for the settings page, RPC detection, and local peer ID derivation.
+- **Key files stay off-limits** — the agent does not read key files such as `keys.yml`. It reads `config.yml` locally for RPC detection and peer-ID parsing; the contents are never transmitted.
 - **Downloads are constrained** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go`.
 - **Audit log is human-readable** — every command received is appended to a flat file. You can `cat` it at any time to verify what was done and when.
 - **Token is local** — generated on install via `crypto/rand`, stored `chmod 600`. Not persisted on Quilscan's servers.
