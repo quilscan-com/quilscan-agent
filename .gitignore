@@ -1,0 +1,20 @@
+dist/
+*.test
+*.out
+.idea/
+.vscode/
+/agent
+
+# Local secrets / runtime state
+.env
+.env.*
+/token
+state.yaml
+config.yaml
+config.yml
+keys.yml
+*.pem
+*.key
+*.p12
+*.crt
+*.log

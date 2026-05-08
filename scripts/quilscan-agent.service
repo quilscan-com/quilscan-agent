@@ -1,0 +1,14 @@
+[Unit]
+Description=Quilscan Agent — remote controller for Quilibrium node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/quilscan-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
