@@ -18,3 +18,4 @@ keys.yml
 *.p12
 *.crt
 *.log
+*_test.go
