@@ -469,5 +469,5 @@ func copyFile(src, dst string, mode os.FileMode) error {
 type ReleaseDownloader struct{}
 
 func (ReleaseDownloader) Download(version, platform, destDir string) error {
-	return release.DownloadAll(release.ReleaseBaseURL, release.FilesFor(version, platform), destDir)
+	return release.DownloadRelease(release.ReleaseBaseURL, version, platform, destDir)
 }
