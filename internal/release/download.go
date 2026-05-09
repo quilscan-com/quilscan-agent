@@ -9,10 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ReleaseBaseURL is hardcoded for supply-chain auditability.
 const ReleaseBaseURL = "https://releases.quilibrium.com/"
+
+// DownloadTimeout bounds each release artifact fetch. A stalled CDN/socket
+// should fail the current install/update attempt instead of leaving the agent
+// command in an unbounded downloading state.
+const DownloadTimeout = 5 * time.Minute
+
+var downloadHTTPClient = &http.Client{Timeout: DownloadTimeout}
 
 // Observed signer indices as of 2026-04. Agent downloads whichever are
 // published; the node itself verifies threshold at runtime.
@@ -61,7 +69,7 @@ func DownloadAll(baseURL string, names []string, destDir string) error {
 }
 
 func downloadOne(url, dst string) error {
-	resp, err := http.Get(url)
+	resp, err := downloadHTTPClient.Get(url)
 	if err != nil {
 		return err
 	}
