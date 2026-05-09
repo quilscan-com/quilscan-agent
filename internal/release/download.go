@@ -3,11 +3,14 @@
 package release
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,10 +24,6 @@ const ReleaseBaseURL = "https://releases.quilibrium.com/"
 const DownloadTimeout = 5 * time.Minute
 
 var downloadHTTPClient = &http.Client{Timeout: DownloadTimeout}
-
-// Observed signer indices as of 2026-04. Agent downloads whichever are
-// published; the node itself verifies threshold at runtime.
-var signerIndices = []int{1, 2, 10, 13, 14, 16, 17}
 
 // DetectPlatform maps Go runtime GOOS/GOARCH to the release file suffix.
 // Supported: linux-amd64, linux-arm64, darwin-arm64. Unknown combos return empty.
@@ -42,15 +41,103 @@ func DetectPlatform(goos, goarch string) string {
 	return ""
 }
 
-// FilesFor returns the file list for a version + platform: binary, .dgst, and
-// one .dgst.sig.N per known signer index.
-func FilesFor(version, platform string) []string {
-	base := fmt.Sprintf("node-%s-%s", version, platform)
-	names := []string{base, base + ".dgst"}
-	for _, i := range signerIndices {
-		names = append(names, fmt.Sprintf("%s.dgst.sig.%d", base, i))
+// BaseName returns the versioned Quilibrium node artifact prefix.
+func BaseName(version, platform string) string {
+	return fmt.Sprintf("node-%s-%s", version, platform)
+}
+
+// FilesForManifest returns the release files for a version + platform from the
+// official /release manifest. Signature suffixes are intentionally discovered
+// dynamically because the signer index set can change between node releases.
+func FilesForManifest(raw, version, platform string) ([]string, error) {
+	base := BaseName(version, platform)
+	binary := false
+	digest := false
+	sigSeen := map[string]bool{}
+	sigPrefix := base + ".dgst.sig."
+	sigPattern := regexp.MustCompile("^" + regexp.QuoteMeta(sigPrefix) + `[0-9]+$`)
+
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		name := releaseFileName(sc.Text())
+		switch {
+		case name == base:
+			binary = true
+		case name == base+".dgst":
+			digest = true
+		case sigPattern.MatchString(name):
+			sigSeen[name] = true
+		}
 	}
-	return names
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if !binary {
+		return nil, fmt.Errorf("release manifest missing %s", base)
+	}
+	if !digest {
+		return nil, fmt.Errorf("release manifest missing %s.dgst", base)
+	}
+	if len(sigSeen) == 0 {
+		return nil, fmt.Errorf("release manifest missing %s*. signatures", sigPrefix)
+	}
+	sigs := make([]string, 0, len(sigSeen))
+	for name := range sigSeen {
+		sigs = append(sigs, name)
+	}
+	sort.Slice(sigs, func(i, j int) bool {
+		return signatureSuffixLess(sigs[i], sigs[j], sigPrefix)
+	})
+	files := []string{base, base + ".dgst"}
+	files = append(files, sigs...)
+	return files, nil
+}
+
+func releaseFileName(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	line = strings.Trim(line, `"'`)
+	if i := strings.IndexByte(line, '?'); i >= 0 {
+		line = line[:i]
+	}
+	if i := strings.IndexByte(line, '#'); i >= 0 {
+		line = line[:i]
+	}
+	return filepath.Base(line)
+}
+
+func signatureSuffixLess(a, b, prefix string) bool {
+	ai := strings.TrimPrefix(a, prefix)
+	bi := strings.TrimPrefix(b, prefix)
+	if len(ai) != len(bi) {
+		return len(ai) < len(bi)
+	}
+	return ai < bi
+}
+
+// FilesFor returns the minimum fixed artifacts for a version + platform. The
+// complete bundle, including dynamic .dgst.sig.N files, must come from
+// FilesForManifest.
+func FilesFor(version, platform string) []string {
+	base := BaseName(version, platform)
+	return []string{base, base + ".dgst"}
+}
+
+// DownloadRelease fetches the official manifest, discovers all signature
+// sidecars for the requested bundle, then downloads the exact listed files.
+func DownloadRelease(baseURL, version, platform, destDir string) error {
+	manifestURL := strings.TrimRight(baseURL, "/") + "/release"
+	raw, err := fetchText(manifestURL)
+	if err != nil {
+		return fmt.Errorf("fetch release manifest: %w", err)
+	}
+	names, err := FilesForManifest(raw, version, platform)
+	if err != nil {
+		return err
+	}
+	return DownloadAll(baseURL, names, destDir)
 }
 
 // DownloadAll fetches every name from baseURL into destDir. Returns the first
@@ -66,6 +153,22 @@ func DownloadAll(baseURL string, names []string, destDir string) error {
 		}
 	}
 	return nil
+}
+
+func fetchText(url string) (string, error) {
+	resp, err := downloadHTTPClient.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 func downloadOne(url, dst string) error {
