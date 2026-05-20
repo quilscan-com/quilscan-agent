@@ -11,7 +11,8 @@
 //
 //  3. Latest-version poll (1h): GET https://releases.quilibrium.com/release,
 //     compare against state.NodeVersion, fold into node_status as
-//     node_update_available + latest_node_version.
+//     node_update_available + latest_node_version. The same cadence also
+//     polls qclient-release when qclient is installed.
 //
 // All loops swallow individual errors — they're best-effort observability,
 // not critical path.
@@ -37,6 +38,8 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinfo"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinstall"
 	"github.com/quilscan-com/quilscan-agent/internal/peerinfo"
+	"github.com/quilscan-com/quilscan-agent/internal/qclient"
+	"github.com/quilscan-com/quilscan-agent/internal/release"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 	"gopkg.in/yaml.v3"
 )
@@ -58,12 +61,14 @@ type ServiceCtl interface {
 
 // Loop holds the dependencies for the reconcile goroutines.
 type Loop struct {
-	StatePath        string
-	UnitName         string // node service identifier (systemd unit / launchd label)
-	BinaryPath       string // node binary path
-	ManagedConfigDir string
-	UnitDir          string
-	Sender           Sender
+	StatePath         string
+	UnitName          string // node service identifier (systemd unit / launchd label)
+	BinaryPath        string // node binary path
+	QClientBinaryPath string
+	ManagedConfigDir  string
+	UnitDir           string
+	Platform          string // release platform suffix, e.g. linux-amd64
+	Sender            Sender
 
 	// Agent paths surfaced to the Settings tab. Populated from
 	// config.DefaultConfig in cmd/agent/main.go so the same loop emits
@@ -92,11 +97,14 @@ type Loop struct {
 
 	// LatestVersionURL points at the source-of-truth release endpoint.
 	// Defaults to https://releases.quilibrium.com/release.
-	LatestVersionURL     string
-	LatestVersionFetcher func(string) (string, error)
+	LatestVersionURL            string
+	LatestVersionFetcher        func(string) (string, error)
+	LatestQClientVersionURL     string
+	LatestQClientVersionFetcher func(string, string) (string, error)
 
 	NodeInfoRunner      func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
 	PeerInfoRunner      func(context.Context, peerinfo.RunRequest, time.Duration) (int, bool, error)
+	QClientStatusRunner func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
 	PeerIDFromJournaler func(context.Context, string, int, time.Duration) string
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
@@ -120,11 +128,13 @@ type Loop struct {
 const configReadLimit = 256 * 1024
 
 const defaultLatestVersionURL = "https://releases.quilibrium.com/release"
+const defaultLatestQClientVersionURL = "https://releases.quilibrium.com/qclient-release"
 const unknownPeerID = "--"
 
 var nodeVersionPattern = regexp.MustCompile(`\b(?:node-)?([0-9]+(?:\.[0-9]+){3})(?:-[A-Za-z0-9_-]+)?\b`)
 
 const rustNodeReleaseFloor = "2.1.0.23"
+const rustNodeInfoCompatVersion = "0.1.0"
 
 // Run blocks until ctx is cancelled, ticking each loop on its own schedule.
 func (l *Loop) Run(ctx context.Context) {
@@ -149,6 +159,9 @@ func (l *Loop) Run(ctx context.Context) {
 	}
 	if l.LatestVersionURL == "" {
 		l.LatestVersionURL = defaultLatestVersionURL
+	}
+	if l.LatestQClientVersionURL == "" {
+		l.LatestQClientVersionURL = defaultLatestQClientVersionURL
 	}
 	l.nodeStatus = map[string]interface{}{}
 
@@ -217,11 +230,12 @@ func (l *Loop) runVerify() {
 		state = &config.State{}
 	}
 	detection := nodeinstall.Detect(nodeinstall.Paths{
-		BinaryPath:       l.BinaryPath,
-		ManagedConfigDir: l.managedConfigDir(),
-		StatePath:        l.StatePath,
-		UnitFilePath:     svcctl.UnitFilePath(l.UnitDir, l.UnitName),
-		ProcessRunning:   processRunning("quilibrium-node"),
+		BinaryPath:        l.BinaryPath,
+		ManagedConfigDir:  l.managedConfigDir(),
+		RecordedConfigDir: state.ConfigPath,
+		StatePath:         l.StatePath,
+		UnitFilePath:      svcctl.UnitFilePath(l.UnitDir, l.UnitName),
+		ProcessRunning:    processRunning("quilibrium-node"),
 	})
 
 	signals := 0
@@ -242,10 +256,16 @@ func (l *Loop) runVerify() {
 	if started := l.serviceStartedAt(l.UnitName); !started.IsZero() {
 		state.LastStartedAt = started.UTC()
 	}
+	qclientInstalled := l.qclientInstalled()
 	nodePatch := map[string]interface{}{
-		"install_source": state.InstallSource,
-		"node_managed":   state.InstallSource != "migrated",
-		"node_residues":  detection.Residues,
+		"install_source":      state.InstallSource,
+		"node_managed":        detection.HasNode && state.InstallSource != "migrated",
+		"node_residues":       detection.Residues,
+		"has_qclient":         qclientInstalled,
+		"qclient_binary_path": l.qclientBinaryPath(),
+	}
+	if !qclientInstalled {
+		nodePatch["qclient_status"] = "not_installed"
 	}
 	if detection.HasNode {
 		nodePatch["node_running_workers"] = int64(0)
@@ -267,7 +287,7 @@ func (l *Loop) runVerify() {
 				}
 				if latest := l.statusString("latest_node_version"); latest != "" {
 					nodePatch["latest_node_version"] = latest
-					nodePatch["node_update_available"] = latest != info.Version
+					nodePatch["node_update_available"] = releaseVersionNewerThan(latest, info.Version)
 				}
 			}
 			nodePatch["node_running_workers"] = info.RunningWorkers
@@ -276,7 +296,7 @@ func (l *Loop) runVerify() {
 		if rustNode {
 			if latest := l.statusString("latest_node_version"); latest != "" && state.NodeVersion != "" {
 				nodePatch["latest_node_version"] = latest
-				nodePatch["node_update_available"] = latest != state.NodeVersion
+				nodePatch["node_update_available"] = releaseVersionNewerThan(latest, state.NodeVersion)
 			}
 			if status := l.readRuntimeStatusFromLogs(); status != nil {
 				if status.TotalAllocations > 0 {
@@ -288,6 +308,33 @@ func (l *Loop) runVerify() {
 				if status.Peers > 0 {
 					nodePatch["node_connections"] = status.Peers
 				}
+			}
+		}
+		if qclientInstalled {
+			if qstatus := l.readQClientProverStatus(state); qstatus != nil {
+				applyQClientStatus(nodePatch, qstatus)
+				if qstatus.PeerID != "" && isLegacyPeerID(qstatus.PeerID) {
+					foundPeerID = qstatus.PeerID
+				}
+				qclientRustNode := rustNode || releaseVersionAtLeast(qstatus.Version, rustNodeReleaseFloor)
+				if qclientRustNode {
+					if qstatus.Version != "" {
+						nodePatch["node_info_version"] = qstatus.Version
+						nodePatch["current_node_version"] = qstatus.Version
+						if state.NodeVersion != qstatus.Version {
+							state.NodeVersion = qstatus.Version
+							_ = config.SaveState(l.StatePath, state)
+						}
+					}
+					if qstatus.AllocatedWorkers > 0 {
+						nodePatch["node_running_workers"] = qstatus.AllocatedWorkers
+					}
+					if qstatus.LastReceived > 0 {
+						nodePatch["node_frame_height"] = qstatus.LastReceived
+					}
+				}
+			} else {
+				nodePatch["qclient_status"] = "unavailable"
 			}
 		}
 		if foundPeerID == "" {
@@ -342,11 +389,14 @@ func (l *Loop) runVerify() {
 	l.updateNodeStatus(nodePatch)
 	if l.Sender != nil {
 		meta := map[string]interface{}{
-			"type":           "meta_update",
-			"has_node":       detection.HasNode,
-			"node_version":   state.NodeVersion,
-			"install_source": state.InstallSource,
-			"node_residues":  detection.Residues,
+			"type":                "meta_update",
+			"has_node":            detection.HasNode,
+			"has_qclient":         qclientInstalled,
+			"qclient_version":     state.QClientVersion,
+			"qclient_binary_path": l.qclientBinaryPath(),
+			"node_version":        state.NodeVersion,
+			"install_source":      state.InstallSource,
+			"node_residues":       detection.Residues,
 		}
 		if peerID, _ := nodePatch["peer_id"].(string); peerID != "" {
 			meta["peer_id"] = peerID
@@ -443,6 +493,55 @@ func (l *Loop) readRuntimeStatusFromLogs() *nodeinfo.RuntimeStatus {
 	return nodeinfo.RuntimeStatusFromJournal(context.Background(), l.UnitName, 1000, 5*time.Second)
 }
 
+func (l *Loop) qclientBinaryPath() string {
+	if l.QClientBinaryPath != "" {
+		return l.QClientBinaryPath
+	}
+	return "/usr/local/bin/qclient"
+}
+
+func (l *Loop) qclientInstalled() bool {
+	st, err := os.Stat(l.qclientBinaryPath())
+	return err == nil && !st.IsDir()
+}
+
+func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatus {
+	runner := l.QClientStatusRunner
+	if runner == nil {
+		runner = qclient.Run
+	}
+	cfg := l.nodeInfoConfigPath(state)
+	req := qclient.RunRequest{
+		BinaryPath: l.qclientBinaryPath(),
+		ConfigPath: cfg,
+		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
+	}
+	status, err := runner(context.Background(), req, 8*time.Second)
+	if err != nil {
+		return nil
+	}
+	return status
+}
+
+func applyQClientStatus(patch map[string]interface{}, status *qclient.ProverStatus) {
+	if status == nil {
+		return
+	}
+	patch["qclient_status"] = "reachable"
+	if !status.Reachable {
+		patch["qclient_status"] = "unreachable"
+	}
+	patch["qclient_reachable"] = status.Reachable
+	patch["qclient_peer_id"] = status.PeerID
+	patch["qclient_node_version"] = status.Version
+	patch["qclient_seniority"] = status.Seniority
+	patch["qclient_peer_score"] = status.PeerScore
+	patch["qclient_running_workers"] = status.RunningWorkers
+	patch["qclient_allocated_workers"] = status.AllocatedWorkers
+	patch["qclient_last_received"] = status.LastReceived
+	patch["qclient_last_global_head"] = status.LastGlobalHead
+}
+
 func nodeCommandWorkDir(configPath, managedConfigDir string) string {
 	if configPath != "" {
 		return filepath.Dir(filepath.Clean(configPath))
@@ -454,6 +553,9 @@ func nodeCommandWorkDir(configPath, managedConfigDir string) string {
 }
 
 func usesRustNodeCommands(state *config.State, info *nodeinfo.Info) bool {
+	if info != nil && strings.TrimSpace(info.Version) == rustNodeInfoCompatVersion {
+		return true
+	}
 	if info != nil && releaseVersionAtLeast(info.Version, rustNodeReleaseFloor) {
 		return true
 	}
@@ -478,6 +580,23 @@ func releaseVersionAtLeast(v, floor string) bool {
 		}
 	}
 	return true
+}
+
+func releaseVersionNewerThan(candidate, current string) bool {
+	a, okA := parseReleaseVersion(candidate)
+	b, okB := parseReleaseVersion(current)
+	if !okA || !okB {
+		return false
+	}
+	for i := range a {
+		if a[i] > b[i] {
+			return true
+		}
+		if a[i] < b[i] {
+			return false
+		}
+	}
+	return false
 }
 
 func parseReleaseVersion(v string) ([4]int, bool) {
@@ -533,6 +652,7 @@ func (l *Loop) broadcastSystemFilesIfChanged(stateCfgPath string) {
 		"agent_audit_log_path":    l.AgentAuditLogPath,
 		"agent_service_unit_path": agentUnitPath,
 		"node_binary_path":        l.BinaryPath,
+		"qclient_binary_path":     l.qclientBinaryPath(),
 		"node_managed_config_dir": l.managedConfigDir(),
 		"node_service_unit_path":  nodeUnitPath,
 	}
@@ -551,7 +671,7 @@ func (l *Loop) broadcastSystemFilesIfChanged(stateCfgPath string) {
 	for _, k := range []string{
 		"agent_binary_path", "agent_token_path", "agent_config_yaml_path",
 		"agent_state_yaml_path", "agent_audit_log_path", "agent_service_unit_path",
-		"node_binary_path", "node_managed_config_dir", "node_service_unit_path",
+		"node_binary_path", "qclient_binary_path", "node_managed_config_dir", "node_service_unit_path",
 		"node_config_dir", "node_keys_path", "node_worker_store_dir",
 	} {
 		if v, ok := patch[k].(string); ok {
@@ -613,7 +733,7 @@ func (l *Loop) broadcastConfigYAMLIfChanged(cfgDir string) {
 		"rpc_rest_multiaddr": rpcState.REST,
 	}
 	if !rpcState.Configured {
-		patch["rpc_config_hint"] = "Set listenGrpcMultiaddr and listenRESTMultiaddr in config.yml to enable local node data."
+		patch["rpc_config_hint"] = "Enable local gRPC/REST in config.yml to improve node information accuracy."
 	}
 	l.updateNodeStatus(patch)
 }
@@ -673,14 +793,16 @@ func (l *Loop) runDu() {
 	})
 }
 
-// runVersionPoll fetches the canonical "what's the latest node version" string
-// and folds it into node_status. Frontend uses node_update_available as the
-// banner trigger.
+// runVersionPoll fetches canonical latest version strings and folds them into
+// node_status. Frontend uses *_update_available as the banner/icon trigger.
 func (l *Loop) runVersionPoll() {
 	state, err := config.LoadState(l.StatePath)
 	if err != nil {
 		return
 	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	patch := map[string]interface{}{}
+
 	current := state.NodeVersion
 	if observed := l.statusString("node_info_version"); observed != "" {
 		current = observed
@@ -690,16 +812,37 @@ func (l *Loop) runVersionPoll() {
 		fetcher = fetchLatestVersion
 	}
 	latest, err := fetcher(l.LatestVersionURL)
-	if err != nil || latest == "" {
-		return
+	if err == nil && latest != "" {
+		available := releaseVersionNewerThan(latest, current)
+		patch["current_node_version"] = current
+		patch["latest_node_version"] = latest
+		patch["node_update_available"] = available
+		patch["version_polled_at"] = now
 	}
-	available := current != "" && latest != current
-	l.updateNodeStatus(map[string]interface{}{
-		"current_node_version":  current,
-		"latest_node_version":   latest,
-		"node_update_available": available,
-		"version_polled_at":     time.Now().UTC().Format(time.RFC3339),
-	})
+
+	if l.qclientInstalled() {
+		qclientCurrent := state.QClientVersion
+		if observed := l.statusString("qclient_version"); observed != "" {
+			qclientCurrent = observed
+		}
+		qclientFetcher := l.LatestQClientVersionFetcher
+		if qclientFetcher == nil {
+			qclientFetcher = fetchLatestQClientVersion
+		}
+		latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+		if err == nil && latestQClient != "" {
+			patch["qclient_version"] = qclientCurrent
+			patch["latest_qclient_version"] = latestQClient
+			patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
+			patch["qclient_version_polled_at"] = now
+		}
+	} else {
+		patch["qclient_update_available"] = false
+	}
+
+	if len(patch) > 0 {
+		l.updateNodeStatus(patch)
+	}
 }
 
 // PatchNodeStatus is the exported entry point so command handlers (e.g.
@@ -802,6 +945,26 @@ func fetchLatestVersion(url string) (string, error) {
 		return "", err
 	}
 	return parseLatestVersion(string(b)), nil
+}
+
+func fetchLatestQClientVersion(url, platform string) (string, error) {
+	if platform == "" {
+		return "", fmt.Errorf("missing platform")
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	return release.LatestVersionForPrefix(string(b), "qclient", platform), nil
 }
 
 func parseLatestVersion(raw string) string {

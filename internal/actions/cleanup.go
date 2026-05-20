@@ -26,13 +26,15 @@ type SystemdControl interface {
 
 // CleanupDeps wires the dependencies for the cleanup_residue handler.
 type CleanupDeps struct {
-	StatePath        string // /etc/quilscan-agent/state.yaml
-	ManagedConfigDir string // /var/lib/quilscan/node/.config
-	UnitName         string // systemd unit name OR launchd label
-	BackupRootDir    string // /var/lib/quilscan/backups
-	UnitDir          string // systemd unit dir OR LaunchAgents dir
-	Systemd          SystemdControl
-	EmitRaw          func(map[string]interface{})
+	StatePath         string // /etc/quilscan-agent/state.yaml
+	ManagedConfigDir  string // /var/lib/quilscan/node/.config
+	BinaryPath        string // /usr/local/bin/quilibrium-node
+	QClientBinaryPath string // /usr/local/bin/qclient
+	UnitName          string // systemd unit name OR launchd label
+	BackupRootDir     string // /var/lib/quilscan/backups
+	UnitDir           string // systemd unit dir OR LaunchAgents dir
+	Systemd           SystemdControl
+	EmitRaw           func(map[string]interface{})
 	// PatchNodeStatus, when set, lets cleanup zero out the reconcile loop's
 	// in-memory snapshot so the next push frame and any handler that reads
 	// the cache (e.g. update_node) sees a clean slate immediately, not 60s
@@ -48,10 +50,9 @@ type CleanupItem struct {
 }
 
 // NewCleanupResidueHandler returns a handler that stops the orphan node,
-// moves residue artifacts (managed .config dir, agent state file, service
-// definition) into a timestamped backup directory, and asks the service
-// manager to reload if needed. The node binary is intentionally never touched:
-// if it exists, has_node is true and the user should run force install instead.
+// moves residue artifacts (managed .config dir, binaries, signature bundles,
+// agent state file, service definition) into a timestamped backup directory,
+// and asks the service manager to reload if needed.
 func NewCleanupResidueHandler(d CleanupDeps) Handler {
 	return func(c Command, emit Emitter) error {
 		emit(Status{ID: c.ID, Step: "preparing", Progress: 0.05})
@@ -119,6 +120,19 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 			items = append(items, CleanupItem{Label: label, From: src, To: dst})
 		}
 
+		mvBinaryBundle := func(binary, label string) {
+			if binary == "" {
+				return
+			}
+			mvBackup(binary, label+" binary")
+			mvBackup(binary+".dgst", label+" digest")
+			for _, sig := range signatureFiles(binary) {
+				mvBackup(sig, label+" signature")
+			}
+		}
+
+		mvBinaryBundle(d.BinaryPath, "node")
+		mvBinaryBundle(d.QClientBinaryPath, "qclient")
 		mvBackup(d.ManagedConfigDir, "managed .config directory")
 		mvBackup(unitFile, "systemd unit")
 		mvBackup(d.StatePath, "agent state file")
@@ -132,20 +146,25 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 		// the 60s reconcile tick re-detects the world.
 		if d.PatchNodeStatus != nil {
 			d.PatchNodeStatus(map[string]interface{}{
-				"node_residues":         []string{},
-				"config_path":           "",
-				"current_node_version":  "",
-				"node_info_version":     "",
-				"latest_node_version":   "",
-				"node_update_available": false,
-				"peer_id":               "",
-				"node_running_workers":  int64(0),
-				"node_active_workers":   int64(0),
-				"node_connections":      nil,
-				"install_source":        "",
-				"node_managed":          false,
-				"node_disk_bytes":       int64(0),
-				"node_disk_sub":         "",
+				"node_residues":            []string{},
+				"config_path":              "",
+				"current_node_version":     "",
+				"node_info_version":        "",
+				"latest_node_version":      "",
+				"node_update_available":    false,
+				"peer_id":                  "",
+				"node_running_workers":     int64(0),
+				"node_active_workers":      int64(0),
+				"node_connections":         nil,
+				"install_source":           "",
+				"node_managed":             false,
+				"node_disk_bytes":          int64(0),
+				"node_disk_sub":            "",
+				"has_qclient":              false,
+				"qclient_status":           "not_installed",
+				"qclient_version":          "",
+				"latest_qclient_version":   "",
+				"qclient_update_available": false,
 			})
 		}
 
@@ -161,6 +180,14 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 		return nil
 	}
+}
+
+func signatureFiles(binary string) []string {
+	files, err := filepath.Glob(binary + ".dgst.sig.*")
+	if err != nil {
+		return nil
+	}
+	return files
 }
 
 func pgrepFirst(name string) int {

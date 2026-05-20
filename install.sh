@@ -30,6 +30,20 @@ case "$(uname -s)-$(uname -m)" in
   *) echo "Unsupported platform: $(uname -s)-$(uname -m)"; exit 1 ;;
 esac
 
+print_node_blocker_message() {
+  local os_label="$1"
+  shift
+  echo "" >&2
+  echo "Existing Quilibrium node files were detected on this ${os_label}:" >&2
+  for path in "$@"; do echo "  - $path" >&2; done
+  echo "" >&2
+  echo "quilscan-agent now requires a clean node environment before install." >&2
+  echo "These files are treated as your own existing node and will not be adopted automatically." >&2
+  echo "" >&2
+  echo "Move or back up the listed files first, then re-run this installer." >&2
+  echo "If you want Quilscan to manage that old node later, install the agent after cleanup and use Migrate Existing from the dashboard." >&2
+}
+
 # ─────────────────────────────────────────────────────────────
 # macOS branch (LaunchAgent / user-scope, no sudo)
 # ─────────────────────────────────────────────────────────────
@@ -66,14 +80,25 @@ install_macos() {
     exit 1
   fi
 
-  # Preserve check (informational only — node files are never overwritten):
-  local preserved=()
-  [[ -e "$node_bin" ]] && preserved+=("$node_bin")
-  [[ -e "$home/Library/LaunchAgents/com.quilscan.node.plist" ]] && preserved+=("...com.quilscan.node.plist")
-  [[ -e "$home/Library/Application Support/quilibrium/.config" ]] && preserved+=("$home/Library/Application Support/quilibrium/.config")
-  if (( ${#preserved[@]} > 0 )); then
-    echo "Existing Quilibrium node files detected (preserved):"
-    for p in "${preserved[@]}"; do echo "  - $p"; done
+  local node_blockers=()
+  [[ -e "$node_bin" ]] && node_blockers+=("$node_bin")
+  [[ -e "$node_bin.dgst" ]] && node_blockers+=("$node_bin.dgst")
+  for sig in "$node_bin".dgst.sig.*; do
+    [[ -e "$sig" ]] && node_blockers+=("$sig")
+  done
+  [[ -e "$bin_dir/qclient" ]] && node_blockers+=("$bin_dir/qclient")
+  [[ -e "$bin_dir/qclient.dgst" ]] && node_blockers+=("$bin_dir/qclient.dgst")
+  for sig in "$bin_dir/qclient".dgst.sig.*; do
+    [[ -e "$sig" ]] && node_blockers+=("$sig")
+  done
+  [[ -e "$home/Library/LaunchAgents/com.quilscan.node.plist" ]] && node_blockers+=("$home/Library/LaunchAgents/com.quilscan.node.plist")
+  [[ -e "$home/Library/Application Support/quilibrium/.config" ]] && node_blockers+=("$home/Library/Application Support/quilibrium/.config")
+  if pgrep -x quilibrium-node >/dev/null 2>&1; then
+    node_blockers+=("running process: quilibrium-node (pid $(pgrep -x quilibrium-node | head -1))")
+  fi
+  if (( ${#node_blockers[@]} > 0 )); then
+    print_node_blocker_message "Mac" "${node_blockers[@]}"
+    exit 1
   fi
 
   # Make sure ~/.local/bin exists and is on PATH for future shells. We modify
@@ -175,14 +200,23 @@ install_linux() {
   fi
 
   local existing=()
-  local preserved=()
   [[ -e /usr/local/bin/quilscan-agent ]]                    && existing+=("/usr/local/bin/quilscan-agent")
   [[ -e /etc/quilscan-agent ]]                              && existing+=("/etc/quilscan-agent/")
   [[ -e /etc/systemd/system/quilscan-agent.service ]]       && existing+=("/etc/systemd/system/quilscan-agent.service")
   [[ -e /var/log/quilscan-agent.log ]]                      && existing+=("/var/log/quilscan-agent.log")
-  [[ -e /var/lib/quilscan/node/.config ]]                   && preserved+=("/var/lib/quilscan/node/.config")
-  [[ -e /usr/local/bin/quilibrium-node ]]                   && preserved+=("/usr/local/bin/quilibrium-node")
-  [[ -e /etc/systemd/system/quilibrium-node.service ]]      && preserved+=("/etc/systemd/system/quilibrium-node.service")
+  local node_blockers=()
+  [[ -e /var/lib/quilscan/node/.config ]]                   && node_blockers+=("/var/lib/quilscan/node/.config")
+  [[ -e /usr/local/bin/quilibrium-node ]]                   && node_blockers+=("/usr/local/bin/quilibrium-node")
+  [[ -e /usr/local/bin/quilibrium-node.dgst ]]              && node_blockers+=("/usr/local/bin/quilibrium-node.dgst")
+  for sig in /usr/local/bin/quilibrium-node.dgst.sig.*; do
+    [[ -e "$sig" ]] && node_blockers+=("$sig")
+  done
+  [[ -e /usr/local/bin/qclient ]]                           && node_blockers+=("/usr/local/bin/qclient")
+  [[ -e /usr/local/bin/qclient.dgst ]]                      && node_blockers+=("/usr/local/bin/qclient.dgst")
+  for sig in /usr/local/bin/qclient.dgst.sig.*; do
+    [[ -e "$sig" ]] && node_blockers+=("$sig")
+  done
+  [[ -e /etc/systemd/system/quilibrium-node.service ]]      && node_blockers+=("/etc/systemd/system/quilibrium-node.service")
 
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl list-unit-files --no-pager 2>/dev/null | grep -q '^quilscan-agent\.service'; then
@@ -191,20 +225,21 @@ install_linux() {
     if systemctl is-active --quiet quilscan-agent 2>/dev/null; then
       existing+=("systemd service running: quilscan-agent (active)")
     fi
+    if systemctl is-active --quiet quilibrium-node 2>/dev/null; then
+      node_blockers+=("systemd service running: quilibrium-node.service (active)")
+    fi
   fi
   if command -v pgrep >/dev/null 2>&1 && pgrep -x quilscan-agent >/dev/null 2>&1; then
     existing+=("running process: quilscan-agent (pid $(pgrep -x quilscan-agent | head -1))")
+  fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -x quilibrium-node >/dev/null 2>&1; then
+    node_blockers+=("running process: quilibrium-node (pid $(pgrep -x quilibrium-node | head -1))")
   fi
 
   if (( ${#existing[@]} > 0 )); then
     echo "" >&2
     echo "An existing quilscan installation was detected at:" >&2
     for path in "${existing[@]}"; do echo "  - $path" >&2; done
-    if (( ${#preserved[@]} > 0 )); then
-      echo "" >&2
-      echo "Preserved Quilibrium node files detected; these do not block agent reinstall:" >&2
-      for path in "${preserved[@]}"; do echo "  - $path" >&2; done
-    fi
     echo "" >&2
     echo "Run the agent uninstall script first, then re-run this installer:" >&2
     echo "The uninstall script does not remove Quilibrium node data." >&2
@@ -212,9 +247,9 @@ install_linux() {
     exit 1
   fi
 
-  if (( ${#preserved[@]} > 0 )); then
-    echo "Preserved Quilibrium node files detected; agent install will keep them:"
-    for path in "${preserved[@]}"; do echo "  - $path"; done
+  if (( ${#node_blockers[@]} > 0 )); then
+    print_node_blocker_message "server" "${node_blockers[@]}"
+    exit 1
   fi
 
   local bin_url="$QSA_RELEASE_URL/quilscan-agent-$PLATFORM"

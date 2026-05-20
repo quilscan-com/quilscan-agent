@@ -30,7 +30,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.0"
+var version = "1.0.2"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -106,9 +106,10 @@ func run() {
 		URL:   cfg.BackendURL,
 		Token: tok,
 		Meta: ws.Meta{
-			Version: version,
-			OS:      platform,
-			HasNode: hasExistingNode(defaults),
+			Version:    version,
+			OS:         platform,
+			HasNode:    hasExistingNode(defaults),
+			HasQClient: hasExistingQClient(defaults),
 		},
 	}
 
@@ -186,6 +187,34 @@ func run() {
 	if runtime.GOOS == "darwin" {
 		installUser = "" // launchd runs jobs as the user that bootstrapped them
 	}
+	qclientInstallDeps := func() actions.QClientInstallDeps {
+		return actions.QClientInstallDeps{
+			BinaryPath: defaults.QClientBinaryPath,
+			Platform:   platform,
+			Downloader: actions.QClientReleaseDownloader{},
+			LoadState:  func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+			SaveState:  func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+			EmitRaw:    func(m map[string]interface{}) { _ = client.Send(m) },
+		}
+	}
+	var qclientInstallMu sync.Mutex
+	installQClient := func() (string, error) {
+		qclientInstallMu.Lock()
+		defer qclientInstallMu.Unlock()
+		if hasExistingQClient(defaults) {
+			client.Meta.HasQClient = true
+			if state, err := config.LoadState(defaults.StatePath); err == nil && state != nil {
+				return state.QClientVersion, nil
+			}
+			return "", nil
+		}
+		version, err := actions.InstallQClient(qclientInstallDeps())
+		if err == nil {
+			client.Meta.HasQClient = true
+		}
+		return version, err
+	}
+	go ensureQClientInstalledOnStartup(defaults, installQClient)
 	installHandler := actions.NewInstallHandler(actions.InstallDeps{
 		Downloader:       actions.ReleaseDownloader{},
 		Systemd:          sdOps,
@@ -201,6 +230,7 @@ func run() {
 		SaveState:        func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
 		EmitRaw:          func(m map[string]interface{}) { _ = client.Send(m) },
 		OnInstalled:      onInstalled,
+		InstallQClient:   installQClient,
 	})
 
 	d := &actions.Dispatcher{
@@ -226,13 +256,15 @@ func run() {
 				Svc:             svcctl.New(),
 			}),
 			"cleanup_residue": actions.NewCleanupResidueHandler(actions.CleanupDeps{
-				StatePath:        defaults.StatePath,
-				ManagedConfigDir: defaults.ManagedConfigDir,
-				UnitName:         defaults.NodeServiceName,
-				BackupRootDir:    defaults.BackupRootDir,
-				UnitDir:          defaults.UnitDir,
-				Systemd:          sdCtl,
-				EmitRaw:          func(m map[string]interface{}) { _ = client.Send(m) },
+				StatePath:         defaults.StatePath,
+				ManagedConfigDir:  defaults.ManagedConfigDir,
+				BinaryPath:        defaults.NodeBinaryPath,
+				QClientBinaryPath: defaults.QClientBinaryPath,
+				UnitName:          defaults.NodeServiceName,
+				BackupRootDir:     defaults.BackupRootDir,
+				UnitDir:           defaults.UnitDir,
+				Systemd:           sdCtl,
+				EmitRaw:           func(m map[string]interface{}) { _ = client.Send(m) },
 				PatchNodeStatus: func(patch map[string]interface{}) {
 					if rec != nil {
 						rec.PatchNodeStatus(patch)
@@ -254,6 +286,7 @@ func run() {
 					}
 				},
 			}),
+			"install_qclient": actions.NewInstallQClientHandler(qclientInstallDeps()),
 		},
 	}
 
@@ -356,8 +389,10 @@ func run() {
 		StatePath:           defaults.StatePath,
 		UnitName:            defaults.NodeServiceName,
 		BinaryPath:          defaults.NodeBinaryPath,
+		QClientBinaryPath:   defaults.QClientBinaryPath,
 		ManagedConfigDir:    defaults.ManagedConfigDir,
 		UnitDir:             defaults.UnitDir,
+		Platform:            platform,
 		Sender:              client,
 		AgentBinaryPath:     defaults.AgentBinaryPath,
 		AgentTokenPath:      defaults.TokenPath,
@@ -421,24 +456,67 @@ func run() {
 }
 
 // hasExistingNode reports whether the agent should consider a node installed
-// for the auth handshake. The stable Quilscan-managed node binary is the
-// source of truth; config/unit/process-only leftovers are reported as residue
-// by reconcile instead of making the UI show installed controls.
+// for the auth handshake. A node is managed only when both the stable binary
+// and the recorded config directory exist; binary-only or config/unit/process
+// leftovers are reported as residue by reconcile.
 func hasExistingNode(defaults config.Config) bool {
+	state, _ := config.LoadState(defaults.StatePath)
+	recordedConfig := ""
+	if state != nil {
+		recordedConfig = state.ConfigPath
+	}
 	return hasExistingNodeAt(
 		defaults.NodeBinaryPath,
-		"", // state config path is read by reconcile; handshake only needs binary check
+		recordedConfig,
 		defaults.ManagedConfigDir,
 		filepath.Join(defaults.UnitDir, defaults.NodeServiceName),
 	)
 }
 
+func hasExistingQClient(defaults config.Config) bool {
+	if defaults.QClientBinaryPath == "" {
+		return false
+	}
+	st, err := os.Stat(defaults.QClientBinaryPath)
+	return err == nil && !st.IsDir()
+}
+
+func ensureQClientInstalledOnStartup(defaults config.Config, installQClient func() (string, error)) {
+	if hasExistingQClient(defaults) || installQClient == nil {
+		return
+	}
+	if !hasRecordedNode(defaults.StatePath) {
+		log.Printf("[qclient] missing at %s; no recorded node yet, skipping startup install", defaults.QClientBinaryPath)
+		return
+	}
+	log.Printf("[qclient] missing at %s; installing latest qclient", defaults.QClientBinaryPath)
+	version, err := installQClient()
+	if err != nil {
+		log.Printf("[qclient] auto install failed: %v", err)
+		return
+	}
+	if version != "" {
+		log.Printf("[qclient] auto installed v%s", version)
+	} else {
+		log.Printf("[qclient] auto install skipped; qclient already present")
+	}
+}
+
+func hasRecordedNode(statePath string) bool {
+	state, err := config.LoadState(statePath)
+	if err != nil || state == nil || state.ConfigPath == "" {
+		return false
+	}
+	st, err := os.Stat(state.ConfigPath)
+	return err == nil && st.IsDir()
+}
+
 func hasExistingNodeAt(binaryPath, stateCfgPath, defaultCfgDir, unitFilePath string) bool {
-	_ = stateCfgPath
 	_ = unitFilePath
 	return nodeinstall.Detect(nodeinstall.Paths{
-		BinaryPath:       binaryPath,
-		ManagedConfigDir: defaultCfgDir,
+		BinaryPath:        binaryPath,
+		ManagedConfigDir:  defaultCfgDir,
+		RecordedConfigDir: stateCfgPath,
 	}).HasNode
 }
 

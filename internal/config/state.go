@@ -23,14 +23,18 @@ type State struct {
 	ServiceUnit string `yaml:"service_unit,omitempty"`
 	NodeVersion string `yaml:"node_version"`
 
+	QClientBinaryPath string `yaml:"qclient_binary_path,omitempty"`
+	QClientVersion    string `yaml:"qclient_version,omitempty"`
+
 	// Origin: how the node entered our care.
 	InstallSource string `yaml:"install_source,omitempty"` // "fresh" | "migrated"
 	MigratedFrom  string `yaml:"migrated_from,omitempty"`
 
 	// Lifecycle timestamps (UTC). Zero values mean "not yet recorded".
-	InstalledAt    time.Time `yaml:"installed_at,omitempty"`
-	LastVerifiedAt time.Time `yaml:"last_verified_at,omitempty"`
-	LastStartedAt  time.Time `yaml:"last_started_at,omitempty"`
+	InstalledAt        time.Time `yaml:"installed_at,omitempty"`
+	QClientInstalledAt time.Time `yaml:"qclient_installed_at,omitempty"`
+	LastVerifiedAt     time.Time `yaml:"last_verified_at,omitempty"`
+	LastStartedAt      time.Time `yaml:"last_started_at,omitempty"`
 
 	// RPC config patch (we set listenGrpcMultiaddr / listenRESTMultiaddr to
 	// 127.0.0.1 so the agent can talk to the node without exposing it publicly).

@@ -59,6 +59,10 @@ type InstallDeps struct {
 	// Optional post-install hook — run after Start succeeds and before the
 	// final done status. Used for the RPC config patch + node restart.
 	OnInstalled func(cfgDir, version string) error
+
+	// Optional companion install hook — run after the node is installed and
+	// local RPC is configured, before the final done status.
+	InstallQClient func() (string, error)
 }
 
 // Existing summarises a pre-existing node install for the install guard.
@@ -332,6 +336,14 @@ func NewInstallHandler(d InstallDeps) Handler {
 		if d.OnInstalled != nil && source != "migrated" {
 			emit(Status{ID: c.ID, Step: "configuring_rpc", Progress: 0.98})
 			if err := d.OnInstalled(cfgDir, version); err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+		}
+
+		if d.InstallQClient != nil {
+			emit(Status{ID: c.ID, Step: "installing_qclient", Progress: 0.99})
+			if _, err := d.InstallQClient(); err != nil {
 				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 				return err
 			}

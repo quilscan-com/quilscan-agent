@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # remove-node.sh — back up and stop the Quilibrium node managed by
-# quilscan-agent. Reads the agent state file to decide whether the install
-# was fresh or migrated; user-imported .config dirs are preserved at
-# their original path. The agent itself is left running so the user can
-# re-install or migrate again from the browser console without re-pairing.
+# quilscan-agent. Also backs up the managed qclient bundle. Reads the agent
+# state file to decide whether the install was fresh or migrated;
+# user-imported .config dirs are preserved at their original path. The agent
+# itself is left running so the user can re-install or migrate again from the
+# browser console without re-pairing.
 #
 # Linux : reads /etc/quilscan-agent/state.yaml, uses systemd to stop the
 #         node, backs up under /var/lib/quilscan/backups/. Requires sudo.
@@ -21,6 +22,7 @@ remove_node_macos() {
   local home="$HOME"
   local state="$home/Library/Application Support/quilscan-agent/state.yaml"
   local bin="$home/.local/bin/quilibrium-node"
+  local qclient_bin="$home/.local/bin/qclient"
   local plist="$home/Library/LaunchAgents/com.quilscan.node.plist"
   local fresh_cfg="$home/Library/Application Support/quilibrium/.config"
   local label="com.quilscan.node"
@@ -33,6 +35,8 @@ remove_node_macos() {
   if [ -f "$state" ]; then
     install_source=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$state" | tr -d '"')
     user_cfg=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$state" | tr -d '"')
+    qclient_bin=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$state" | tr -d '"')
+    qclient_bin=${qclient_bin:-"$home/.local/bin/qclient"}
   fi
   echo "[remove-node] install_source=${install_source:-unknown}"
   mkdir -p "$backup"
@@ -61,8 +65,19 @@ remove_node_macos() {
       items+=("$src -> $dst")
     fi
   }
+  move_binary_bundle_to_backup() {
+    local binary="$1"
+    local sig
+    move_to_backup "$binary"
+    move_to_backup "$binary.dgst"
+    for sig in "$binary".dgst.sig.*; do
+      [ -e "$sig" ] || continue
+      move_to_backup "$sig"
+    done
+  }
 
-  move_to_backup "$bin"
+  move_binary_bundle_to_backup "$bin"
+  move_binary_bundle_to_backup "$qclient_bin"
   move_to_backup "$plist"
   move_to_backup "$state"
   if [ "$install_source" = "fresh" ]; then
@@ -87,6 +102,7 @@ remove_node_macos() {
 remove_node_linux() {
   local STATE=/etc/quilscan-agent/state.yaml
   local BIN=/usr/local/bin/quilibrium-node
+  local QCLIENT_BIN=/usr/local/bin/qclient
   local UNIT_FILE=/etc/systemd/system/quilibrium-node.service
   local FRESH_CFG=/var/lib/quilscan/node/.config
   local TS
@@ -98,6 +114,8 @@ remove_node_linux() {
   if [ -f "$STATE" ]; then
     INSTALL_SOURCE=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$STATE" | tr -d '"')
     USER_CFG=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$STATE" | tr -d '"')
+    QCLIENT_BIN=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$STATE" | tr -d '"')
+    QCLIENT_BIN=${QCLIENT_BIN:-/usr/local/bin/qclient}
   fi
   echo "[remove-node] install_source=${INSTALL_SOURCE:-unknown}"
   mkdir -p "$BACKUP"
@@ -122,7 +140,18 @@ remove_node_linux() {
       ITEMS+=("$src -> $dst")
     fi
   }
-  move_to_backup "$BIN"
+  move_binary_bundle_to_backup() {
+    local binary="$1"
+    local sig
+    move_to_backup "$binary"
+    move_to_backup "$binary.dgst"
+    for sig in "$binary".dgst.sig.*; do
+      [ -e "$sig" ] || continue
+      move_to_backup "$sig"
+    done
+  }
+  move_binary_bundle_to_backup "$BIN"
+  move_binary_bundle_to_backup "$QCLIENT_BIN"
   move_to_backup "$UNIT_FILE"
   move_to_backup "$STATE"
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
