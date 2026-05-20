@@ -89,8 +89,8 @@ func WaitAndPatch(ctl SystemdController, unit, cfgDir string, timeout time.Durat
 }
 
 // patchYAMLListenAddrs reads cfgFile, fills in the two listen multiaddrs only
-// when they are absent or empty, and atomically writes the result. Any other
-// field in the file is preserved byte-for-byte (subject to YAML normalisation).
+// when they are absent or empty, and atomically writes the result. Other YAML
+// fields are preserved, and top-level keys keep their original order.
 //
 // Returns true if at least one field was modified.
 func patchYAMLListenAddrs(cfgFile string, res *PatchResult) (bool, error) {
@@ -99,17 +99,14 @@ func patchYAMLListenAddrs(cfgFile string, res *PatchResult) (bool, error) {
 		return false, fmt.Errorf("read config: %w", err)
 	}
 
-	// Decode into a generic map so we don't lose unknown fields.
-	root := map[string]interface{}{}
-	if len(raw) > 0 {
-		if err := yaml.Unmarshal(raw, &root); err != nil {
-			return false, fmt.Errorf("parse config: %w", err)
-		}
+	doc, root, err := parseConfigYAML(raw)
+	if err != nil {
+		return false, err
 	}
 
 	changed := false
 
-	if applied, current := applyMultiaddr(root, "listenGrpcMultiaddr", GRPCMultiaddr); applied {
+	if applied, current := applyMultiaddrNode(root, "listenGrpcMultiaddr", GRPCMultiaddr); applied {
 		changed = true
 		res.GRPCWasEmpty = true
 		res.GRPCFinalValue = GRPCMultiaddr
@@ -117,7 +114,7 @@ func patchYAMLListenAddrs(cfgFile string, res *PatchResult) (bool, error) {
 		res.GRPCFinalValue = current
 	}
 
-	if applied, current := applyMultiaddr(root, "listenRESTMultiaddr", RESTMultiaddr); applied {
+	if applied, current := applyMultiaddrNode(root, "listenRESTMultiaddr", RESTMultiaddr); applied {
 		changed = true
 		res.RESTWasEmpty = true
 		res.RESTFinalValue = RESTMultiaddr
@@ -129,7 +126,7 @@ func patchYAMLListenAddrs(cfgFile string, res *PatchResult) (bool, error) {
 		return false, nil
 	}
 
-	out, err := yaml.Marshal(root)
+	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return false, fmt.Errorf("encode config: %w", err)
 	}
@@ -143,23 +140,72 @@ func patchYAMLListenAddrs(cfgFile string, res *PatchResult) (bool, error) {
 	return true, nil
 }
 
-// applyMultiaddr writes desired to root[key] iff the key is missing or its
-// current value is empty. Returns (modified, currentString).
-func applyMultiaddr(root map[string]interface{}, key, desired string) (bool, string) {
-	cur, ok := root[key]
-	if !ok || cur == nil {
-		root[key] = desired
-		return true, desired
+func parseConfigYAML(raw []byte) (*yaml.Node, *yaml.Node, error) {
+	doc := &yaml.Node{Kind: yaml.DocumentNode}
+	if len(raw) == 0 {
+		root := &yaml.Node{Kind: yaml.MappingNode}
+		doc.Content = []*yaml.Node{root}
+		return doc, root, nil
 	}
-	switch v := cur.(type) {
-	case string:
-		if v == "" {
-			root[key] = desired
+
+	if err := yaml.Unmarshal(raw, doc); err != nil {
+		return nil, nil, fmt.Errorf("parse config: %w", err)
+	}
+	if doc.Kind == 0 {
+		doc.Kind = yaml.DocumentNode
+	}
+	if len(doc.Content) == 0 || doc.Content[0] == nil {
+		root := &yaml.Node{Kind: yaml.MappingNode}
+		doc.Content = []*yaml.Node{root}
+		return doc, root, nil
+	}
+
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, nil, fmt.Errorf("parse config: expected YAML mapping at document root")
+	}
+	return doc, root, nil
+}
+
+// applyMultiaddrNode writes desired to root[key] iff the key is missing or its
+// current value is empty. Existing keys are updated in place; missing keys are
+// appended so the generated config's original top-level order remains stable.
+func applyMultiaddrNode(root *yaml.Node, key, desired string) (bool, string) {
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		keyNode := root.Content[i]
+		valueNode := root.Content[i+1]
+		if keyNode == nil || keyNode.Value != key {
+			continue
+		}
+		if valueNode == nil {
+			root.Content[i+1] = scalarStringNode(desired)
 			return true, desired
 		}
-		return false, v
-	default:
-		// Unexpected type: stringify and treat as a populated user value.
-		return false, fmt.Sprintf("%v", v)
+		if valueNode.Kind == yaml.ScalarNode && valueNode.Value == "" {
+			setScalarStringNode(valueNode, desired)
+			return true, desired
+		}
+		if valueNode.Kind == yaml.ScalarNode {
+			return false, valueNode.Value
+		}
+		return false, valueNode.Value
 	}
+
+	root.Content = append(root.Content, scalarStringNode(key), scalarStringNode(desired))
+	return true, desired
+}
+
+func scalarStringNode(value string) *yaml.Node {
+	return &yaml.Node{
+		Kind:  yaml.ScalarNode,
+		Tag:   "!!str",
+		Value: value,
+	}
+}
+
+func setScalarStringNode(node *yaml.Node, value string) {
+	node.Kind = yaml.ScalarNode
+	node.Tag = "!!str"
+	node.Value = value
+	node.Style = 0
 }

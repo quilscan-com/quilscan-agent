@@ -17,6 +17,7 @@ import (
 
 // ReleaseBaseURL is hardcoded for supply-chain auditability.
 const ReleaseBaseURL = "https://releases.quilibrium.com/"
+const QClientReleaseManifest = "qclient-release"
 
 // DownloadTimeout bounds each release artifact fetch. A stalled CDN/socket
 // should fail the current install/update attempt instead of leaving the agent
@@ -43,14 +44,22 @@ func DetectPlatform(goos, goarch string) string {
 
 // BaseName returns the versioned Quilibrium node artifact prefix.
 func BaseName(version, platform string) string {
-	return fmt.Sprintf("node-%s-%s", version, platform)
+	return ArtifactBaseName("node", version, platform)
+}
+
+func ArtifactBaseName(prefix, version, platform string) string {
+	return fmt.Sprintf("%s-%s-%s", prefix, version, platform)
 }
 
 // FilesForManifest returns the release files for a version + platform from the
 // official /release manifest. Signature suffixes are intentionally discovered
 // dynamically because the signer index set can change between node releases.
 func FilesForManifest(raw, version, platform string) ([]string, error) {
-	base := BaseName(version, platform)
+	return FilesForPrefixManifest(raw, "node", version, platform)
+}
+
+func FilesForPrefixManifest(raw, prefix, version, platform string) ([]string, error) {
+	base := ArtifactBaseName(prefix, version, platform)
 	binary := false
 	digest := false
 	sigSeen := map[string]bool{}
@@ -140,6 +149,26 @@ func DownloadRelease(baseURL, version, platform, destDir string) error {
 	return DownloadAll(baseURL, names, destDir)
 }
 
+func DownloadQClientLatest(baseURL, platform, destDir string) (string, error) {
+	manifestURL := strings.TrimRight(baseURL, "/") + "/" + QClientReleaseManifest
+	raw, err := fetchText(manifestURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch qclient release manifest: %w", err)
+	}
+	version := LatestVersionForPrefix(raw, "qclient", platform)
+	if version == "" {
+		return "", fmt.Errorf("qclient release manifest missing qclient for %s", platform)
+	}
+	names, err := FilesForPrefixManifest(raw, "qclient", version, platform)
+	if err != nil {
+		return "", err
+	}
+	if err := DownloadAll(baseURL, names, destDir); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
 // DownloadAll fetches every name from baseURL into destDir. Returns the first
 // error encountered and stops.
 func DownloadAll(baseURL string, names []string, destDir string) error {
@@ -187,4 +216,46 @@ func downloadOne(url, dst string) error {
 	defer f.Close()
 	_, err = io.Copy(f, resp.Body)
 	return err
+}
+
+func LatestVersionForPrefix(raw, prefix, platform string) string {
+	best := ""
+	re := regexp.MustCompile("^" + regexp.QuoteMeta(prefix+"-") + `([0-9]+(?:\.[0-9]+){2,3})-` + regexp.QuoteMeta(platform) + `(?:$|\.)`)
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		name := releaseFileName(sc.Text())
+		m := re.FindStringSubmatch(name)
+		if len(m) != 2 {
+			continue
+		}
+		if best == "" || compareDottedVersions(m[1], best) > 0 {
+			best = m[1]
+		}
+	}
+	return best
+}
+
+func compareDottedVersions(a, b string) int {
+	ap := strings.Split(a, ".")
+	bp := strings.Split(b, ".")
+	n := len(ap)
+	if len(bp) > n {
+		n = len(bp)
+	}
+	for i := 0; i < n; i++ {
+		ai, bi := 0, 0
+		if i < len(ap) {
+			fmt.Sscanf(ap[i], "%d", &ai)
+		}
+		if i < len(bp) {
+			fmt.Sscanf(bp[i], "%d", &bi)
+		}
+		if ai > bi {
+			return 1
+		}
+		if ai < bi {
+			return -1
+		}
+	}
+	return 0
 }

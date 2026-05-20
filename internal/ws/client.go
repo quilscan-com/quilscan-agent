@@ -23,9 +23,10 @@ const MaxInboundMessageSize = 1 << 20
 
 // Meta is included in the auth handshake so backend knows what's connected.
 type Meta struct {
-	Version string `json:"version"`
-	OS      string `json:"os"`
-	HasNode bool   `json:"has_node"`
+	Version    string `json:"version"`
+	OS         string `json:"os"`
+	HasNode    bool   `json:"has_node"`
+	HasQClient bool   `json:"has_qclient"`
 }
 
 // Client is a long-running WebSocket client.
@@ -82,11 +83,12 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 
 	// auth
 	auth := map[string]interface{}{
-		"type":     "auth",
-		"token":    c.Token,
-		"version":  c.Meta.Version,
-		"os":       c.Meta.OS,
-		"has_node": c.Meta.HasNode,
+		"type":        "auth",
+		"token":       c.Token,
+		"version":     c.Meta.Version,
+		"os":          c.Meta.OS,
+		"has_node":    c.Meta.HasNode,
+		"has_qclient": c.Meta.HasQClient,
 	}
 	if err := c.writeJSON(conn, auth); err != nil {
 		return err
