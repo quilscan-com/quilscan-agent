@@ -1,18 +1,7 @@
 // Package systemd renders unit files and wraps systemctl calls.
 package systemd
 
-import (
-	"fmt"
-)
-
-// NodeMetricsAddr is the local-only Prometheus endpoint we ask the node to
-// expose. The agent's metrics collector scrapes
-//
-//	http://NodeMetricsAddr/metrics
-//
-// every few seconds and forwards selected gauges to backend. Bound to the
-// loopback interface so it never reaches the public internet.
-const NodeMetricsAddr = "127.0.0.1:49163"
+import "fmt"
 
 // UnitInput feeds the node unit template.
 //
@@ -24,8 +13,8 @@ const NodeMetricsAddr = "127.0.0.1:49163"
 //     relative to WorkDir.
 //
 //  2. Migrated install: leave ConfigPath empty and set WorkDir to the
-//     parent of the user-supplied `.config` directory. Query commands use
-//     `--config`; service startup relies on the working directory.
+//     parent of the user-supplied `.config` directory. Service startup
+//     relies on the working directory, matching the fresh install shape.
 type UnitInput struct {
 	BinaryPath string
 	User       string
@@ -36,10 +25,6 @@ type UnitInput struct {
 // RenderNodeUnit returns the systemd unit file content for the node service.
 // Template is const — users auditing can grep for it and be sure no dynamic
 // fields influence directives like ExecStart beyond BinaryPath/ConfigPath.
-//
-// The --prometheus-server flag enables the node's /metrics endpoint at
-// NodeMetricsAddr; without it the agent has no way to read live frame height
-// or process memory.
 func RenderNodeUnit(in UnitInput) string {
 	// Defence in depth: a control character in any field would either bleed
 	// into a new directive (\n, \r) or truncate the unit (\x00). Inputs are
@@ -58,11 +43,6 @@ func RenderNodeUnit(in UnitInput) string {
 			}
 		}
 	}
-	// Use double-dash long flags. Quilibrium 2.1.0.23+ uses a clap-based
-	// CLI parser that strictly requires `--` for multi-char flags;
-	// single-dash forms like `-prometheus-server` are mis-parsed as
-	// `-p` and the node fails to start. 2.1.0.22 (Go flag) accepts
-	// both `-` and `--` forms, so `--` is backwards compatible.
 	configFlag := ""
 	if in.ConfigPath != "" {
 		configFlag = " --config " + in.ConfigPath
@@ -79,12 +59,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=%s
-%sExecStart=%s%s --prometheus-server %s
+%sExecStart=%s%s
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-`, in.User, workDirLine, in.BinaryPath, configFlag, NodeMetricsAddr)
+`, in.User, workDirLine, in.BinaryPath, configFlag)
 }

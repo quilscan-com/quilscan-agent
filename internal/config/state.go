@@ -26,6 +26,21 @@ type State struct {
 	QClientBinaryPath string `yaml:"qclient_binary_path,omitempty"`
 	QClientVersion    string `yaml:"qclient_version,omitempty"`
 
+	// Node binary release source detected from the local binary sha256 and
+	// the Quilscan node manifest. This is agent-owned metadata; the node's
+	// config.yml is never modified for release bookkeeping.
+	NodeSource               string    `yaml:"node_source,omitempty"` // "releases" | "dev" | "unknown"
+	InstalledNodeVersion     string    `yaml:"installed_node_version,omitempty"`
+	NodeBaseVersion          string    `yaml:"node_base_version,omitempty"`
+	NodeBuildNumber          int       `yaml:"node_build_number,omitempty"`
+	NodeBinarySHA256         string    `yaml:"node_binary_sha256,omitempty"`
+	NodeManifestURL          string    `yaml:"node_manifest_url,omitempty"`
+	NodeManifestCheckedAt    time.Time `yaml:"node_manifest_checked_at,omitempty"`
+	LatestDevNodeVersion     string    `yaml:"latest_dev_node_version,omitempty"`
+	LatestDevNodeURL         string    `yaml:"latest_dev_node_url,omitempty"`
+	LatestDevNodeSHA256      string    `yaml:"latest_dev_node_sha256,omitempty"`
+	LatestDevNodeBuildNumber int       `yaml:"latest_dev_node_build_number,omitempty"`
+
 	// Origin: how the node entered our care.
 	InstallSource string `yaml:"install_source,omitempty"` // "fresh" | "migrated"
 	MigratedFrom  string `yaml:"migrated_from,omitempty"`
@@ -53,7 +68,7 @@ type State struct {
 }
 
 // CurrentSchemaVersion is bumped whenever State adds breaking field changes.
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 
 // LoadState reads the YAML at path; missing file returns an empty State.
 func LoadState(path string) (*State, error) {

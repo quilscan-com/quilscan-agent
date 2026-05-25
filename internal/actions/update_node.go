@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 )
 
 // NodeUpdaterDeps wires the update_node flow:
@@ -27,10 +28,12 @@ type NodeUpdaterDeps struct {
 		Stop(unit string) error
 	}
 
-	Downloader Downloader
-	LoadState  func() (*config.State, error)
-	SaveState  func(*config.State) error
-	EmitRaw    func(map[string]interface{})
+	Downloader      Downloader
+	DevInstaller    DevNodeInstaller
+	NodeManifestURL string
+	LoadState       func() (*config.State, error)
+	SaveState       func(*config.State) error
+	EmitRaw         func(map[string]interface{})
 	// PatchNodeStatus folds an authoritative patch into reconcile's cached
 	// node_status snapshot. Used right after a successful update so the
 	// stale `node_update_available: true` doesn't linger for up to an hour
@@ -61,6 +64,9 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			return fmt.Errorf("no install recorded")
 		}
 		fromVersion := state.NodeVersion
+		if state.NodeSource == nodemanifest.SourceDev {
+			return updateDevNode(c, emit, d, state)
+		}
 
 		emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
 		if err := d.StartStop.Stop(d.UnitName); err != nil {
@@ -140,6 +146,104 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 		return nil
+	}
+}
+
+func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.State) error {
+	fromVersion := state.InstalledNodeVersion
+	manifestURL := d.NodeManifestURL
+	if manifestURL == "" {
+		manifestURL = state.NodeManifestURL
+	}
+	if manifestURL == "" {
+		manifestURL = nodemanifest.DefaultURL
+	}
+	installer := d.DevInstaller
+	if installer == nil {
+		installer = ManifestDevNodeInstaller{}
+	}
+
+	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
+	if err := d.StartStop.Stop(d.UnitName); err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+
+	emit(Status{ID: c.ID, Step: "downloading", Progress: 0.35})
+	result, err := installer.InstallLatest(d.Platform, d.BinaryPath, manifestURL)
+	if err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		_ = d.StartStop.Start(d.UnitName)
+		return err
+	}
+
+	emit(Status{ID: c.ID, Step: "starting", Progress: 0.92})
+	if err := d.StartStop.Start(d.UnitName); err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+
+	applyDevInstallResult(state, result)
+	state.LastStartedAt = time.Now().UTC()
+	if d.SaveState == nil {
+		err := fmt.Errorf("SaveState dep missing")
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+	if err := d.SaveState(state); err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+
+	if d.PatchNodeStatus != nil {
+		d.PatchNodeStatus(nodeStatusPatchForDevResult(result, false))
+	}
+	if d.EmitRaw != nil {
+		d.EmitRaw(map[string]interface{}{
+			"type":         "node_updated",
+			"from_version": fromVersion,
+			"to_version":   result.Version,
+			"node_source":  nodemanifest.SourceDev,
+		})
+	}
+	emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
+	return nil
+}
+
+func applyDevInstallResult(state *config.State, result DevNodeInstallResult) {
+	state.NodeSource = nodemanifest.SourceDev
+	state.InstalledNodeVersion = result.Version
+	state.NodeBaseVersion = result.BaseVersion
+	state.NodeBuildNumber = result.BuildNumber
+	state.NodeBinarySHA256 = result.SHA256
+	state.NodeManifestURL = result.ManifestURL
+	state.NodeManifestCheckedAt = result.CheckedAt
+	state.LatestDevNodeVersion = result.Version
+	state.LatestDevNodeURL = result.URL
+	state.LatestDevNodeSHA256 = result.SHA256
+	state.LatestDevNodeBuildNumber = result.BuildNumber
+}
+
+func nodeStatusPatchForDevResult(result DevNodeInstallResult, updateAvailable bool) map[string]interface{} {
+	checkedAt := result.CheckedAt
+	if checkedAt.IsZero() {
+		checkedAt = time.Now().UTC()
+	}
+	return map[string]interface{}{
+		"node_source":                  nodemanifest.SourceDev,
+		"installed_node_version":       result.Version,
+		"node_base_version":            result.BaseVersion,
+		"node_build_number":            result.BuildNumber,
+		"node_binary_sha256":           result.SHA256,
+		"node_manifest_url":            result.ManifestURL,
+		"node_manifest_checked_at":     checkedAt.Format(time.RFC3339),
+		"latest_node_version":          result.Version,
+		"latest_dev_node_version":      result.Version,
+		"latest_dev_node_url":          result.URL,
+		"latest_dev_node_sha256":       result.SHA256,
+		"latest_dev_node_build_number": result.BuildNumber,
+		"node_update_source":           nodemanifest.SourceDev,
+		"node_update_available":        updateAvailable,
 	}
 }
 

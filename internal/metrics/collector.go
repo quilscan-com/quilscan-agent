@@ -5,18 +5,16 @@
 package metrics
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"os/exec"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/quilscan-com/quilscan-agent/internal/nodeinfo"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
@@ -42,24 +40,14 @@ type Collector struct {
 	IdleTick time.Duration
 	Started  time.Time
 
-	// NodeMetricsURL is the loopback Prometheus endpoint exposed by the node
-	// binary when invoked with --prometheus-server. We scrape just two gauges
-	// from it: process_resident_memory_bytes and
-	// quilibrium_global_consensus_current_frame_number.
-	// Empty string disables node-level metrics.
-	NodeMetricsURL string
 	// DiskPath is the partition whose usage we report (default "/").
 	DiskPath string
 
 	// UnitName is the platform service unit of the quilibrium-node
 	// (e.g. "quilibrium-node.service" on Linux, "com.quilscan.node" on
 	// macOS). When non-empty and Svc is set, we probe IsActive each tick
-	// to surface a `node_running` bool — distinguishes "installed but
-	// stopped" from "running" without waiting on prometheus scrape success.
+	// to surface a `node_running` bool.
 	UnitName string
-	// NodeLogPath is set on macOS where launchd redirects node logs to a file.
-	// Linux leaves it empty and the collector falls back to journalctl.
-	NodeLogPath string
 
 	// Svc is the platform service controller. nil → node_running not emitted.
 	Svc ServiceProbe
@@ -75,14 +63,13 @@ type Collector struct {
 	cpuCores    int
 	streaming   bool
 	modeCh      chan struct{}
-
-	lastRuntimeRead time.Time
-	runtimeStatus   *nodeinfo.RuntimeStatus
 }
 
 const (
 	pointsCapacity = 24 // ~ 1 minute of data at 3s tick
 )
+
+var darwinTopIdlePattern = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)%\s+idle`)
 
 // Run blocks until ctx is cancelled. Errors collecting individual samples are
 // swallowed (with the affected field omitted) so a transient gopsutil failure
@@ -193,13 +180,12 @@ func (c *Collector) sample() map[string]interface{} {
 		"type": "metrics",
 	}
 
-	if cpus, err := cpu.Percent(0, false); err == nil && len(cpus) > 0 {
-		v := round1(cpus[0])
+	if v, ok := hostCPUPercent(); ok {
 		frame["cpu"] = v
 		c.appendPoint(&c.cpuPoints, v)
 	}
 	if c.cpuStaticOK {
-		frame["cpu_sub"] = fmt.Sprintf("%d Core · %s", c.cpuCores, trimModel(c.cpuModel))
+		frame["cpu_sub"] = fmt.Sprintf("%d Core - %s", c.cpuCores, trimModel(c.cpuModel))
 	}
 	if pts := c.snapshotPoints(c.cpuPoints); pts != nil {
 		frame["cpu_points"] = pts
@@ -225,34 +211,9 @@ func (c *Collector) sample() map[string]interface{} {
 		frame["disk_points"] = pts
 	}
 
-	// Node-level metrics come from the node's own Prometheus endpoint
-	// (enabled by the service definition's --prometheus-server flag). We only
-	// care about two gauges, so a tiny line-by-line parser is enough.
-	gotNodeMem := false
-	gotNodeFrame := false
-	if c.NodeMetricsURL != "" {
-		if vals, err := scrapeNodeMetrics(c.NodeMetricsURL); err == nil {
-			if vals.residentMemBytes > 0 {
-				frame["node_mem_bytes"] = vals.residentMemBytes
-				frame["node_mem_sub"] = humanBytes(uint64(vals.residentMemBytes))
-				gotNodeMem = true
-			}
-			if vals.frameNumber > 0 {
-				frame["node_frame_height"] = vals.frameNumber
-				gotNodeFrame = true
-			}
-		}
-	}
-	if !gotNodeFrame {
-		if status := c.runtimeStatusFromLogs(); status != nil && status.FrameNumber > 0 {
-			frame["node_frame_height"] = status.FrameNumber
-		}
-	}
-	if !gotNodeMem {
-		if rss := nodeProcessRSSBytes(); rss > 0 {
-			frame["node_mem_bytes"] = rss
-			frame["node_mem_sub"] = humanBytes(uint64(rss))
-		}
+	if rss := nodeProcessRSSBytes(); rss > 0 {
+		frame["node_mem_bytes"] = rss
+		frame["node_mem_sub"] = humanBytes(uint64(rss))
 	}
 
 	if c.UnitName != "" && c.Svc != nil {
@@ -266,20 +227,76 @@ func (c *Collector) sample() map[string]interface{} {
 	return frame
 }
 
-func (c *Collector) runtimeStatusFromLogs() *nodeinfo.RuntimeStatus {
-	if time.Since(c.lastRuntimeRead) < 30*time.Second {
-		return c.runtimeStatus
+func hostCPUPercent() (float64, bool) {
+	if cpus, err := cpu.Percent(0, false); err == nil && len(cpus) > 0 {
+		return round1(cpus[0]), true
 	}
-	c.lastRuntimeRead = time.Now()
-	if c.NodeLogPath != "" {
-		c.runtimeStatus = nodeinfo.RuntimeStatusFromLogFile(context.Background(), c.NodeLogPath, 1000, 5*time.Second)
-		return c.runtimeStatus
+	if runtime.GOOS == "darwin" {
+		if v, ok := darwinPSCPUPercent(); ok {
+			return v, true
+		}
+		return darwinTopCPUPercent()
 	}
-	if c.UnitName != "" {
-		c.runtimeStatus = nodeinfo.RuntimeStatusFromJournal(context.Background(), c.UnitName, 1000, 5*time.Second)
-		return c.runtimeStatus
+	return 0, false
+}
+
+func darwinPSCPUPercent() (float64, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/ps", "-A", "-o", "%cpu=").Output()
+	if err != nil {
+		return 0, false
 	}
-	return nil
+	return parseDarwinPSCPUPercent(out, runtime.NumCPU())
+}
+
+func parseDarwinPSCPUPercent(out []byte, cores int) (float64, bool) {
+	if cores <= 0 {
+		cores = 1
+	}
+	total := 0.0
+	count := 0
+	for _, field := range strings.Fields(string(out)) {
+		v, err := strconv.ParseFloat(field, 64)
+		if err != nil {
+			continue
+		}
+		total += v
+		count++
+	}
+	if count == 0 {
+		return 0, false
+	}
+	used := total / float64(cores)
+	if used < 0 {
+		used = 0
+	}
+	if used > 100 {
+		used = 100
+	}
+	return round1(used), true
+}
+
+func darwinTopCPUPercent() (float64, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/usr/bin/top", "-l", "1", "-n", "0", "-s", "0").Output()
+	if err != nil {
+		return 0, false
+	}
+	return parseDarwinTopCPUPercent(out)
+}
+
+func parseDarwinTopCPUPercent(out []byte) (float64, bool) {
+	m := darwinTopIdlePattern.FindSubmatch(out)
+	if len(m) != 2 {
+		return 0, false
+	}
+	idle, err := strconv.ParseFloat(string(m[1]), 64)
+	if err != nil || idle < 0 || idle > 100 {
+		return 0, false
+	}
+	return round1(100 - idle), true
 }
 
 func nodeProcessRSSBytes() int64 {
@@ -337,85 +354,6 @@ func (c *Collector) snapshotPoints(buf []float64) []float64 {
 	out := make([]float64, len(buf))
 	copy(out, buf)
 	return out
-}
-
-// scrapedNodeValues collects only the two Prometheus gauges this collector
-// forwards to backend. Anything else in the /metrics dump is intentionally
-// ignored — the wire payload stays small and we don't need to track schema
-// drift across node versions.
-type scrapedNodeValues struct {
-	residentMemBytes int64
-	frameNumber      int64
-}
-
-// scrapeNodeMetrics fetches the node's /metrics endpoint and pulls just two
-// gauge values. Robust against the file being huge: we read line-by-line and
-// stop after both fields are filled.
-func scrapeNodeMetrics(url string) (scrapedNodeValues, error) {
-	var v scrapedNodeValues
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return v, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		// Drain & discard so the connection can be reused
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return v, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	gotMem, gotFrame := false, false
-	for sc.Scan() {
-		line := sc.Text()
-		if len(line) == 0 || line[0] == '#' {
-			continue
-		}
-		switch {
-		case !gotMem && strings.HasPrefix(line, "process_resident_memory_bytes"):
-			if val, ok := parsePromValue(line); ok {
-				v.residentMemBytes = int64(val)
-				gotMem = true
-			}
-		case !gotFrame && strings.HasPrefix(line, "quilibrium_global_consensus_current_frame_number"):
-			if val, ok := parsePromValue(line); ok {
-				v.frameNumber = int64(val)
-				gotFrame = true
-			}
-		}
-		if gotMem && gotFrame {
-			break
-		}
-	}
-	return v, sc.Err()
-}
-
-// parsePromValue extracts the numeric value from a Prometheus exposition
-// line: "metric_name{labels} 12345.678" or "metric_name 12345.678". Returns
-// false if the line doesn't fit the shape.
-func parsePromValue(line string) (float64, bool) {
-	// Skip optional labels block
-	if idx := strings.IndexByte(line, '}'); idx >= 0 {
-		line = line[idx+1:]
-	} else if idx := strings.IndexByte(line, ' '); idx >= 0 {
-		line = line[idx+1:]
-	} else {
-		return 0, false
-	}
-	line = strings.TrimSpace(line)
-	if i := strings.IndexAny(line, " \t"); i >= 0 {
-		line = line[:i]
-	}
-	if line == "" {
-		return 0, false
-	}
-	v, err := strconv.ParseFloat(line, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
 }
 
 // round1 rounds to 1 decimal place — keeps frame payload compact and the UI

@@ -1,5 +1,5 @@
-// Package nodeinfo runs `${binary} --node-info` (with `--config <dir>` when
-// the caller supplies a config directory) and parses the labelled output.
+// Package nodeinfo runs `${binary} --node-info` from the config parent
+// directory when possible and parses the labelled output.
 // Sample:
 //
 //	signature check passed
@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -41,21 +40,12 @@ type Info struct {
 	Seniority      int64
 	RunningWorkers int64
 	ActiveWorkers  int64
+	FrameNumber    int64
 }
 
-// RuntimeStatus is parsed from the Rust node's periodic `node status` log.
-// For 2.1.0.23+ we use it for local liveness counters and the local running
-// worker count. Active / joining / leaving / rejected shard state still comes
-// from backend lookups by the node identity.
-type RuntimeStatus struct {
-	FrameNumber      int64
-	Peers            int64
-	TotalAllocations int64
-}
-
-// RunRequest describes how the node binary should be invoked. ConfigPath must
-// be the same directory the running node uses for config.yml; otherwise
-// --node-info can read a default .config and falsely report RPC disabled.
+// RunRequest describes how the node binary should be invoked. WorkDir should
+// be the parent of the running node's .config directory; if WorkDir is empty,
+// ConfigPath is passed as --config.
 type RunRequest struct {
 	BinaryPath string
 	ConfigPath string
@@ -94,7 +84,7 @@ func Run(ctx context.Context, req RunRequest, timeout time.Duration) (*Info, err
 
 func commandForRequest(ctx context.Context, req RunRequest) (*exec.Cmd, []string) {
 	args := []string{"--node-info"}
-	if req.ConfigPath != "" {
+	if req.WorkDir == "" && req.ConfigPath != "" {
 		args = append(args, "--config", req.ConfigPath)
 	}
 	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
@@ -138,6 +128,8 @@ func parse(out string, requireVersion bool) (*Info, error) {
 			info.RunningWorkers = atoi64(val)
 		case "Active Workers":
 			info.ActiveWorkers = atoi64(val)
+		case "Frame Number":
+			info.FrameNumber = atoi64(val)
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -164,13 +156,10 @@ func atoi64(s string) int64 {
 	return n
 }
 
-var peerIDPattern = regexp.MustCompile(`\bQm[1-9A-HJ-NP-Za-km-z]{20,}\b`)
-
 // PeerIDFromConfigDir derives the Go-compatible libp2p peer ID from the Rust
 // node's p2p.peerPrivKey config field. The config stores 114 bytes as
 // [57-byte seed][57-byte Ed448 public key]; only the public half is used here.
-// Seed-only configs cannot be derived without Ed448 support, so callers should
-// fall back to node logs in that case.
+// Seed-only configs cannot be derived without Ed448 support.
 func PeerIDFromConfigDir(configDir string) string {
 	if configDir == "" {
 		return ""
@@ -245,80 +234,71 @@ func base58BTCEncode(raw []byte) string {
 	return string(out)
 }
 
-// ParsePeerIDFromLogs extracts the master peer id from journalctl output. The
-// node logs JSON like:
-// {"msg":"established peer id","process":"master","peer_id":"Qm..."}
-// Worker processes emit the same message; the master id is preferred.
-func ParsePeerIDFromLogs(raw string) string {
-	var first string
+// ParsePeerConnectionsFromLogs extracts the latest Rust node status `peers`
+// value from the node's status logs.
+func ParsePeerConnectionsFromLogs(raw string) (int, bool) {
 	sc := bufio.NewScanner(strings.NewReader(raw))
+	latest := 0
+	ok := false
 	for sc.Scan() {
 		line := sc.Text()
-		idx := strings.IndexByte(line, '{')
-		if idx < 0 {
+		if !strings.Contains(line, "node status") {
 			continue
 		}
-		payload := line[idx:]
+		payload := trailingJSON(line)
+		if payload == "" {
+			continue
+		}
 		var entry map[string]interface{}
 		if err := json.Unmarshal([]byte(payload), &entry); err != nil {
 			continue
 		}
-		msg := strings.TrimSpace(fmt.Sprint(entry["msg"]))
-		process := strings.TrimSpace(fmt.Sprint(entry["process"]))
-		peerID := ""
-		switch {
-		case strings.Contains(line, "P2P identity ready") ||
-			strings.Contains(line, "starting P2P networking") ||
-			msg == "established peer id":
-			peerID = strings.TrimSpace(fmt.Sprint(entry["peer_id"]))
-		default:
-			if _, ok := entry["local_peer_id"]; ok {
-				peerID = strings.TrimSpace(fmt.Sprint(entry["local_peer_id"]))
-			}
-		}
-		if !peerIDPattern.MatchString(peerID) {
+		peers, hasPeers := jsonInt(entry, "peers")
+		if !hasPeers || peers < 0 {
 			continue
 		}
-		if first == "" {
-			first = peerID
-		}
-		if msg == "established peer id" && process == "master" {
-			return peerID
-		}
+		latest = int(peers)
+		ok = true
 	}
-	return first
+	return latest, ok
 }
 
-func ParseRuntimeStatusFromLogs(raw string) *RuntimeStatus {
-	var latest *RuntimeStatus
-	sc := bufio.NewScanner(strings.NewReader(raw))
-	for sc.Scan() {
-		line := sc.Text()
-		switch {
-		case strings.Contains(line, "node status"):
-			payload := trailingJSON(line)
-			if payload == "" {
-				continue
-			}
-			var entry map[string]interface{}
-			if err := json.Unmarshal([]byte(payload), &entry); err != nil {
-				continue
-			}
-			if latest == nil {
-				latest = &RuntimeStatus{}
-			}
-			if v, ok := jsonInt64(entry, "frame"); ok {
-				latest.FrameNumber = v
-			}
-			if v, ok := jsonInt64(entry, "peers"); ok {
-				latest.Peers = v
-			}
-			if v, ok := jsonInt64(entry, "total_allocations"); ok {
-				latest.TotalAllocations = v
-			}
-		}
+func PeerConnectionsFromJournal(ctx context.Context, unitName string, lines int, timeout time.Duration) (int, bool) {
+	if unitName == "" {
+		unitName = "quilibrium-node.service"
 	}
-	return latest
+	if lines <= 0 {
+		lines = 1000
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "journalctl", "-u", unitName, "-n", strconv.Itoa(lines), "--no-pager", "-o", "short-iso").Output()
+	if err != nil {
+		return 0, false
+	}
+	return ParsePeerConnectionsFromLogs(string(out))
+}
+
+func PeerConnectionsFromLogFile(ctx context.Context, logPath string, lines int, timeout time.Duration) (int, bool) {
+	if logPath == "" {
+		return 0, false
+	}
+	if lines <= 0 {
+		lines = 1000
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tail", "-n", strconv.Itoa(lines), logPath).Output()
+	if err != nil {
+		return 0, false
+	}
+	return ParsePeerConnectionsFromLogs(string(out))
 }
 
 func trailingJSON(line string) string {
@@ -329,7 +309,7 @@ func trailingJSON(line string) string {
 	return strings.TrimSpace(line[idx:])
 }
 
-func jsonInt64(entry map[string]interface{}, key string) (int64, bool) {
+func jsonInt(entry map[string]interface{}, key string) (int64, bool) {
 	v, ok := entry[key]
 	if !ok {
 		return 0, false
@@ -350,85 +330,4 @@ func jsonInt64(entry map[string]interface{}, key string) (int64, bool) {
 	default:
 		return 0, false
 	}
-}
-
-func PeerIDFromJournal(ctx context.Context, unitName string, lines int, timeout time.Duration) string {
-	if unitName == "" {
-		unitName = "quilibrium-node.service"
-	}
-	if lines <= 0 {
-		lines = 2000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "journalctl", "-u", unitName, "-n", strconv.Itoa(lines), "--no-pager", "-o", "short-iso").Output()
-	if err != nil {
-		return ""
-	}
-	return ParsePeerIDFromLogs(string(out))
-}
-
-func RuntimeStatusFromJournal(ctx context.Context, unitName string, lines int, timeout time.Duration) *RuntimeStatus {
-	if unitName == "" {
-		unitName = "quilibrium-node.service"
-	}
-	if lines <= 0 {
-		lines = 1000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "journalctl", "-u", unitName, "-n", strconv.Itoa(lines), "--no-pager", "-o", "short-iso").Output()
-	if err != nil {
-		return nil
-	}
-	return ParseRuntimeStatusFromLogs(string(out))
-}
-
-// PeerIDFromLogFile is the macOS counterpart to PeerIDFromJournal:
-// the launchd plist redirects the node's stdout/stderr to a flat file
-// (NodeLogPath), so we tail-read that file instead of querying the
-// journal. Same parse logic; same fallback semantics (empty string on
-// any failure — caller treats this as "not yet known").
-func PeerIDFromLogFile(ctx context.Context, logPath string, lines int, timeout time.Duration) string {
-	if logPath == "" {
-		return ""
-	}
-	if lines <= 0 {
-		lines = 2000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "tail", "-n", strconv.Itoa(lines), logPath).Output()
-	if err != nil {
-		return ""
-	}
-	return ParsePeerIDFromLogs(string(out))
-}
-
-func RuntimeStatusFromLogFile(ctx context.Context, logPath string, lines int, timeout time.Duration) *RuntimeStatus {
-	if logPath == "" {
-		return nil
-	}
-	if lines <= 0 {
-		lines = 1000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "tail", "-n", strconv.Itoa(lines), logPath).Output()
-	if err != nil {
-		return nil
-	}
-	return ParseRuntimeStatusFromLogs(string(out))
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 	"github.com/quilscan-com/quilscan-agent/internal/release"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 	"github.com/quilscan-com/quilscan-agent/internal/systemd"
@@ -31,8 +32,10 @@ type SystemdOps interface {
 
 // InstallDeps wires install.go's external effects.
 type InstallDeps struct {
-	Downloader Downloader
-	Systemd    SystemdOps
+	Downloader      Downloader
+	DevInstaller    DevNodeInstaller
+	NodeManifestURL string
+	Systemd         SystemdOps
 	// RenderServiceDef returns the systemd unit file (Linux) or LaunchAgent
 	// plist (macOS) body for the supplied node-launch parameters. The
 	// install handler does not care which format it gets — it just hands
@@ -147,15 +150,30 @@ func unitFilePath(unitDir, unitName string) string {
 func NewInstallHandler(d InstallDeps) Handler {
 	return func(c Command, emit Emitter) error {
 		version, _ := c.Args["version"].(string)
-		if version == "" {
-			emit(Status{ID: c.ID, Step: "failed", Error: "missing version"})
-			return fmt.Errorf("missing version")
-		}
 
 		force, _ := c.Args["force"].(bool)
 		source, _ := c.Args["source"].(string) // "fresh" | "migrated" — set by caller (e.g. migrate handler)
+		nodeSource := nodemanifest.SourceReleases
+		if normalized := normalizeNodeSource(source); normalized != "" {
+			nodeSource = normalized
+			source = "fresh"
+		}
+		if raw, _ := c.Args["node_source"].(string); raw != "" {
+			if normalized := normalizeNodeSource(raw); normalized != "" {
+				nodeSource = normalized
+			}
+		}
+		if raw, _ := c.Args["node_channel"].(string); raw != "" {
+			if normalized := normalizeNodeSource(raw); normalized != "" {
+				nodeSource = normalized
+			}
+		}
 		if source == "" {
 			source = "fresh"
+		}
+		if nodeSource != nodemanifest.SourceDev && version == "" {
+			emit(Status{ID: c.ID, Step: "failed", Error: "missing version"})
+			return fmt.Errorf("missing version")
 		}
 
 		// Preflight environment check — fail fast with an actionable
@@ -239,29 +257,54 @@ func NewInstallHandler(d InstallDeps) Handler {
 				return err
 			}
 		}
-		releaseDir, cleanupReleaseDir, err := makeNodeReleaseTempDir(d.BinaryPath)
-		if err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
-		}
-		defer cleanupReleaseDir()
-
+		devResult := DevNodeInstallResult{}
+		stateNodeVersion := version
 		emit(Status{ID: c.ID, Step: "downloading", Progress: 0.20})
-		if err := d.Downloader.Download(version, d.Platform, releaseDir); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
-		}
+		if nodeSource == nodemanifest.SourceDev {
+			installer := d.DevInstaller
+			if installer == nil {
+				installer = ManifestDevNodeInstaller{}
+			}
+			manifestURL := d.NodeManifestURL
+			if manifestURL == "" {
+				manifestURL = nodemanifest.DefaultURL
+			}
+			var err error
+			devResult, err = installer.InstallLatest(d.Platform, d.BinaryPath, manifestURL)
+			if err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+			version = devResult.Version
+			stateNodeVersion = devResult.BaseVersion
+			if stateNodeVersion == "" {
+				stateNodeVersion = devResult.Version
+			}
+			emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.55})
+		} else {
+			releaseDir, cleanupReleaseDir, err := makeNodeReleaseTempDir(d.BinaryPath)
+			if err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+			defer cleanupReleaseDir()
 
-		// Quilibrium publishes binaries with version-templated filenames
-		// (node-2.1.0.22-linux-amd64). The service definition needs a stable
-		// binary path, so we move the binary and its digest/signature sidecars
-		// to the same stable path prefix. The node looks for <binary>.dgst at
-		// startup.
-		emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.55})
-		versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
-		if err := installNodeBinary(versionedBinary, d.BinaryPath); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
+			if err := d.Downloader.Download(version, d.Platform, releaseDir); err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+
+			// Quilibrium publishes binaries with version-templated filenames
+			// (node-2.1.0.22-linux-amd64). The service definition needs a stable
+			// binary path, so we move the binary and its digest/signature sidecars
+			// to the same stable path prefix. The node looks for <binary>.dgst at
+			// startup.
+			emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.55})
+			versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
+			if err := installNodeBinary(versionedBinary, d.BinaryPath); err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
 		}
 
 		emit(Status{ID: c.ID, Step: "registering", Progress: 0.80})
@@ -290,6 +333,14 @@ func NewInstallHandler(d InstallDeps) Handler {
 			}
 		}
 		unit := render(ui)
+		if nodeSource == nodemanifest.SourceDev {
+			patched, _, err := patchNodeServiceSignatureCheck(unit, true)
+			if err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+			unit = patched
+		}
 		if err := d.Systemd.WriteUnit(d.UnitName, unit); err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
@@ -306,15 +357,26 @@ func NewInstallHandler(d InstallDeps) Handler {
 		}
 
 		// === Persist full state ===
+		var savedState *config.State
 		if d.SaveState != nil {
 			now := time.Now().UTC()
 			ns := &config.State{
 				ConfigPath:    cfgDir,
 				BinaryPath:    d.BinaryPath,
 				ServiceUnit:   d.UnitName,
-				NodeVersion:   version,
+				NodeVersion:   stateNodeVersion,
 				InstallSource: source,
 				InstalledAt:   now,
+			}
+			if nodeSource == nodemanifest.SourceDev {
+				applyDevInstallResult(ns, devResult)
+			} else {
+				ns.NodeSource = nodemanifest.SourceReleases
+				ns.InstalledNodeVersion = version
+				ns.NodeBaseVersion = version
+				ns.NodeBuildNumber = 0
+				ns.NodeManifestURL = nodeManifestURL(d.NodeManifestURL)
+				ns.NodeManifestCheckedAt = now
 			}
 			if source == "migrated" {
 				ns.MigratedFrom, _ = c.Args["config_path"].(string)
@@ -323,14 +385,36 @@ func NewInstallHandler(d InstallDeps) Handler {
 				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 				return err
 			}
+			savedState = ns
 		}
 
 		if d.EmitRaw != nil {
-			d.EmitRaw(map[string]interface{}{
+			meta := map[string]interface{}{
 				"type":         "meta_update",
 				"has_node":     true,
-				"node_version": version,
-			})
+				"node_version": stateNodeVersion,
+			}
+			if savedState != nil {
+				meta["node_source"] = savedState.NodeSource
+				meta["installed_node_version"] = savedState.InstalledNodeVersion
+				meta["node_base_version"] = savedState.NodeBaseVersion
+				meta["node_build_number"] = savedState.NodeBuildNumber
+				meta["node_binary_sha256"] = savedState.NodeBinarySHA256
+				meta["node_manifest_url"] = savedState.NodeManifestURL
+				if !savedState.NodeManifestCheckedAt.IsZero() {
+					meta["node_manifest_checked_at"] = savedState.NodeManifestCheckedAt.Format(time.RFC3339)
+				}
+				if savedState.NodeSource == nodemanifest.SourceDev {
+					meta["latest_node_version"] = savedState.InstalledNodeVersion
+					meta["latest_dev_node_version"] = savedState.LatestDevNodeVersion
+					meta["latest_dev_node_url"] = savedState.LatestDevNodeURL
+					meta["latest_dev_node_sha256"] = savedState.LatestDevNodeSHA256
+					meta["latest_dev_node_build_number"] = savedState.LatestDevNodeBuildNumber
+					meta["node_update_source"] = nodemanifest.SourceDev
+					meta["node_update_available"] = false
+				}
+			}
+			d.EmitRaw(meta)
 		}
 
 		if d.OnInstalled != nil && source != "migrated" {

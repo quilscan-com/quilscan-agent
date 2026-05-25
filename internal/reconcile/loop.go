@@ -37,7 +37,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinfo"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinstall"
-	"github.com/quilscan-com/quilscan-agent/internal/peerinfo"
+	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 	"github.com/quilscan-com/quilscan-agent/internal/qclient"
 	"github.com/quilscan-com/quilscan-agent/internal/release"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
@@ -78,12 +78,7 @@ type Loop struct {
 	AgentConfigYAMLPath string
 	AgentAuditLogPath   string
 	AgentServiceName    string // systemd unit name OR launchd label
-
-	// NodeLogPath is the flat-file log target the launchd plist
-	// redirects the node's stdout/stderr to on macOS (e.g.
-	// ~/Library/Logs/quilibrium-node.log). Empty on Linux where
-	// journalctl is the source of truth.
-	NodeLogPath string
+	NodeLogPath         string // macOS node log file; Linux uses journalctl
 
 	// Svc is the service-manager probe used for IsActive / StartedAt.
 	// When nil, runVerify falls back to a Linux-only systemctl path so
@@ -101,11 +96,14 @@ type Loop struct {
 	LatestVersionFetcher        func(string) (string, error)
 	LatestQClientVersionURL     string
 	LatestQClientVersionFetcher func(string, string) (string, error)
+	NodeManifestURL             string
+	NodeManifestFetcher         func(string) (*nodemanifest.Manifest, error)
+	OfficialArtifactsURL        string
+	OfficialArtifactsFetcher    func(string) (*nodemanifest.OfficialArtifacts, error)
 
-	NodeInfoRunner      func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
-	PeerInfoRunner      func(context.Context, peerinfo.RunRequest, time.Duration) (int, bool, error)
-	QClientStatusRunner func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
-	PeerIDFromJournaler func(context.Context, string, int, time.Duration) string
+	NodeInfoRunner           func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
+	QClientStatusRunner      func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
+	PeerConnectionsLogReader func(context.Context, string, string, int, time.Duration) (int, bool)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
@@ -129,12 +127,11 @@ const configReadLimit = 256 * 1024
 
 const defaultLatestVersionURL = "https://releases.quilibrium.com/release"
 const defaultLatestQClientVersionURL = "https://releases.quilibrium.com/qclient-release"
+const defaultNodeManifestURL = nodemanifest.DefaultURL
+const defaultOfficialArtifactsURL = nodemanifest.DefaultOfficialArtifactsURL
 const unknownPeerID = "--"
 
 var nodeVersionPattern = regexp.MustCompile(`\b(?:node-)?([0-9]+(?:\.[0-9]+){3})(?:-[A-Za-z0-9_-]+)?\b`)
-
-const rustNodeReleaseFloor = "2.1.0.23"
-const rustNodeInfoCompatVersion = "0.1.0"
 
 // Run blocks until ctx is cancelled, ticking each loop on its own schedule.
 func (l *Loop) Run(ctx context.Context) {
@@ -162,6 +159,12 @@ func (l *Loop) Run(ctx context.Context) {
 	}
 	if l.LatestQClientVersionURL == "" {
 		l.LatestQClientVersionURL = defaultLatestQClientVersionURL
+	}
+	if l.NodeManifestURL == "" {
+		l.NodeManifestURL = defaultNodeManifestURL
+	}
+	if l.OfficialArtifactsURL == "" {
+		l.OfficialArtifactsURL = defaultOfficialArtifactsURL
 	}
 	l.nodeStatus = map[string]interface{}{}
 
@@ -268,14 +271,14 @@ func (l *Loop) runVerify() {
 		nodePatch["qclient_status"] = "not_installed"
 	}
 	if detection.HasNode {
+		mergePatch(nodePatch, l.refreshNodeManifestState(state, now))
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
 		nodePatch["node_connections"] = nil
 		foundPeerID := ""
 		info := l.readNodeInfo(state)
-		rustNode := usesRustNodeCommands(state, info)
 		if info != nil {
-			if info.PeerID != "" && (!rustNode || isLegacyPeerID(info.PeerID)) {
+			if info.PeerID != "" && isLegacyPeerID(info.PeerID) {
 				foundPeerID = info.PeerID
 			}
 			if info.Version != "" {
@@ -285,29 +288,17 @@ func (l *Loop) runVerify() {
 					state.NodeVersion = info.Version
 					_ = config.SaveState(l.StatePath, state)
 				}
-				if latest := l.statusString("latest_node_version"); latest != "" {
-					nodePatch["latest_node_version"] = latest
-					nodePatch["node_update_available"] = releaseVersionNewerThan(latest, info.Version)
+				if state.NodeSource != nodemanifest.SourceDev {
+					if latest := l.statusString("latest_node_version"); latest != "" {
+						nodePatch["latest_node_version"] = latest
+						nodePatch["node_update_available"] = releaseVersionNewerThan(latest, info.Version)
+					}
 				}
 			}
 			nodePatch["node_running_workers"] = info.RunningWorkers
 			nodePatch["node_active_workers"] = info.ActiveWorkers
-		}
-		if rustNode {
-			if latest := l.statusString("latest_node_version"); latest != "" && state.NodeVersion != "" {
-				nodePatch["latest_node_version"] = latest
-				nodePatch["node_update_available"] = releaseVersionNewerThan(latest, state.NodeVersion)
-			}
-			if status := l.readRuntimeStatusFromLogs(); status != nil {
-				if status.TotalAllocations > 0 {
-					nodePatch["node_running_workers"] = status.TotalAllocations
-				}
-				if status.FrameNumber > 0 {
-					nodePatch["node_frame_height"] = status.FrameNumber
-				}
-				if status.Peers > 0 {
-					nodePatch["node_connections"] = status.Peers
-				}
+			if info.FrameNumber > 0 {
+				nodePatch["node_frame_height"] = info.FrameNumber
 			}
 		}
 		if qclientInstalled {
@@ -316,22 +307,25 @@ func (l *Loop) runVerify() {
 				if qstatus.PeerID != "" && isLegacyPeerID(qstatus.PeerID) {
 					foundPeerID = qstatus.PeerID
 				}
-				qclientRustNode := rustNode || releaseVersionAtLeast(qstatus.Version, rustNodeReleaseFloor)
-				if qclientRustNode {
-					if qstatus.Version != "" {
-						nodePatch["node_info_version"] = qstatus.Version
-						nodePatch["current_node_version"] = qstatus.Version
-						if state.NodeVersion != qstatus.Version {
-							state.NodeVersion = qstatus.Version
-							_ = config.SaveState(l.StatePath, state)
+				if qstatus.Version != "" {
+					nodePatch["node_info_version"] = qstatus.Version
+					nodePatch["current_node_version"] = qstatus.Version
+					if state.NodeVersion != qstatus.Version {
+						state.NodeVersion = qstatus.Version
+						_ = config.SaveState(l.StatePath, state)
+					}
+					if state.NodeSource != nodemanifest.SourceDev {
+						if latest := l.statusString("latest_node_version"); latest != "" {
+							nodePatch["latest_node_version"] = latest
+							nodePatch["node_update_available"] = releaseVersionNewerThan(latest, qstatus.Version)
 						}
 					}
-					if qstatus.AllocatedWorkers > 0 {
-						nodePatch["node_running_workers"] = qstatus.AllocatedWorkers
-					}
-					if qstatus.LastReceived > 0 {
-						nodePatch["node_frame_height"] = qstatus.LastReceived
-					}
+				}
+				if qstatus.RunningWorkers > 0 {
+					nodePatch["node_running_workers"] = qstatus.RunningWorkers
+				}
+				if qstatus.LastReceived > 0 {
+					nodePatch["node_frame_height"] = qstatus.LastReceived
 				}
 			} else {
 				nodePatch["qclient_status"] = "unavailable"
@@ -342,20 +336,15 @@ func (l *Loop) runVerify() {
 				foundPeerID = peerID
 			}
 		}
-		if foundPeerID == "" {
-			if peerID := l.readPeerIDFromJournal(); peerID != "" {
-				foundPeerID = peerID
-			}
-		}
-		// If both --node-info and the log scrape miss this tick (subprocess
-		// timeout, recently rotated log, etc.), prefer the value we
-		// previously persisted to state.yaml over the "--" placeholder.
+		// If --node-info and config parsing miss this tick (subprocess timeout,
+		// incomplete config, etc.), prefer the value we previously persisted to
+		// state.yaml over the "--" placeholder.
 		// The peer ID is stable for the lifetime of keys.yml so a cached
 		// value can never become wrong — only stale by definition.
-		if foundPeerID == "" && state.PeerID != "" && (!rustNode || isLegacyPeerID(state.PeerID)) {
+		if foundPeerID == "" && state.PeerID != "" && isLegacyPeerID(state.PeerID) {
 			foundPeerID = state.PeerID
 		}
-		if rustNode && state.PeerID != "" && !isLegacyPeerID(state.PeerID) {
+		if state.PeerID != "" && !isLegacyPeerID(state.PeerID) {
 			state.PeerID = ""
 		}
 		if foundPeerID != "" {
@@ -364,10 +353,8 @@ func (l *Loop) runVerify() {
 		} else {
 			nodePatch["peer_id"] = unknownPeerID
 		}
-		if !rustNode {
-			if connections, ok := l.readPeerConnectionCount(state); ok {
-				nodePatch["node_connections"] = connections
-			}
+		if connections, ok := l.readPeerConnectionCountFromLogs(); ok {
+			nodePatch["node_connections"] = connections
 		} else if nodePatch["node_connections"] == nil {
 			nodePatch["node_connections"] = nil
 		}
@@ -389,14 +376,20 @@ func (l *Loop) runVerify() {
 	l.updateNodeStatus(nodePatch)
 	if l.Sender != nil {
 		meta := map[string]interface{}{
-			"type":                "meta_update",
-			"has_node":            detection.HasNode,
-			"has_qclient":         qclientInstalled,
-			"qclient_version":     state.QClientVersion,
-			"qclient_binary_path": l.qclientBinaryPath(),
-			"node_version":        state.NodeVersion,
-			"install_source":      state.InstallSource,
-			"node_residues":       detection.Residues,
+			"type":                   "meta_update",
+			"has_node":               detection.HasNode,
+			"has_qclient":            qclientInstalled,
+			"qclient_version":        state.QClientVersion,
+			"qclient_binary_path":    l.qclientBinaryPath(),
+			"node_version":           state.NodeVersion,
+			"node_source":            state.NodeSource,
+			"installed_node_version": state.InstalledNodeVersion,
+			"node_base_version":      state.NodeBaseVersion,
+			"node_build_number":      state.NodeBuildNumber,
+			"node_binary_sha256":     state.NodeBinarySHA256,
+			"node_manifest_url":      state.NodeManifestURL,
+			"install_source":         state.InstallSource,
+			"node_residues":          detection.Residues,
 		}
 		if peerID, _ := nodePatch["peer_id"].(string); peerID != "" {
 			meta["peer_id"] = peerID
@@ -433,6 +426,157 @@ func (l *Loop) readNodeInfo(state *config.State) *nodeinfo.Info {
 	return info
 }
 
+func (l *Loop) refreshNodeManifestState(state *config.State, now time.Time) map[string]interface{} {
+	patch := map[string]interface{}{}
+	sha, err := nodemanifest.HashFile(l.BinaryPath)
+	if err != nil {
+		return patch
+	}
+	state.NodeBinarySHA256 = sha
+	patch["node_binary_sha256"] = sha
+
+	officialFetched := false
+	officialMatch := nodemanifest.Match{}
+	officialMatched := false
+	if match, ok, fetched := l.matchOfficialArtifact(sha); ok {
+		officialMatch = match
+		officialMatched = true
+	} else if fetched {
+		officialFetched = true
+	}
+
+	manifestURL := l.NodeManifestURL
+	if manifestURL == "" {
+		manifestURL = defaultNodeManifestURL
+	}
+	fetcher := l.NodeManifestFetcher
+	if fetcher == nil {
+		fetcher = nodemanifest.Fetch
+	}
+	manifest, err := fetcher(manifestURL)
+	devFetched := err == nil && manifest != nil
+	if err != nil || manifest == nil {
+		if officialMatched {
+			applyNodeManifestMatch(state, officialMatch)
+			patchNodeSourceFromState(patch, state)
+			return patch
+		}
+		if !officialFetched && state.NodeSource == nodemanifest.SourceReleases {
+			patchNodeSourceFromState(patch, state)
+			return patch
+		}
+		if state.NodeSource == nodemanifest.SourceDev {
+			patchNodeSourceFromState(patch, state)
+			return patch
+		}
+		state.NodeSource = nodemanifest.SourceUnknown
+		state.InstalledNodeVersion = ""
+		state.NodeBaseVersion = ""
+		state.NodeBuildNumber = 0
+		patchNodeSourceFromState(patch, state)
+		patch["node_update_available"] = false
+		return patch
+	}
+
+	state.NodeManifestURL = manifestURL
+	state.NodeManifestCheckedAt = now
+	patch["node_manifest_url"] = manifestURL
+	patch["node_manifest_checked_at"] = now.Format(time.RFC3339)
+
+	if latest, artifact, ok := manifest.LatestDev(l.Platform); ok {
+		state.LatestDevNodeVersion = latest.Version
+		state.LatestDevNodeURL = artifact.URL
+		state.LatestDevNodeSHA256 = artifact.SHA256
+		state.LatestDevNodeBuildNumber = latest.BuildNumber
+		patch["latest_dev_node_version"] = latest.Version
+		patch["latest_dev_node_url"] = artifact.URL
+		patch["latest_dev_node_sha256"] = artifact.SHA256
+		patch["latest_dev_node_build_number"] = latest.BuildNumber
+	}
+
+	if officialMatched {
+		applyNodeManifestMatch(state, officialMatch)
+		patchNodeSourceFromState(patch, state)
+		return patch
+	}
+
+	match, ok := manifest.MatchDev(l.Platform, sha)
+	if !ok {
+		if !officialFetched && state.NodeSource == nodemanifest.SourceReleases {
+			patchNodeSourceFromState(patch, state)
+			return patch
+		}
+		if !devFetched && state.NodeSource == nodemanifest.SourceDev {
+			patchNodeSourceFromState(patch, state)
+			return patch
+		}
+		state.NodeSource = nodemanifest.SourceUnknown
+		state.InstalledNodeVersion = ""
+		state.NodeBaseVersion = ""
+		state.NodeBuildNumber = 0
+		patchNodeSourceFromState(patch, state)
+		patch["node_update_available"] = false
+		return patch
+	}
+
+	applyNodeManifestMatch(state, match)
+	patchNodeSourceFromState(patch, state)
+	if match.Source == nodemanifest.SourceDev {
+		updateAvailable, latest := manifest.DevUpdate(match, l.Platform)
+		patch["latest_node_version"] = latest.Version
+		patch["node_update_source"] = nodemanifest.SourceDev
+		patch["node_update_available"] = updateAvailable
+	}
+	return patch
+}
+
+func (l *Loop) matchOfficialArtifact(sha string) (nodemanifest.Match, bool, bool) {
+	url := l.OfficialArtifactsURL
+	if strings.TrimSpace(url) == "" {
+		url = defaultOfficialArtifactsURL
+	}
+	fetcher := l.OfficialArtifactsFetcher
+	if fetcher == nil {
+		fetcher = nodemanifest.FetchOfficialArtifacts
+	}
+	artifacts, err := fetcher(url)
+	if err != nil || artifacts == nil {
+		return nodemanifest.Match{}, false, false
+	}
+	match, ok := artifacts.Match(l.Platform, sha)
+	return match, ok, true
+}
+
+func applyNodeManifestMatch(state *config.State, match nodemanifest.Match) {
+	state.NodeSource = match.Source
+	state.InstalledNodeVersion = match.Version
+	state.NodeBaseVersion = match.BaseVersion
+	state.NodeBuildNumber = match.BuildNumber
+	if state.NodeBaseVersion == "" && match.Source == nodemanifest.SourceReleases {
+		state.NodeBaseVersion = match.Version
+	}
+}
+
+func patchNodeSourceFromState(patch map[string]interface{}, state *config.State) {
+	patch["node_source"] = state.NodeSource
+	patch["installed_node_version"] = state.InstalledNodeVersion
+	patch["node_base_version"] = state.NodeBaseVersion
+	patch["node_build_number"] = state.NodeBuildNumber
+	patch["node_binary_sha256"] = state.NodeBinarySHA256
+	if state.NodeManifestURL != "" {
+		patch["node_manifest_url"] = state.NodeManifestURL
+	}
+	if !state.NodeManifestCheckedAt.IsZero() {
+		patch["node_manifest_checked_at"] = state.NodeManifestCheckedAt.UTC().Format(time.RFC3339)
+	}
+}
+
+func mergePatch(dst, src map[string]interface{}) {
+	for k, v := range src {
+		dst[k] = v
+	}
+}
+
 func (l *Loop) nodeInfoConfigPath(state *config.State) string {
 	if state != nil && state.ConfigPath != "" {
 		return state.ConfigPath
@@ -442,19 +586,6 @@ func (l *Loop) nodeInfoConfigPath(state *config.State) string {
 		return cfgDir
 	}
 	return ""
-}
-
-func (l *Loop) readPeerIDFromJournal() string {
-	if l.PeerIDFromJournaler != nil {
-		return l.PeerIDFromJournaler(context.Background(), l.UnitName, 500, 5*time.Second)
-	}
-	// macOS: the plist redirects stdout/err to NodeLogPath, so the
-	// peer-id line lands in that file rather than the journal. Fall
-	// through to journalctl on Linux where NodeLogPath is empty.
-	if l.NodeLogPath != "" {
-		return nodeinfo.PeerIDFromLogFile(context.Background(), l.NodeLogPath, 500, 5*time.Second)
-	}
-	return nodeinfo.PeerIDFromJournal(context.Background(), l.UnitName, 500, 5*time.Second)
 }
 
 func (l *Loop) readPeerIDFromConfig(state *config.State) string {
@@ -469,28 +600,14 @@ func isLegacyPeerID(peerID string) bool {
 	return strings.HasPrefix(peerID, "Qm")
 }
 
-func (l *Loop) readPeerConnectionCount(state *config.State) (int, bool) {
-	runner := l.PeerInfoRunner
-	if runner == nil {
-		runner = peerinfo.Run
+func (l *Loop) readPeerConnectionCountFromLogs() (int, bool) {
+	if l.PeerConnectionsLogReader != nil {
+		return l.PeerConnectionsLogReader(context.Background(), l.UnitName, l.NodeLogPath, 1000, 5*time.Second)
 	}
-	req := peerinfo.RunRequest{
-		BinaryPath: l.BinaryPath,
-		ConfigPath: l.nodeInfoConfigPath(state),
-	}
-	req.WorkDir = nodeCommandWorkDir(req.ConfigPath, l.managedConfigDir())
-	count, ok, err := runner(context.Background(), req, 15*time.Second)
-	if err != nil {
-		return 0, false
-	}
-	return count, ok
-}
-
-func (l *Loop) readRuntimeStatusFromLogs() *nodeinfo.RuntimeStatus {
 	if l.NodeLogPath != "" {
-		return nodeinfo.RuntimeStatusFromLogFile(context.Background(), l.NodeLogPath, 1000, 5*time.Second)
+		return nodeinfo.PeerConnectionsFromLogFile(context.Background(), l.NodeLogPath, 1000, 5*time.Second)
 	}
-	return nodeinfo.RuntimeStatusFromJournal(context.Background(), l.UnitName, 1000, 5*time.Second)
+	return nodeinfo.PeerConnectionsFromJournal(context.Background(), l.UnitName, 1000, 5*time.Second)
 }
 
 func (l *Loop) qclientBinaryPath() string {
@@ -550,36 +667,6 @@ func nodeCommandWorkDir(configPath, managedConfigDir string) string {
 		return filepath.Dir(filepath.Clean(managedConfigDir))
 	}
 	return ""
-}
-
-func usesRustNodeCommands(state *config.State, info *nodeinfo.Info) bool {
-	if info != nil && strings.TrimSpace(info.Version) == rustNodeInfoCompatVersion {
-		return true
-	}
-	if info != nil && releaseVersionAtLeast(info.Version, rustNodeReleaseFloor) {
-		return true
-	}
-	if state != nil && releaseVersionAtLeast(state.NodeVersion, rustNodeReleaseFloor) {
-		return true
-	}
-	// Manual binary replacement can leave state.NodeVersion at the previous Go
-	// release. Rust --node-info exposes Prover Address, so use it as a command
-	// compatibility signal while still reporting the release version separately.
-	return info != nil && info.ProverAddress != ""
-}
-
-func releaseVersionAtLeast(v, floor string) bool {
-	a, okA := parseReleaseVersion(v)
-	b, okB := parseReleaseVersion(floor)
-	if !okA || !okB {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return a[i] > b[i]
-		}
-	}
-	return true
 }
 
 func releaseVersionNewerThan(candidate, current string) bool {
@@ -802,6 +889,96 @@ func (l *Loop) runVersionPoll() {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	patch := map[string]interface{}{}
+
+	if state.NodeSource == nodemanifest.SourceDev {
+		manifestURL := l.NodeManifestURL
+		if manifestURL == "" {
+			manifestURL = defaultNodeManifestURL
+		}
+		fetcher := l.NodeManifestFetcher
+		if fetcher == nil {
+			fetcher = nodemanifest.Fetch
+		}
+		if manifest, err := fetcher(manifestURL); err == nil && manifest != nil {
+			latest, artifact, ok := manifest.LatestDev(l.Platform)
+			if ok {
+				current := state.InstalledNodeVersion
+				currentMatch := nodemanifest.Match{
+					Source:      nodemanifest.SourceDev,
+					Version:     state.InstalledNodeVersion,
+					BaseVersion: state.NodeBaseVersion,
+					BuildNumber: state.NodeBuildNumber,
+					Platform:    l.Platform,
+					SHA256:      state.NodeBinarySHA256,
+				}
+				available, _ := manifest.DevUpdate(currentMatch, l.Platform)
+				patch["installed_node_version"] = current
+				patch["latest_node_version"] = latest.Version
+				patch["latest_dev_node_version"] = latest.Version
+				patch["latest_dev_node_url"] = artifact.URL
+				patch["latest_dev_node_sha256"] = artifact.SHA256
+				patch["latest_dev_node_build_number"] = latest.BuildNumber
+				patch["node_update_source"] = nodemanifest.SourceDev
+				patch["node_update_available"] = available
+				patch["version_polled_at"] = now
+				state.LatestDevNodeVersion = latest.Version
+				state.LatestDevNodeURL = artifact.URL
+				state.LatestDevNodeSHA256 = artifact.SHA256
+				state.LatestDevNodeBuildNumber = latest.BuildNumber
+				_ = config.SaveState(l.StatePath, state)
+			}
+		}
+		if l.qclientInstalled() {
+			qclientCurrent := state.QClientVersion
+			if observed := l.statusString("qclient_version"); observed != "" {
+				qclientCurrent = observed
+			}
+			qclientFetcher := l.LatestQClientVersionFetcher
+			if qclientFetcher == nil {
+				qclientFetcher = fetchLatestQClientVersion
+			}
+			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+			if err == nil && latestQClient != "" {
+				patch["qclient_version"] = qclientCurrent
+				patch["latest_qclient_version"] = latestQClient
+				patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
+				patch["qclient_version_polled_at"] = now
+			}
+		} else {
+			patch["qclient_update_available"] = false
+		}
+		if len(patch) > 0 {
+			l.updateNodeStatus(patch)
+		}
+		return
+	}
+
+	if state.NodeSource == nodemanifest.SourceUnknown {
+		patch["node_update_source"] = nodemanifest.SourceUnknown
+		patch["node_update_available"] = false
+		patch["version_polled_at"] = now
+		if l.qclientInstalled() {
+			qclientCurrent := state.QClientVersion
+			if observed := l.statusString("qclient_version"); observed != "" {
+				qclientCurrent = observed
+			}
+			qclientFetcher := l.LatestQClientVersionFetcher
+			if qclientFetcher == nil {
+				qclientFetcher = fetchLatestQClientVersion
+			}
+			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+			if err == nil && latestQClient != "" {
+				patch["qclient_version"] = qclientCurrent
+				patch["latest_qclient_version"] = latestQClient
+				patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
+				patch["qclient_version_polled_at"] = now
+			}
+		} else {
+			patch["qclient_update_available"] = false
+		}
+		l.updateNodeStatus(patch)
+		return
+	}
 
 	current := state.NodeVersion
 	if observed := l.statusString("node_info_version"); observed != "" {

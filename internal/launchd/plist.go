@@ -12,11 +12,6 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 )
 
-// NodeMetricsAddr is the local-only Prometheus endpoint we ask the node
-// to expose. Same value as systemd.NodeMetricsAddr — kept duplicated to
-// avoid a cross-package dependency in the platform-specific packages.
-const NodeMetricsAddr = "127.0.0.1:49163"
-
 // plistDoc + plistDict are the minimal subset of Apple's plist DTD we
 // emit. Using encoding/xml gives us correct character escaping for paths
 // containing spaces or odd quotes (e.g. "Application Support") without
@@ -62,7 +57,7 @@ func pair(k, v string) []any {
 //   - Fresh install: ConfigPath empty, WorkDir set to the parent of the
 //     `.config` directory; node uses its built-in `.config` default.
 //   - Migrated install: ConfigPath empty, WorkDir set to the parent of the
-//     user-supplied `.config` directory; query commands still use `--config`.
+//     user-supplied `.config` directory; startup matches the fresh install shape.
 //
 // RunAtLoad=true so the job starts automatically when the user logs in.
 // KeepAlive's `Crashed` clause restarts the process on non-zero exits but
@@ -70,8 +65,6 @@ func pair(k, v string) []any {
 func RenderNodePlist(in svcctl.NodeServiceInput) string {
 	args := []plistString{
 		{Value: in.BinaryPath},
-		{Value: "--prometheus-server"},
-		{Value: NodeMetricsAddr},
 	}
 	if in.ConfigPath != "" {
 		args = append(args, plistString{Value: "--config"}, plistString{Value: in.ConfigPath})

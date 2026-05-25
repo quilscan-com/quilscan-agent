@@ -21,6 +21,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/metrics"
 	"github.com/quilscan-com/quilscan-agent/internal/netinfo"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinstall"
+	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 	"github.com/quilscan-com/quilscan-agent/internal/reconcile"
 	"github.com/quilscan-com/quilscan-agent/internal/release"
 	"github.com/quilscan-com/quilscan-agent/internal/rpcconfig"
@@ -30,7 +31,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.2"
+var version = "1.0.3"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -217,6 +218,8 @@ func run() {
 	go ensureQClientInstalledOnStartup(defaults, installQClient)
 	installHandler := actions.NewInstallHandler(actions.InstallDeps{
 		Downloader:       actions.ReleaseDownloader{},
+		DevInstaller:     actions.ManifestDevNodeInstaller{},
+		NodeManifestURL:  "https://releases.quilscan.com/node-version.json",
 		Systemd:          sdOps,
 		RenderServiceDef: renderNodeDef,
 		Platform:         platform,
@@ -272,14 +275,35 @@ func run() {
 				},
 			}),
 			"update_node": actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
-				UnitName:   defaults.NodeServiceName,
-				BinaryPath: defaults.NodeBinaryPath,
-				Platform:   platform,
-				StartStop:  sdCtl,
-				Downloader: actions.ReleaseDownloader{},
-				LoadState:  func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-				SaveState:  func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
-				EmitRaw:    func(m map[string]interface{}) { _ = client.Send(m) },
+				UnitName:        defaults.NodeServiceName,
+				BinaryPath:      defaults.NodeBinaryPath,
+				Platform:        platform,
+				StartStop:       sdCtl,
+				Downloader:      actions.ReleaseDownloader{},
+				DevInstaller:    actions.ManifestDevNodeInstaller{},
+				NodeManifestURL: "https://releases.quilscan.com/node-version.json",
+				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
+			}),
+			"switch_node_source": actions.NewSwitchNodeSourceHandler(actions.NodeSourceSwitcherDeps{
+				UnitName:        defaults.NodeServiceName,
+				UnitDir:         defaults.UnitDir,
+				BinaryPath:      defaults.NodeBinaryPath,
+				Platform:        platform,
+				StartStop:       sdCtl,
+				Reload:          sdCtl.Reload,
+				Downloader:      actions.ReleaseDownloader{},
+				DevInstaller:    actions.ManifestDevNodeInstaller{},
+				NodeManifestURL: "https://releases.quilscan.com/node-version.json",
+				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
 				PatchNodeStatus: func(patch map[string]interface{}) {
 					if rec != nil {
 						rec.PatchNodeStatus(patch)
@@ -364,15 +388,13 @@ func run() {
 	// Background workers — independent of WS connection lifecycle, so they
 	// keep producing data even during reconnect storms.
 	collector = &metrics.Collector{
-		Sender:         client,
-		Tick:           3 * time.Second,
-		IdleTick:       60 * time.Second,
-		Started:        startedAt,
-		NodeMetricsURL: "http://" + systemd.NodeMetricsAddr + "/metrics",
-		DiskPath:       "/",
-		UnitName:       defaults.NodeServiceName,
-		NodeLogPath:    defaults.NodeLogPath,
-		Svc:            svcctl.New(),
+		Sender:   client,
+		Tick:     3 * time.Second,
+		IdleTick: 60 * time.Second,
+		Started:  startedAt,
+		DiskPath: "/",
+		UnitName: defaults.NodeServiceName,
+		Svc:      svcctl.New(),
 	}
 	go collector.Run(ctx)
 
@@ -386,21 +408,23 @@ func run() {
 		reconcileSvc = svcctl.New()
 	}
 	rec = &reconcile.Loop{
-		StatePath:           defaults.StatePath,
-		UnitName:            defaults.NodeServiceName,
-		BinaryPath:          defaults.NodeBinaryPath,
-		QClientBinaryPath:   defaults.QClientBinaryPath,
-		ManagedConfigDir:    defaults.ManagedConfigDir,
-		UnitDir:             defaults.UnitDir,
-		Platform:            platform,
-		Sender:              client,
-		AgentBinaryPath:     defaults.AgentBinaryPath,
-		AgentTokenPath:      defaults.TokenPath,
-		AgentConfigYAMLPath: defaults.ConfigPath,
-		AgentAuditLogPath:   defaults.AuditLogPath,
-		AgentServiceName:    defaults.AgentServiceName,
-		NodeLogPath:         defaults.NodeLogPath,
-		Svc:                 reconcileSvc,
+		StatePath:            defaults.StatePath,
+		UnitName:             defaults.NodeServiceName,
+		BinaryPath:           defaults.NodeBinaryPath,
+		QClientBinaryPath:    defaults.QClientBinaryPath,
+		ManagedConfigDir:     defaults.ManagedConfigDir,
+		UnitDir:              defaults.UnitDir,
+		Platform:             platform,
+		Sender:               client,
+		AgentBinaryPath:      defaults.AgentBinaryPath,
+		AgentTokenPath:       defaults.TokenPath,
+		AgentConfigYAMLPath:  defaults.ConfigPath,
+		AgentAuditLogPath:    defaults.AuditLogPath,
+		AgentServiceName:     defaults.AgentServiceName,
+		NodeLogPath:          defaults.NodeLogPath,
+		Svc:                  reconcileSvc,
+		NodeManifestURL:      "https://releases.quilscan.com/node-version.json",
+		OfficialArtifactsURL: nodemanifest.OfficialArtifactsURLFromBackend(cfg.BackendURL),
 	}
 	go rec.Run(ctx)
 
@@ -434,7 +458,7 @@ func run() {
 			if err != nil {
 				log.Printf("[netinfo] lookup failed: %v", err)
 			} else {
-				log.Printf("[netinfo] %s · %s (%s)", info.PublicIP, info.Country, info.CountryCode)
+				log.Printf("[netinfo] %s - %s (%s)", info.PublicIP, info.Country, info.CountryCode)
 				netMu.Lock()
 				changed := info != netCache
 				netCache = info

@@ -169,6 +169,19 @@ func DownloadQClientLatest(baseURL, platform, destDir string) (string, error) {
 	return version, nil
 }
 
+func FetchLatestNodeVersion(baseURL, platform string) (string, error) {
+	manifestURL := strings.TrimRight(baseURL, "/") + "/release"
+	raw, err := fetchText(manifestURL)
+	if err != nil {
+		return "", err
+	}
+	version := LatestVersionForPrefix(raw, "node", platform)
+	if version == "" {
+		return "", fmt.Errorf("release manifest missing node for %s", platform)
+	}
+	return version, nil
+}
+
 // DownloadAll fetches every name from baseURL into destDir. Returns the first
 // error encountered and stops.
 func DownloadAll(baseURL string, names []string, destDir string) error {

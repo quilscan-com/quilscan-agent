@@ -5,7 +5,7 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 ## Why this is safe
 
 - **Outbound only** — the agent opens a single WebSocket to Quilscan's backend; it never listens on any port.
-- **9-action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `restart_agent`, `update_agent`, `update_node`, `cleanup_residue`, `rescan`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
+- **10-action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `rescan`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
 - **Key files stay off-limits** — the agent does not read key files such as `keys.yml`. It reads `config.yml` locally for RPC detection and peer-ID parsing; the contents are never transmitted.
 - **Downloads are constrained** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go`.
 - **Audit log is human-readable** — every command received is appended to a flat file. You can `cat` it at any time to verify what was done and when.
@@ -69,8 +69,8 @@ For removing only the node (keeping the agent paired), use `remove-node.sh` from
 git clone https://github.com/quilscan-com/quilscan-agent.git
 cd quilscan-agent
 
-# 1. Action whitelist — should show exactly the 9 allowed actions.
-grep -E '"(install|migrate|start|stop|restart_agent|update_agent|update_node|cleanup_residue|rescan)":' cmd/agent/main.go
+# 1. Action whitelist — should show exactly the 10 allowed actions.
+grep -E '"(install|migrate|start|stop|restart_agent|update_agent|update_node|switch_node_source|cleanup_residue|rescan)":' cmd/agent/main.go
 grep -n "ErrForbidden" internal/actions/dispatcher.go
 
 # 2. File reads — should be limited to agent config/state/token/logs,
@@ -108,11 +108,10 @@ quilscan-agent/
 │   ├── config/           # config.yaml + state.yaml (platform-aware defaults)
 │   ├── launchd/          # macOS plist renderer + launchctl wrapper
 │   ├── logstream/        # node-log streaming (journalctl on Linux, tail -f on macOS)
-│   ├── metrics/          # 3s host + node sampling
+│   ├── metrics/          # host + node-process sampling
 │   ├── netinfo/          # public IP + country (ip-api.com)
 │   ├── nodeinfo/         # parses `node --node-info`
 │   ├── nodeinstall/      # install detection (binary / config / process / unit)
-│   ├── peerinfo/         # parses `node --peer-info`
 │   ├── reconcile/        # background loops: verify / du / version-poll
 │   ├── release/          # node release downloader (const URL)
 │   ├── rpcconfig/        # patches node config.yml RPC listen addrs
