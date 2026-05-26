@@ -7,10 +7,14 @@ package launchd
 import (
 	"encoding/xml"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 )
+
+const NodeFileLimit = 61440
 
 // plistDoc + plistDict are the minimal subset of Apple's plist DTD we
 // emit. Using encoding/xml gives us correct character escaping for paths
@@ -26,6 +30,11 @@ type plistDict struct {
 	Entries []any `xml:",any"`
 }
 
+type plistInlineDict struct {
+	XMLName xml.Name `xml:"dict"`
+	Entries []any    `xml:",any"`
+}
+
 type plistKey struct {
 	XMLName xml.Name `xml:"key"`
 	Value   string   `xml:",chardata"`
@@ -38,6 +47,11 @@ type plistString struct {
 
 type plistTrue struct {
 	XMLName xml.Name `xml:"true"`
+}
+
+type plistInteger struct {
+	XMLName xml.Name `xml:"integer"`
+	Value   int      `xml:",chardata"`
 }
 
 type plistArray struct {
@@ -75,6 +89,8 @@ func RenderNodePlist(in svcctl.NodeServiceInput) string {
 		plistKey{Value: "ProgramArguments"}, plistArray{Strings: args},
 		plistKey{Value: "RunAtLoad"}, plistTrue{},
 		plistKey{Value: "ProcessType"}, plistString{Value: "Background"},
+		plistKey{Value: "SoftResourceLimits"}, nodeFileLimitDict(NodeFileLimit),
+		plistKey{Value: "HardResourceLimits"}, nodeFileLimitDict(NodeFileLimit),
 	}
 	if in.WorkDir != "" {
 		entries = append(entries, plistKey{Value: "WorkingDirectory"}, plistString{Value: in.WorkDir})
@@ -103,4 +119,77 @@ func RenderNodePlist(in svcctl.NodeServiceInput) string {
 	out = strings.ReplaceAll(out, "<false></false>", "<false/>")
 	return xml.Header + `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n" +
 		out + "\n"
+}
+
+func nodeFileLimitDict(limit int) plistInlineDict {
+	return plistInlineDict{Entries: []any{
+		plistKey{Value: "NumberOfFiles"},
+		plistInteger{Value: limit},
+	}}
+}
+
+// EnsureNodeFileLimit updates an existing LaunchAgent plist so older managed
+// node installs get the same file descriptor limit as freshly rendered plists.
+func EnsureNodeFileLimit(plistPath string, limit int) (bool, error) {
+	raw, err := os.ReadFile(plistPath)
+	if err != nil {
+		return false, err
+	}
+	updated, changed, err := EnsureNodeFileLimitXML(string(raw), limit)
+	if err != nil || !changed {
+		return changed, err
+	}
+	mode := os.FileMode(0o644)
+	if st, err := os.Stat(plistPath); err == nil {
+		mode = st.Mode().Perm()
+	}
+	return true, os.WriteFile(plistPath, []byte(updated), mode)
+}
+
+func EnsureNodeFileLimitXML(raw string, limit int) (string, bool, error) {
+	if limit <= 0 {
+		return raw, false, fmt.Errorf("invalid node file limit %d", limit)
+	}
+	if hasNodeFileLimit(raw, "SoftResourceLimits", limit) &&
+		hasNodeFileLimit(raw, "HardResourceLimits", limit) {
+		return raw, false, nil
+	}
+	out := removeResourceLimitBlock(raw, "SoftResourceLimits")
+	out = removeResourceLimitBlock(out, "HardResourceLimits")
+	block := resourceLimitBlock("SoftResourceLimits", limit) + resourceLimitBlock("HardResourceLimits", limit)
+	insertAt := plistInsertIndex(out)
+	if insertAt < 0 {
+		return raw, false, fmt.Errorf("plist root dict close not found")
+	}
+	return out[:insertAt] + block + out[insertAt:], true, nil
+}
+
+func plistInsertIndex(raw string) int {
+	if loc := regexp.MustCompile(`\n[ \t]*<key>StandardOutPath</key>`).FindStringIndex(raw); loc != nil {
+		return loc[0]
+	}
+	matches := regexp.MustCompile(`\n[ \t]*</dict>`).FindAllStringIndex(raw, -1)
+	if len(matches) == 0 {
+		return -1
+	}
+	return matches[len(matches)-1][0]
+}
+
+func hasNodeFileLimit(raw, key string, limit int) bool {
+	pattern := fmt.Sprintf(`(?s)<key>%s</key>\s*<dict>\s*<key>NumberOfFiles</key>\s*<integer>\s*%d\s*</integer>\s*</dict>`, regexp.QuoteMeta(key), limit)
+	return regexp.MustCompile(pattern).MatchString(raw)
+}
+
+func removeResourceLimitBlock(raw, key string) string {
+	pattern := fmt.Sprintf(`(?s)\s*<key>%s</key>\s*<dict>.*?</dict>`, regexp.QuoteMeta(key))
+	return regexp.MustCompile(pattern).ReplaceAllString(raw, "")
+}
+
+func resourceLimitBlock(key string, limit int) string {
+	return fmt.Sprintf(`
+  <key>%s</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>%d</integer>
+  </dict>`, key, limit)
 }

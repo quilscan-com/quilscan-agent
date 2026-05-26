@@ -31,7 +31,15 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.4"
+var version = "1.0.5"
+
+type startStopCtl interface {
+	Start(string) error
+	Stop(string) error
+	Disable(string) error
+	Reload() error
+	IsActive(string) bool
+}
 
 func main() {
 	if len(os.Args) > 1 {
@@ -118,13 +126,6 @@ func run() {
 	// FSOps + Ctl pair handles writing service definitions to disk
 	// (systemd unit / launchd plist) and lifecycle commands. defaults is
 	// already platform-aware (DefaultConfig branches on runtime.GOOS).
-	type startStopCtl interface {
-		Start(string) error
-		Stop(string) error
-		Disable(string) error
-		Reload() error
-		IsActive(string) bool
-	}
 	var sdOps actions.SystemdOps
 	var sdCtl startStopCtl
 	var renderNodeDef func(svcctl.NodeServiceInput) string
@@ -144,6 +145,7 @@ func run() {
 			})
 		}
 	}
+	ensureDarwinNodeFileLimitOnStartup(defaults, sdCtl)
 
 	// Post-install hook: wait for node's auto-generated config.yml, set
 	// loopback listen multiaddrs (without overriding user values), restart
@@ -533,6 +535,66 @@ func hasRecordedNode(statePath string) bool {
 	}
 	st, err := os.Stat(state.ConfigPath)
 	return err == nil && st.IsDir()
+}
+
+func ensureDarwinNodeFileLimitOnStartup(defaults config.Config, ctl startStopCtl) {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	changed, err := ensureNodeLaunchdFileLimit(defaults, ctl)
+	if err != nil {
+		log.Printf("[launchd] node file limit check failed: %v", err)
+		return
+	}
+	if changed {
+		log.Printf("[launchd] node file limit set to %d", launchd.NodeFileLimit)
+	}
+}
+
+func ensureNodeLaunchdFileLimit(defaults config.Config, ctl startStopCtl) (bool, error) {
+	if ctl == nil || defaults.NodeBinaryPath == "" || defaults.UnitDir == "" || defaults.NodeServiceName == "" {
+		return false, nil
+	}
+	if st, err := os.Stat(defaults.NodeBinaryPath); err != nil || st.IsDir() {
+		return false, nil
+	}
+	plistPath := filepath.Join(defaults.UnitDir, defaults.NodeServiceName+".plist")
+	if st, err := os.Stat(plistPath); err != nil || st.IsDir() {
+		return false, nil
+	}
+	wasActive := ctl.IsActive(defaults.NodeServiceName)
+	changed, err := launchd.EnsureNodeFileLimit(plistPath, launchd.NodeFileLimit)
+	if err != nil || !changed || !wasActive {
+		return changed, err
+	}
+	if err := ctl.Stop(defaults.NodeServiceName); err != nil {
+		return true, fmt.Errorf("restart node after file limit update: stop: %w", err)
+	}
+	if err := startNodeAfterLaunchdFileLimitUpdate(ctl, defaults.NodeServiceName); err != nil {
+		return true, fmt.Errorf("restart node after file limit update: start: %w", err)
+	}
+	return true, nil
+}
+
+var launchdFileLimitRestartDelay = time.Second
+
+func startNodeAfterLaunchdFileLimitUpdate(ctl startStopCtl, name string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(launchdFileLimitRestartDelay)
+		}
+		if err := ctl.Start(name); err != nil {
+			lastErr = err
+			continue
+		}
+		time.Sleep(launchdFileLimitRestartDelay)
+		if ctl.IsActive(name) {
+			return nil
+		}
+		lastErr = fmt.Errorf("service did not become active")
+	}
+	return lastErr
 }
 
 func hasExistingNodeAt(binaryPath, stateCfgPath, defaultCfgDir, unitFilePath string) bool {
