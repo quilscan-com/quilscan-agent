@@ -31,7 +31,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.3"
+var version = "1.0.4"
 
 func main() {
 	if len(os.Args) > 1 {
