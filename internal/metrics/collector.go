@@ -64,22 +64,33 @@ type Collector struct {
 
 	// Internal sample state — mutex-guarded because we may eventually expose
 	// stats over a side channel.
-	mu          sync.Mutex
-	cpuPoints   []float64
-	memPoints   []float64
-	diskPoints  []float64
-	cpuStaticOK bool
-	cpuModel    string
-	cpuCores    int
-	netLast     netCounters
-	netLastAt   time.Time
-	streaming   bool
-	modeCh      chan struct{}
+	mu                     sync.Mutex
+	cpuPoints              []float64
+	memPoints              []float64
+	diskPoints             []float64
+	cpuStaticOK            bool
+	cpuModel               string
+	cpuCores               int
+	netLast                netCounters
+	netLastAt              time.Time
+	netRealtime            []netRateSample
+	netOverview            []netRateSample
+	netOverviewBucketStart time.Time
+	netOverviewBucketDown  float64
+	netOverviewBucketUp    float64
+	netOverviewBucketCount int
+	streaming              bool
+	modeCh                 chan struct{}
 }
 
 const (
-	pointsCapacity = 24 // ~ 1 minute of data at 3s tick
-	defaultNetDevPath = "/proc/net/dev"
+	pointsCapacity            = 24 // ~ 1 minute of data at 3s tick
+	defaultNetDevPath         = "/proc/net/dev"
+	netRealtimeSampleInterval = 3 * time.Second
+	netRealtimeWindow         = 10 * time.Minute
+	netRealtimeCapacity       = int(netRealtimeWindow / netRealtimeSampleInterval)
+	netOverviewWindow         = 12 * time.Hour
+	netOverviewBucket         = 5 * time.Minute
 )
 
 var darwinTopIdlePattern = regexp.MustCompile(`(?i)([0-9]+(?:\.[0-9]+)?)%\s+idle`)
@@ -230,13 +241,18 @@ func (c *Collector) sample() map[string]interface{} {
 	}
 
 	if nc, ok := readNetCounters(c.NetDevPath); ok {
+		now := time.Now()
 		frame["net_rx_bytes"] = nc.RXBytes
 		frame["net_tx_bytes"] = nc.TXBytes
 		frame["net_total_sub"] = fmt.Sprintf("RX %s / TX %s", humanBytes(nc.RXBytes), humanBytes(nc.TXBytes))
-		if down, up, ok := c.netRates(nc, time.Now()); ok {
+		if down, up, ok := c.netRates(nc, now); ok {
 			frame["net_down_mbit_s"] = down
 			frame["net_up_mbit_s"] = up
 			frame["net_speed_sub"] = fmt.Sprintf("Down %.2f Mbit/s / Up %.2f Mbit/s", down, up)
+			c.recordNetRateSample(now, down, up)
+		}
+		if history := c.netHistoryPayload(now); history != nil {
+			frame["net_history"] = history
 		}
 	}
 
@@ -289,6 +305,24 @@ type netCounters struct {
 	TXBytes uint64
 }
 
+type netRateSample struct {
+	At       time.Time
+	DownMbit float64
+	UpMbit   float64
+}
+
+type netHistoryPayload struct {
+	Realtime netHistorySeries  `json:"realtime"`
+	Overview *netHistorySeries `json:"overview,omitempty"`
+}
+
+type netHistorySeries struct {
+	IntervalSec int             `json:"interval_sec"`
+	WindowSec   int             `json:"window_sec"`
+	Points      [][]interface{} `json:"points"`
+	UpdatedAt   int64           `json:"updated_at,omitempty"`
+}
+
 func (c *Collector) netRates(current netCounters, now time.Time) (float64, float64, bool) {
 	c.mu.Lock()
 	previous := c.netLast
@@ -310,6 +344,119 @@ func (c *Collector) netRates(current netCounters, now time.Time) (float64, float
 	downMbit := float64(current.RXBytes-previous.RXBytes) * 8 / 1024 / 1024 / elapsed
 	upMbit := float64(current.TXBytes-previous.TXBytes) * 8 / 1024 / 1024 / elapsed
 	return round2(downMbit), round2(upMbit), true
+}
+
+func (c *Collector) recordNetRateSample(now time.Time, downMbit, upMbit float64) {
+	if now.IsZero() {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sample := netRateSample{
+		At:       now,
+		DownMbit: round2(nonNegative(downMbit)),
+		UpMbit:   round2(nonNegative(upMbit)),
+	}
+	c.netRealtime = append(c.netRealtime, sample)
+	c.trimRealtimeLocked(now)
+	c.addOverviewSampleLocked(sample)
+}
+
+func (c *Collector) trimRealtimeLocked(now time.Time) {
+	cutoff := now.Add(-netRealtimeWindow)
+	keepFrom := 0
+	for keepFrom < len(c.netRealtime) && c.netRealtime[keepFrom].At.Before(cutoff) {
+		keepFrom++
+	}
+	if keepFrom > 0 {
+		c.netRealtime = append([]netRateSample(nil), c.netRealtime[keepFrom:]...)
+	}
+	if len(c.netRealtime) > netRealtimeCapacity {
+		c.netRealtime = append([]netRateSample(nil), c.netRealtime[len(c.netRealtime)-netRealtimeCapacity:]...)
+	}
+}
+
+func (c *Collector) addOverviewSampleLocked(sample netRateSample) {
+	bucketStart := sample.At.Truncate(netOverviewBucket)
+	if c.netOverviewBucketStart.IsZero() {
+		c.netOverviewBucketStart = bucketStart
+	}
+	if bucketStart.After(c.netOverviewBucketStart) {
+		c.flushOverviewBucketLocked()
+		c.netOverviewBucketStart = bucketStart
+		c.netOverviewBucketDown = 0
+		c.netOverviewBucketUp = 0
+		c.netOverviewBucketCount = 0
+	}
+	if bucketStart.Before(c.netOverviewBucketStart) {
+		return
+	}
+	c.netOverviewBucketDown += sample.DownMbit
+	c.netOverviewBucketUp += sample.UpMbit
+	c.netOverviewBucketCount++
+}
+
+func (c *Collector) flushOverviewBucketLocked() {
+	if c.netOverviewBucketStart.IsZero() || c.netOverviewBucketCount <= 0 {
+		return
+	}
+	at := c.netOverviewBucketStart.Add(netOverviewBucket)
+	c.netOverview = append(c.netOverview, netRateSample{
+		At:       at,
+		DownMbit: round2(c.netOverviewBucketDown / float64(c.netOverviewBucketCount)),
+		UpMbit:   round2(c.netOverviewBucketUp / float64(c.netOverviewBucketCount)),
+	})
+	cutoff := at.Add(-netOverviewWindow)
+	keepFrom := 0
+	for keepFrom < len(c.netOverview) && c.netOverview[keepFrom].At.Before(cutoff) {
+		keepFrom++
+	}
+	if keepFrom > 0 {
+		c.netOverview = append([]netRateSample(nil), c.netOverview[keepFrom:]...)
+	}
+}
+
+func (c *Collector) netHistoryPayload(now time.Time) *netHistoryPayload {
+	c.mu.Lock()
+	if len(c.netRealtime) == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	realtime := make([]netRateSample, len(c.netRealtime))
+	copy(realtime, c.netRealtime)
+	overview := make([]netRateSample, len(c.netOverview))
+	copy(overview, c.netOverview)
+	c.mu.Unlock()
+
+	return &netHistoryPayload{
+		Realtime: netHistorySeries{
+			IntervalSec: int(netRealtimeSampleInterval.Seconds()),
+			WindowSec:   int(netRealtimeWindow.Seconds()),
+			Points:      encodeNetPoints(realtime),
+		},
+		Overview: &netHistorySeries{
+			IntervalSec: int(netOverviewBucket.Seconds()),
+			WindowSec:   int(netOverviewWindow.Seconds()),
+			Points:      encodeNetPoints(overview),
+			UpdatedAt:   now.UnixMilli(),
+		},
+	}
+}
+
+func encodeNetPoints(samples []netRateSample) [][]interface{} {
+	points := make([][]interface{}, 0, len(samples))
+	for _, s := range samples {
+		points = append(points, []interface{}{s.At.UnixMilli(), s.DownMbit, s.UpMbit})
+	}
+	return points
+}
+
+func nonNegative(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 func readNetCounters(path string) (netCounters, bool) {
