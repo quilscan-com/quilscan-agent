@@ -275,11 +275,15 @@ func (l *Loop) runVerify() {
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
 		nodePatch["node_connections"] = nil
+		nodePatch["prover_address"] = ""
 		foundPeerID := ""
 		info := l.readNodeInfo(state)
 		if info != nil {
 			if info.PeerID != "" && isLegacyPeerID(info.PeerID) {
 				foundPeerID = info.PeerID
+			}
+			if proverAddress := normalizeProverAddress(info.ProverAddress); proverAddress != "" {
+				nodePatch["prover_address"] = proverAddress
 			}
 			if info.Version != "" {
 				nodePatch["node_info_version"] = info.Version
@@ -360,6 +364,7 @@ func (l *Loop) runVerify() {
 		}
 	} else {
 		nodePatch["peer_id"] = unknownPeerID
+		nodePatch["prover_address"] = ""
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
 		nodePatch["node_connections"] = nil
@@ -575,6 +580,17 @@ func mergePatch(dst, src map[string]interface{}) {
 	for k, v := range src {
 		dst[k] = v
 	}
+}
+
+func normalizeProverAddress(value string) string {
+	v := strings.TrimSpace(value)
+	if len(v) >= 2 && strings.EqualFold(v[:2], "0x") {
+		v = v[2:]
+	}
+	if v == "" || v == "--" {
+		return ""
+	}
+	return strings.ToLower(v)
 }
 
 func (l *Loop) nodeInfoConfigPath(state *config.State) string {
