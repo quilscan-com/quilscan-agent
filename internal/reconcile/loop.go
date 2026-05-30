@@ -760,9 +760,14 @@ func (l *Loop) broadcastSystemFilesIfChanged(stateCfgPath string) {
 		"node_service_unit_path":  nodeUnitPath,
 	}
 	if stateCfgPath != "" {
+		storePath := filepath.Join(stateCfgPath, "store")
+		workerStorePath := filepath.Join(stateCfgPath, "worker-store")
 		patch["node_config_dir"] = stateCfgPath
 		patch["node_keys_path"] = filepath.Join(stateCfgPath, "keys.yml")
-		patch["node_worker_store_dir"] = filepath.Join(stateCfgPath, "worker-store")
+		patch["node_store_path"] = storePath
+		patch["node_store_exists"] = pathExists(storePath)
+		patch["node_worker_store_dir"] = workerStorePath
+		patch["node_worker_store_exists"] = pathExists(workerStorePath)
 	}
 
 	// Only paths are surfaced — token, state.yaml, service units, keys.yml,
@@ -775,12 +780,20 @@ func (l *Loop) broadcastSystemFilesIfChanged(stateCfgPath string) {
 		"agent_binary_path", "agent_token_path", "agent_config_yaml_path",
 		"agent_state_yaml_path", "agent_audit_log_path", "agent_service_unit_path",
 		"node_binary_path", "qclient_binary_path", "node_managed_config_dir", "node_service_unit_path",
-		"node_config_dir", "node_keys_path", "node_worker_store_dir",
+		"node_config_dir", "node_keys_path", "node_store_path", "node_worker_store_dir",
 	} {
 		if v, ok := patch[k].(string); ok {
 			h.Write([]byte(k))
 			h.Write([]byte{0})
 			h.Write([]byte(v))
+			h.Write([]byte{0})
+		}
+	}
+	for _, k := range []string{"node_store_exists", "node_worker_store_exists"} {
+		if v, ok := patch[k].(bool); ok {
+			h.Write([]byte(k))
+			h.Write([]byte{0})
+			h.Write([]byte(strconv.FormatBool(v)))
 			h.Write([]byte{0})
 		}
 	}
@@ -795,6 +808,11 @@ func (l *Loop) broadcastSystemFilesIfChanged(stateCfgPath string) {
 		return
 	}
 	l.updateNodeStatus(patch)
+}
+
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }
 
 // broadcastConfigYAMLIfChanged reads ${cfgDir}/config.yml locally, derives

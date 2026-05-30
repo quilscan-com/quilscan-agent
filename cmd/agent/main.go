@@ -31,7 +31,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.7"
+var version = "1.0.8"
 
 type startStopCtl interface {
 	Start(string) error
@@ -270,6 +270,27 @@ func run() {
 				UnitDir:           defaults.UnitDir,
 				Systemd:           sdCtl,
 				EmitRaw:           func(m map[string]interface{}) { _ = client.Send(m) },
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
+			}),
+			"delete_node_store": actions.NewDeleteNodeStoreHandler(actions.DeleteNodeStoreDeps{
+				StatePath:     defaults.StatePath,
+				BackupRootDir: defaults.BackupRootDir,
+				UnitName:      defaults.NodeServiceName,
+				Systemd:       sdCtl,
+				EmitRaw:       func(m map[string]interface{}) { _ = client.Send(m) },
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
+			}),
+			"delete_node_store_backup": actions.NewDeleteNodeStoreBackupHandler(actions.DeleteNodeStoreBackupDeps{
+				BackupRootDir: defaults.BackupRootDir,
+				EmitRaw:       func(m map[string]interface{}) { _ = client.Send(m) },
 				PatchNodeStatus: func(patch map[string]interface{}) {
 					if rec != nil {
 						rec.PatchNodeStatus(patch)
