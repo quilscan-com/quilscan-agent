@@ -68,7 +68,11 @@ func switchToDevNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, state *c
 	}
 	installer := d.DevInstaller
 	if installer == nil {
-		installer = ManifestDevNodeInstaller{}
+		installer = ManifestDevNodeInstaller{
+			progress: func(step string, progress float64) {
+				emit(Status{ID: c.ID, Step: step, Progress: progress})
+			},
+		}
 	}
 	fromSource := state.NodeSource
 	fromVersion := state.InstalledNodeVersion

@@ -381,20 +381,21 @@ func (l *Loop) runVerify() {
 	l.updateNodeStatus(nodePatch)
 	if l.Sender != nil {
 		meta := map[string]interface{}{
-			"type":                   "meta_update",
-			"has_node":               detection.HasNode,
-			"has_qclient":            qclientInstalled,
-			"qclient_version":        state.QClientVersion,
-			"qclient_binary_path":    l.qclientBinaryPath(),
-			"node_version":           state.NodeVersion,
-			"node_source":            state.NodeSource,
-			"installed_node_version": state.InstalledNodeVersion,
-			"node_base_version":      state.NodeBaseVersion,
-			"node_build_number":      state.NodeBuildNumber,
-			"node_binary_sha256":     state.NodeBinarySHA256,
-			"node_manifest_url":      state.NodeManifestURL,
-			"install_source":         state.InstallSource,
-			"node_residues":          detection.Residues,
+			"type":                        "meta_update",
+			"has_node":                    detection.HasNode,
+			"has_qclient":                 qclientInstalled,
+			"qclient_version":             state.QClientVersion,
+			"qclient_binary_path":         l.qclientBinaryPath(),
+			"node_version":                state.NodeVersion,
+			"node_source":                 state.NodeSource,
+			"installed_node_version":      state.InstalledNodeVersion,
+			"node_base_version":           state.NodeBaseVersion,
+			"node_build_number":           state.NodeBuildNumber,
+			"node_binary_sha256":          state.NodeBinarySHA256,
+			"node_manifest_url":           state.NodeManifestURL,
+			"dev_node_signature_verified": state.DevNodeSignatureVerified,
+			"install_source":              state.InstallSource,
+			"node_residues":               detection.Residues,
 		}
 		if peerID, _ := nodePatch["peer_id"].(string); peerID != "" {
 			meta["peer_id"] = peerID
@@ -436,6 +437,10 @@ func (l *Loop) refreshNodeManifestState(state *config.State, now time.Time) map[
 	sha, err := nodemanifest.HashFile(l.BinaryPath)
 	if err != nil {
 		return patch
+	}
+	previousSHA := state.NodeBinarySHA256
+	if previousSHA != "" && !strings.EqualFold(previousSHA, sha) {
+		state.DevNodeSignatureVerified = false
 	}
 	state.NodeBinarySHA256 = sha
 	patch["node_binary_sha256"] = sha
@@ -557,6 +562,7 @@ func applyNodeManifestMatch(state *config.State, match nodemanifest.Match) {
 	state.InstalledNodeVersion = match.Version
 	state.NodeBaseVersion = match.BaseVersion
 	state.NodeBuildNumber = match.BuildNumber
+	state.DevNodeSignatureVerified = match.Source == nodemanifest.SourceDev && state.DevNodeSignatureVerified
 	if state.NodeBaseVersion == "" && match.Source == nodemanifest.SourceReleases {
 		state.NodeBaseVersion = match.Version
 	}
@@ -568,6 +574,7 @@ func patchNodeSourceFromState(patch map[string]interface{}, state *config.State)
 	patch["node_base_version"] = state.NodeBaseVersion
 	patch["node_build_number"] = state.NodeBuildNumber
 	patch["node_binary_sha256"] = state.NodeBinarySHA256
+	patch["dev_node_signature_verified"] = state.NodeSource == nodemanifest.SourceDev && state.DevNodeSignatureVerified
 	if state.NodeManifestURL != "" {
 		patch["node_manifest_url"] = state.NodeManifestURL
 	}

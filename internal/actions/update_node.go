@@ -160,7 +160,11 @@ func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.Sta
 	}
 	installer := d.DevInstaller
 	if installer == nil {
-		installer = ManifestDevNodeInstaller{}
+		installer = ManifestDevNodeInstaller{
+			progress: func(step string, progress float64) {
+				emit(Status{ID: c.ID, Step: step, Progress: progress})
+			},
+		}
 	}
 
 	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
@@ -218,6 +222,7 @@ func applyDevInstallResult(state *config.State, result DevNodeInstallResult) {
 	state.NodeBinarySHA256 = result.SHA256
 	state.NodeManifestURL = result.ManifestURL
 	state.NodeManifestCheckedAt = result.CheckedAt
+	state.DevNodeSignatureVerified = result.SignatureVerified
 	state.LatestDevNodeVersion = result.Version
 	state.LatestDevNodeURL = result.URL
 	state.LatestDevNodeSHA256 = result.SHA256
@@ -237,6 +242,7 @@ func nodeStatusPatchForDevResult(result DevNodeInstallResult, updateAvailable bo
 		"node_binary_sha256":           result.SHA256,
 		"node_manifest_url":            result.ManifestURL,
 		"node_manifest_checked_at":     checkedAt.Format(time.RFC3339),
+		"dev_node_signature_verified":  result.SignatureVerified,
 		"latest_node_version":          result.Version,
 		"latest_dev_node_version":      result.Version,
 		"latest_dev_node_url":          result.URL,

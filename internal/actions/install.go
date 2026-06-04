@@ -401,6 +401,7 @@ func NewInstallHandler(d InstallDeps) Handler {
 				meta["node_build_number"] = savedState.NodeBuildNumber
 				meta["node_binary_sha256"] = savedState.NodeBinarySHA256
 				meta["node_manifest_url"] = savedState.NodeManifestURL
+				meta["dev_node_signature_verified"] = savedState.DevNodeSignatureVerified
 				if !savedState.NodeManifestCheckedAt.IsZero() {
 					meta["node_manifest_checked_at"] = savedState.NodeManifestCheckedAt.Format(time.RFC3339)
 				}

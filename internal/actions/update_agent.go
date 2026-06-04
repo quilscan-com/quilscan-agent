@@ -1,6 +1,8 @@
 package actions
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,15 +23,19 @@ const urlPrefixSeparator = "/"
 // initial binary from. Frontend can override per-call via cmd args.
 const DefaultAgentReleaseURLPrefix = "https://qstorage.quilibrium.com/quilscan-agent"
 
+const agentSigningPublicKeyBase64 = "CdZQuKKKObFcsQY61nhp4vZw7H6jBGBnlav7NuIh53k="
+
 // AgentUpdaterDeps wires the self-update flow: download new binary, atomic
 // rename onto the agent binary path, and request the platform service manager
 // to restart the service. Restart happens out-of-band so the cmd_status reply
 // makes it back to backend before this process is killed.
 type AgentUpdaterDeps struct {
-	AgentBinaryPath string        // e.g. /usr/local/bin/quilscan-agent
-	Platform        string        // linux-amd64 / linux-arm64 / darwin-arm64
-	SelfServiceUnit string        // systemd unit name OR launchd label
-	Svc             SelfRestarter // service controller, used to bounce ourselves
+	AgentBinaryPath        string        // e.g. /usr/local/bin/quilscan-agent
+	Platform               string        // linux-amd64 / linux-arm64 / darwin-arm64
+	SelfServiceUnit        string        // systemd unit name OR launchd label
+	Svc                    SelfRestarter // service controller, used to bounce ourselves
+	ReleaseURLPrefix       string        // test override; defaults to DefaultAgentReleaseURLPrefix
+	SigningPublicKeyBase64 string        // test override; defaults to agentSigningPublicKeyBase64
 }
 
 // NewUpdateAgentHandler constructs the update_agent action.
@@ -47,10 +53,14 @@ func NewUpdateAgentHandler(d AgentUpdaterDeps) Handler {
 		// and replace our own process — bypassing the entire 9-action
 		// whitelist. The prefix is a Go `const`, not user-configurable
 		// at runtime, so this check is grep-auditable.
+		releaseURLPrefix := strings.TrimRight(strings.TrimSpace(d.ReleaseURLPrefix), "/")
+		if releaseURLPrefix == "" {
+			releaseURLPrefix = DefaultAgentReleaseURLPrefix
+		}
 		url, _ := c.Args["url"].(string)
-		defaultURL := fmt.Sprintf("%s/quilscan-agent-%s", DefaultAgentReleaseURLPrefix, d.Platform)
-		if url != "" && !strings.HasPrefix(url, DefaultAgentReleaseURLPrefix+urlPrefixSeparator) {
-			err := fmt.Errorf("update_agent: refusing untrusted URL (must start with %s/)", DefaultAgentReleaseURLPrefix)
+		defaultURL := fmt.Sprintf("%s/quilscan-agent-%s", releaseURLPrefix, d.Platform)
+		if url != "" && !strings.HasPrefix(url, releaseURLPrefix+urlPrefixSeparator) {
+			err := fmt.Errorf("update_agent: refusing untrusted URL (must start with %s/)", releaseURLPrefix)
 			emit(Status{ID: c.ID, Step: "rejected", Error: err.Error()})
 			return err
 		}
@@ -64,15 +74,27 @@ func NewUpdateAgentHandler(d AgentUpdaterDeps) Handler {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
+		defer os.Remove(tmp)
+
+		emit(Status{ID: c.ID, Step: "verifying_signature", Progress: 0.45})
+		sigTmp := tmp + ".sig"
+		if err := downloadAgentBinary(url+".sig", sigTmp); err != nil {
+			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+			return err
+		}
+		defer os.Remove(sigTmp)
+		if err := verifyAgentBinarySignature(tmp, sigTmp, d.SigningPublicKeyBase64); err != nil {
+			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+			return err
+		}
+
 		if err := os.Chmod(tmp, 0o755); err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			os.Remove(tmp)
 			return err
 		}
 
 		// Sanity check: don't ship empty / 4xx HTML downloads.
 		if info, err := os.Stat(tmp); err == nil && info.Size() < 1024*1024 {
-			os.Remove(tmp)
 			err := fmt.Errorf("downloaded binary too small (%d bytes); refusing to install", info.Size())
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
@@ -83,7 +105,6 @@ func NewUpdateAgentHandler(d AgentUpdaterDeps) Handler {
 		// safe to do without first stopping ourselves.
 		emit(Status{ID: c.ID, Step: "swapping_binary", Progress: 0.70})
 		if err := os.Rename(tmp, d.AgentBinaryPath); err != nil {
-			os.Remove(tmp)
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
@@ -107,6 +128,39 @@ func NewUpdateAgentHandler(d AgentUpdaterDeps) Handler {
 
 		return nil
 	}
+}
+
+func verifyAgentBinarySignature(binaryPath, signaturePath, publicKeyBase64 string) error {
+	binary, err := os.ReadFile(binaryPath)
+	if err != nil {
+		return fmt.Errorf("read agent binary: %w", err)
+	}
+	signatureRaw, err := os.ReadFile(signaturePath)
+	if err != nil {
+		return fmt.Errorf("read agent signature: %w", err)
+	}
+	publicKeyText := strings.TrimSpace(publicKeyBase64)
+	if publicKeyText == "" {
+		publicKeyText = agentSigningPublicKeyBase64
+	}
+	publicKey, err := base64.StdEncoding.DecodeString(publicKeyText)
+	if err != nil {
+		return fmt.Errorf("parse agent public key: %w", err)
+	}
+	if len(publicKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("agent public key has %d bytes, want %d", len(publicKey), ed25519.PublicKeySize)
+	}
+	signature, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(signatureRaw)))
+	if err != nil {
+		return fmt.Errorf("parse agent signature: %w", err)
+	}
+	if len(signature) != ed25519.SignatureSize {
+		return fmt.Errorf("agent signature has %d bytes, want %d", len(signature), ed25519.SignatureSize)
+	}
+	if !ed25519.Verify(ed25519.PublicKey(publicKey), binary, signature) {
+		return fmt.Errorf("agent signature verification failed")
+	}
+	return nil
 }
 
 // downloadAgentBinary fetches url to dst with a 5min timeout. Streams to disk

@@ -36,6 +36,7 @@ type State struct {
 	NodeBinarySHA256         string    `yaml:"node_binary_sha256,omitempty"`
 	NodeManifestURL          string    `yaml:"node_manifest_url,omitempty"`
 	NodeManifestCheckedAt    time.Time `yaml:"node_manifest_checked_at,omitempty"`
+	DevNodeSignatureVerified bool      `yaml:"dev_node_signature_verified,omitempty"`
 	LatestDevNodeVersion     string    `yaml:"latest_dev_node_version,omitempty"`
 	LatestDevNodeURL         string    `yaml:"latest_dev_node_url,omitempty"`
 	LatestDevNodeSHA256      string    `yaml:"latest_dev_node_sha256,omitempty"`

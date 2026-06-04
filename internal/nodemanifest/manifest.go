@@ -54,6 +54,7 @@ type Artifact struct {
 	SHA256        string   `json:"sha256"`
 	URL           string   `json:"url"`
 	DigestURL     string   `json:"digest_url"`
+	SignatureURL  string   `json:"signature_url"`
 	SignatureURLs []string `json:"signature_urls"`
 }
 

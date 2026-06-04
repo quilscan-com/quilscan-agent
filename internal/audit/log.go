@@ -1,8 +1,8 @@
 // Package audit appends a human-readable record of every command the
 // agent receives. The path is platform-specific — /var/log on Linux
-// (root-owned, world-readable) and ~/Library/Logs on macOS
-// (user-owned). Either way the user can `cat` it to verify what the
-// agent did and when.
+// (root-owned) and ~/Library/Logs on macOS (user-owned). New logs are created
+// owner-readable only so multi-user hosts cannot read another operator's
+// agent activity.
 package audit
 
 import (
@@ -19,9 +19,9 @@ type Writer struct {
 	f  *os.File
 }
 
-// New opens path in append mode (0644), creating if missing.
+// New opens path in append mode (0600), creating if missing.
 func New(path string) (*Writer, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}

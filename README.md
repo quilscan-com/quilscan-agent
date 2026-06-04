@@ -7,7 +7,7 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 - **Outbound only** — the agent opens a single WebSocket to Quilscan's backend; it never listens on any port.
 - **10-action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `rescan`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
 - **Key files stay off-limits** — the agent does not read key files such as `keys.yml`. It reads `config.yml` locally for RPC detection and peer-ID parsing; the contents are never transmitted.
-- **Downloads are constrained** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go`.
+- **Downloads are constrained and verified** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go` and pass the built-in Ed25519 signature check before replacement.
 - **Audit log is human-readable** — every command received is appended to a flat file. You can `cat` it at any time to verify what was done and when.
 - **Token is local** — generated on install via `crypto/rand`, stored `chmod 600`. Not persisted on Quilscan's servers.
 
@@ -27,6 +27,76 @@ The installer:
 Fresh node installs may patch empty local RPC listen addresses in `config.yml` so the dashboard can read local node data. Migrated/imported node configs are not modified.
 
 Copy the token. Paste it into Quilscan's `/node-console` page to pair.
+
+## Agent self-update verification
+
+Agent self-updates are verified before the running binary is replaced.
+
+For each platform release, publish the binary and its detached signature in the
+agent release bucket:
+
+```text
+quilscan-agent-linux-amd64
+quilscan-agent-linux-amd64.sig
+quilscan-agent-linux-arm64
+quilscan-agent-linux-arm64.sig
+quilscan-agent-darwin-arm64
+quilscan-agent-darwin-arm64.sig
+```
+
+The update action only accepts URLs under `DefaultAgentReleaseURLPrefix`, which
+defaults to:
+
+```text
+https://qstorage.quilibrium.com/quilscan-agent
+```
+
+During an update, the agent downloads the selected platform binary to a
+temporary `.new` path, downloads the signature from the same URL plus `.sig`,
+and verifies:
+
+```text
+ed25519.Verify(built_in_public_key, binary_bytes, base64_signature)
+```
+
+Only after verification succeeds does the agent make the file executable,
+replace the installed binary, and restart the agent service. If the signature is
+missing, malformed, or does not match the downloaded bytes, the update fails and
+the existing agent binary is left in place.
+
+## Dev Node public builds
+
+Quilscan Dev Node binaries are separate from official Quilibrium release
+artifacts. They are built from a public build repository so users can inspect
+the source commit, workflow, build logs, artifact SHA-256, and detached
+signature.
+
+The intended release flow is:
+
+1. The build server resolves the latest commit for the configured upstream
+   Quilibrium branch.
+2. The public build repository runs GitHub Actions for `linux-amd64` and
+   `darwin-arm64`.
+3. Each workflow builds the node from source, writes `build-info.json` and
+   `SHA256SUMS`, and signs the node binary with the release signing key.
+4. The build server downloads the GitHub artifacts, verifies the binary SHA-256
+   and detached signature with the configured public key, then uploads the
+   accepted binary, `.sig`, `SHA256SUMS`, and `build-info.json` to the release
+   bucket.
+5. `node-version.json` is published only after both required platforms have
+   succeeded and have been uploaded.
+
+When installing, switching to, or updating a Dev Node, the agent reads
+`node-version.json`, downloads the platform binary and `signature_url`, verifies
+the binary bytes with the built-in public key, checks the SHA-256 against the
+manifest, then replaces only the managed node binary. Config files, keys, peer
+ID, worker store, and node data are not replaced.
+
+Unsigned legacy Dev Node entries can still be identified by SHA-256, but new
+Dev Node installs and updates require a signed artifact. If the manifest entry
+does not include `signature_url`, or the signature object is missing, the agent
+refuses the Dev Node replacement instead of silently installing an unsigned
+binary.
 
 ## File layout
 
@@ -82,6 +152,10 @@ grep -rn "keys.yml" cmd/ internal/ | grep -v _test
 # 3. Download URL guards
 grep -n "ReleaseBaseURL" internal/release/download.go
 grep -n "DefaultAgentReleaseURLPrefix" internal/actions/update_agent.go
+
+# 4. Agent and Dev Node signature verification paths
+grep -n "verifyAgentBinarySignature" internal/actions/update_agent.go
+grep -n "verifySignature" internal/actions/dev_node.go
 ```
 
 If any of these audits fail, **do not trust the binary**.
@@ -109,7 +183,7 @@ quilscan-agent/
 │   ├── launchd/          # macOS plist renderer + launchctl wrapper
 │   ├── logstream/        # node-log streaming (journalctl on Linux, tail -f on macOS)
 │   ├── metrics/          # host + node-process sampling
-│   ├── netinfo/          # public IP + country (ip-api.com)
+│   ├── netinfo/          # public IP + country over HTTPS
 │   ├── nodeinfo/         # parses `node --node-info`
 │   ├── nodeinstall/      # install detection (binary / config / process / unit)
 │   ├── reconcile/        # background loops: verify / du / version-poll

@@ -31,7 +31,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.8"
+var version = "1.0.9"
 
 type startStopCtl interface {
 	Start(string) error
@@ -221,7 +221,7 @@ func run() {
 	installHandler := actions.NewInstallHandler(actions.InstallDeps{
 		Downloader:       actions.ReleaseDownloader{},
 		DevInstaller:     actions.ManifestDevNodeInstaller{},
-		NodeManifestURL:  "https://releases.quilscan.com/node-version.json",
+		NodeManifestURL:  nodemanifest.DefaultURL,
 		Systemd:          sdOps,
 		RenderServiceDef: renderNodeDef,
 		Platform:         platform,
@@ -304,7 +304,7 @@ func run() {
 				StartStop:       sdCtl,
 				Downloader:      actions.ReleaseDownloader{},
 				DevInstaller:    actions.ManifestDevNodeInstaller{},
-				NodeManifestURL: "https://releases.quilscan.com/node-version.json",
+				NodeManifestURL: nodemanifest.DefaultURL,
 				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
 				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
 				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
@@ -323,7 +323,7 @@ func run() {
 				Reload:          sdCtl.Reload,
 				Downloader:      actions.ReleaseDownloader{},
 				DevInstaller:    actions.ManifestDevNodeInstaller{},
-				NodeManifestURL: "https://releases.quilscan.com/node-version.json",
+				NodeManifestURL: nodemanifest.DefaultURL,
 				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
 				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
 				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
@@ -446,7 +446,7 @@ func run() {
 		AgentServiceName:     defaults.AgentServiceName,
 		NodeLogPath:          defaults.NodeLogPath,
 		Svc:                  reconcileSvc,
-		NodeManifestURL:      "https://releases.quilscan.com/node-version.json",
+		NodeManifestURL:      nodemanifest.DefaultURL,
 		OfficialArtifactsURL: nodemanifest.OfficialArtifactsURLFromBackend(cfg.BackendURL),
 	}
 	go rec.Run(ctx)
