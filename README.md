@@ -5,7 +5,7 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 ## Why this is safe
 
 - **Outbound only** — the agent opens a single WebSocket to Quilscan's backend; it never listens on any port.
-- **10-action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `rescan`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
+- **Action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `rescan`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `delete_node_store`, `delete_node_store_backup`, and `install_qclient`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
 - **Key files stay off-limits** — the agent does not read key files such as `keys.yml`. It reads `config.yml` locally for RPC detection and peer-ID parsing; the contents are never transmitted.
 - **Downloads are constrained and verified** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go` and pass the built-in Ed25519 signature check before replacement.
 - **Audit log is human-readable** — every command received is appended to a flat file. You can `cat` it at any time to verify what was done and when.
@@ -67,24 +67,20 @@ the existing agent binary is left in place.
 ## Dev Node public builds
 
 Quilscan Dev Node binaries are separate from official Quilibrium release
-artifacts. They are built from a public build repository so users can inspect
-the source commit, workflow, build logs, artifact SHA-256, and detached
-signature.
+artifacts. They are built in a public repository so users can inspect the
+upstream source commit, workflow definition, build logs, published SHA-256, and
+detached signature for each platform.
 
-The intended release flow is:
+The public build artifacts are meant to be independently checkable:
 
-1. The build server resolves the latest commit for the configured upstream
-   Quilibrium branch.
-2. The public build repository runs GitHub Actions for `linux-amd64` and
-   `darwin-arm64`.
-3. Each workflow builds the node from source, writes `build-info.json` and
-   `SHA256SUMS`, and signs the node binary with the release signing key.
-4. The build server downloads the GitHub artifacts, verifies the binary SHA-256
-   and detached signature with the configured public key, then uploads the
-   accepted binary, `.sig`, `SHA256SUMS`, and `build-info.json` to the release
-   bucket.
-5. `node-version.json` is published only after both required platforms have
-   succeeded and have been uploaded.
+1. The workflow records the upstream Quilibrium commit used for the build.
+2. The build runs publicly for `linux-amd64` and `darwin-arm64`.
+3. Each platform artifact includes the node binary, `SHA256SUMS`,
+   `build-info.json`, and a detached `.sig` signature.
+4. Users can compare the downloaded binary SHA-256 with the published checksum
+   and inspect the workflow logs to reproduce the build path.
+5. The agent verifies the detached signature with a public key pinned into the
+   agent binary before installing a Dev Node artifact.
 
 When installing, switching to, or updating a Dev Node, the agent reads
 `node-version.json`, downloads the platform binary and `signature_url`, verifies
@@ -139,8 +135,9 @@ For removing only the node (keeping the agent paired), use `remove-node.sh` from
 git clone https://github.com/quilscan-com/quilscan-agent.git
 cd quilscan-agent
 
-# 1. Action whitelist — should show exactly the 10 allowed actions.
-grep -E '"(install|migrate|start|stop|restart_agent|update_agent|update_node|switch_node_source|cleanup_residue|rescan)":' cmd/agent/main.go
+# 1. Action whitelist — should show every registered action.
+sed -n '/Handlers: map\[string\]actions.Handler{/,/var collector/p' cmd/agent/main.go \
+  | grep -n '^[[:space:]]*"[a-z_]*":'
 grep -n "ErrForbidden" internal/actions/dispatcher.go
 
 # 2. File reads — should be limited to agent config/state/token/logs,
@@ -177,7 +174,7 @@ Requires Go 1.22 or newer.
 quilscan-agent/
 ├── cmd/agent/main.go     # runtime entrypoint, action wiring
 ├── internal/
-│   ├── actions/          # 9-action whitelist + handlers
+│   ├── actions/          # action whitelist + handlers
 │   ├── audit/            # append-only audit log
 │   ├── config/           # config.yaml + state.yaml (platform-aware defaults)
 │   ├── launchd/          # macOS plist renderer + launchctl wrapper

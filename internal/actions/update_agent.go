@@ -50,7 +50,7 @@ func NewUpdateAgentHandler(d AgentUpdaterDeps) Handler {
 		// SECURITY: the download URL must start with the compile-time
 		// trusted prefix. A malicious actor with token control would
 		// otherwise be able to point us at an attacker-controlled binary
-		// and replace our own process — bypassing the entire 9-action
+		// and replace our own process — bypassing the hardcoded action
 		// whitelist. The prefix is a Go `const`, not user-configurable
 		// at runtime, so this check is grep-auditable.
 		releaseURLPrefix := strings.TrimRight(strings.TrimSpace(d.ReleaseURLPrefix), "/")
