@@ -12,7 +12,7 @@
 //  3. Latest-version poll (1h): GET https://releases.quilibrium.com/release,
 //     compare against state.NodeVersion, fold into node_status as
 //     node_update_available + latest_node_version. The same cadence also
-//     polls qclient-release when qclient is installed.
+//     polls qclient-version.json when a qclient release URL is configured.
 //
 // All loops swallow individual errors — they're best-effort observability,
 // not critical path.
@@ -103,6 +103,7 @@ type Loop struct {
 
 	NodeInfoRunner           func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
 	QClientStatusRunner      func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
+	QClientManageRunner      func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
 	PeerConnectionsLogReader func(context.Context, string, string, int, time.Duration) (int, bool)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
@@ -126,7 +127,6 @@ type Loop struct {
 const configReadLimit = 256 * 1024
 
 const defaultLatestVersionURL = "https://releases.quilibrium.com/release"
-const defaultLatestQClientVersionURL = "https://releases.quilibrium.com/qclient-release"
 const defaultNodeManifestURL = nodemanifest.DefaultURL
 const defaultOfficialArtifactsURL = nodemanifest.DefaultOfficialArtifactsURL
 const unknownPeerID = "--"
@@ -156,9 +156,6 @@ func (l *Loop) Run(ctx context.Context) {
 	}
 	if l.LatestVersionURL == "" {
 		l.LatestVersionURL = defaultLatestVersionURL
-	}
-	if l.LatestQClientVersionURL == "" {
-		l.LatestQClientVersionURL = defaultLatestQClientVersionURL
 	}
 	if l.NodeManifestURL == "" {
 		l.NodeManifestURL = defaultNodeManifestURL
@@ -269,6 +266,7 @@ func (l *Loop) runVerify() {
 	}
 	if !qclientInstalled {
 		nodePatch["qclient_status"] = "not_installed"
+		nodePatch["qclient_allocations"] = []qclient.Allocation{}
 	}
 	if detection.HasNode {
 		mergePatch(nodePatch, l.refreshNodeManifestState(state, now))
@@ -334,6 +332,9 @@ func (l *Loop) runVerify() {
 			} else {
 				nodePatch["qclient_status"] = "unavailable"
 			}
+			if allocations := l.readQClientAllocations(state); allocations != nil {
+				nodePatch["qclient_allocations"] = allocations
+			}
 		}
 		if foundPeerID == "" {
 			if peerID := l.readPeerIDFromConfig(state); peerID != "" {
@@ -368,6 +369,7 @@ func (l *Loop) runVerify() {
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
 		nodePatch["node_connections"] = nil
+		nodePatch["qclient_allocations"] = []qclient.Allocation{}
 	}
 	// Surface the node service start timestamp so the UI can show how long the
 	// managed quilibrium-node has been running, separate from the agent-process
@@ -645,6 +647,18 @@ func (l *Loop) qclientInstalled() bool {
 	return err == nil && !st.IsDir()
 }
 
+func (l *Loop) qclientManaged(state *config.State) bool {
+	if state == nil || strings.TrimSpace(state.QClientVersion) == "" {
+		return false
+	}
+	for _, suffix := range []string{".dgst", ".sig"} {
+		if st, err := os.Stat(l.qclientBinaryPath() + suffix); err != nil || st.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
 func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatus {
 	runner := l.QClientStatusRunner
 	if runner == nil {
@@ -661,6 +675,24 @@ func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatu
 		return nil
 	}
 	return status
+}
+
+func (l *Loop) readQClientAllocations(state *config.State) []qclient.Allocation {
+	runner := l.QClientManageRunner
+	if runner == nil {
+		runner = qclient.RunManageOnce
+	}
+	cfg := l.nodeInfoConfigPath(state)
+	req := qclient.RunRequest{
+		BinaryPath: l.qclientBinaryPath(),
+		ConfigPath: cfg,
+		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
+	}
+	allocations, err := runner(context.Background(), req, 8*time.Second)
+	if err != nil {
+		return nil
+	}
+	return allocations
 }
 
 func applyQClientStatus(patch map[string]interface{}, status *qclient.ProverStatus) {
@@ -693,40 +725,7 @@ func nodeCommandWorkDir(configPath, managedConfigDir string) string {
 }
 
 func releaseVersionNewerThan(candidate, current string) bool {
-	a, okA := parseReleaseVersion(candidate)
-	b, okB := parseReleaseVersion(current)
-	if !okA || !okB {
-		return false
-	}
-	for i := range a {
-		if a[i] > b[i] {
-			return true
-		}
-		if a[i] < b[i] {
-			return false
-		}
-	}
-	return false
-}
-
-func parseReleaseVersion(v string) ([4]int, bool) {
-	var out [4]int
-	m := nodeVersionPattern.FindStringSubmatch(v)
-	if len(m) != 2 {
-		return out, false
-	}
-	parts := strings.Split(m[1], ".")
-	if len(parts) != 4 {
-		return out, false
-	}
-	for i, part := range parts {
-		n, err := strconv.Atoi(part)
-		if err != nil {
-			return out, false
-		}
-		out[i] = n
-	}
-	return out, true
+	return release.VersionNewerThan(candidate, current)
 }
 
 func (l *Loop) managedConfigDir() string {
@@ -974,16 +973,20 @@ func (l *Loop) runVersionPoll() {
 			if observed := l.statusString("qclient_version"); observed != "" {
 				qclientCurrent = observed
 			}
-			qclientFetcher := l.LatestQClientVersionFetcher
-			if qclientFetcher == nil {
-				qclientFetcher = fetchLatestQClientVersion
-			}
-			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-			if err == nil && latestQClient != "" {
-				patch["qclient_version"] = qclientCurrent
-				patch["latest_qclient_version"] = latestQClient
-				patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
-				patch["qclient_version_polled_at"] = now
+			if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
+				qclientFetcher := l.LatestQClientVersionFetcher
+				if qclientFetcher == nil {
+					qclientFetcher = fetchLatestQClientVersion
+				}
+				latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+				if err == nil && latestQClient != "" {
+					patch["qclient_version"] = qclientCurrent
+					patch["latest_qclient_version"] = latestQClient
+					patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
+					patch["qclient_version_polled_at"] = now
+				}
+			} else {
+				patch["qclient_update_available"] = false
 			}
 		} else {
 			patch["qclient_update_available"] = false
@@ -1003,16 +1006,20 @@ func (l *Loop) runVersionPoll() {
 			if observed := l.statusString("qclient_version"); observed != "" {
 				qclientCurrent = observed
 			}
-			qclientFetcher := l.LatestQClientVersionFetcher
-			if qclientFetcher == nil {
-				qclientFetcher = fetchLatestQClientVersion
-			}
-			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-			if err == nil && latestQClient != "" {
-				patch["qclient_version"] = qclientCurrent
-				patch["latest_qclient_version"] = latestQClient
-				patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
-				patch["qclient_version_polled_at"] = now
+			if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
+				qclientFetcher := l.LatestQClientVersionFetcher
+				if qclientFetcher == nil {
+					qclientFetcher = fetchLatestQClientVersion
+				}
+				latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+				if err == nil && latestQClient != "" {
+					patch["qclient_version"] = qclientCurrent
+					patch["latest_qclient_version"] = latestQClient
+					patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
+					patch["qclient_version_polled_at"] = now
+				}
+			} else {
+				patch["qclient_update_available"] = false
 			}
 		} else {
 			patch["qclient_update_available"] = false
@@ -1043,16 +1050,20 @@ func (l *Loop) runVersionPoll() {
 		if observed := l.statusString("qclient_version"); observed != "" {
 			qclientCurrent = observed
 		}
-		qclientFetcher := l.LatestQClientVersionFetcher
-		if qclientFetcher == nil {
-			qclientFetcher = fetchLatestQClientVersion
-		}
-		latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-		if err == nil && latestQClient != "" {
-			patch["qclient_version"] = qclientCurrent
-			patch["latest_qclient_version"] = latestQClient
-			patch["qclient_update_available"] = releaseVersionNewerThan(latestQClient, qclientCurrent)
-			patch["qclient_version_polled_at"] = now
+		if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
+			qclientFetcher := l.LatestQClientVersionFetcher
+			if qclientFetcher == nil {
+				qclientFetcher = fetchLatestQClientVersion
+			}
+			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+			if err == nil && latestQClient != "" {
+				patch["qclient_version"] = qclientCurrent
+				patch["latest_qclient_version"] = latestQClient
+				patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
+				patch["qclient_version_polled_at"] = now
+			}
+		} else {
+			patch["qclient_update_available"] = false
 		}
 	} else {
 		patch["qclient_update_available"] = false
@@ -1166,6 +1177,9 @@ func fetchLatestVersion(url string) (string, error) {
 }
 
 func fetchLatestQClientVersion(url, platform string) (string, error) {
+	if strings.TrimSpace(url) == "" {
+		return "", fmt.Errorf("missing qclient version url")
+	}
 	if platform == "" {
 		return "", fmt.Errorf("missing platform")
 	}
@@ -1182,7 +1196,11 @@ func fetchLatestQClientVersion(url, platform string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return release.LatestVersionForPrefix(string(b), "qclient", platform), nil
+	version := release.LatestVersionForQClientVersionManifest(string(b), platform)
+	if version == "" {
+		return "", fmt.Errorf("qclient version manifest missing qclient for %s", platform)
+	}
+	return version, nil
 }
 
 func parseLatestVersion(raw string) string {
@@ -1204,25 +1222,7 @@ func parseLatestVersion(raw string) string {
 }
 
 func compareVersions(a, b string) int {
-	ap := strings.Split(a, ".")
-	bp := strings.Split(b, ".")
-	for i := 0; i < len(ap) && i < len(bp); i++ {
-		ai, _ := strconv.Atoi(ap[i])
-		bi, _ := strconv.Atoi(bp[i])
-		if ai > bi {
-			return 1
-		}
-		if ai < bi {
-			return -1
-		}
-	}
-	if len(ap) > len(bp) {
-		return 1
-	}
-	if len(ap) < len(bp) {
-		return -1
-	}
-	return 0
+	return release.CompareDottedVersions(a, b)
 }
 
 func humanBytes(b uint64) string {

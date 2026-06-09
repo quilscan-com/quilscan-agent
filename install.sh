@@ -88,6 +88,7 @@ install_macos() {
   done
   [[ -e "$bin_dir/qclient" ]] && node_blockers+=("$bin_dir/qclient")
   [[ -e "$bin_dir/qclient.dgst" ]] && node_blockers+=("$bin_dir/qclient.dgst")
+  [[ -e "$bin_dir/qclient.sig" ]] && node_blockers+=("$bin_dir/qclient.sig")
   for sig in "$bin_dir/qclient".dgst.sig.*; do
     [[ -e "$sig" ]] && node_blockers+=("$sig")
   done
@@ -213,6 +214,7 @@ install_linux() {
   done
   [[ -e /usr/local/bin/qclient ]]                           && node_blockers+=("/usr/local/bin/qclient")
   [[ -e /usr/local/bin/qclient.dgst ]]                      && node_blockers+=("/usr/local/bin/qclient.dgst")
+  [[ -e /usr/local/bin/qclient.sig ]]                       && node_blockers+=("/usr/local/bin/qclient.sig")
   for sig in /usr/local/bin/qclient.dgst.sig.*; do
     [[ -e "$sig" ]] && node_blockers+=("$sig")
   done

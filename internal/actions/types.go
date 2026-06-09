@@ -12,9 +12,11 @@ type Command struct {
 // Status is one progress event emitted by a handler.
 type Status struct {
 	ID       string  `json:"id"`
+	Action   string  `json:"action,omitempty"`
 	Step     string  `json:"step"`
 	Progress float64 `json:"progress,omitempty"`
 	Error    string  `json:"error,omitempty"`
+	Message  string  `json:"message,omitempty"`
 }
 
 // Emitter receives Status events from a handler.

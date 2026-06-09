@@ -70,6 +70,7 @@ remove_node_macos() {
     local sig
     move_to_backup "$binary"
     move_to_backup "$binary.dgst"
+    move_to_backup "$binary.sig"
     for sig in "$binary".dgst.sig.*; do
       [ -e "$sig" ] || continue
       move_to_backup "$sig"
@@ -145,6 +146,7 @@ remove_node_linux() {
     local sig
     move_to_backup "$binary"
     move_to_backup "$binary.dgst"
+    move_to_backup "$binary.sig"
     for sig in "$binary".dgst.sig.*; do
       [ -e "$sig" ] || continue
       move_to_backup "$sig"

@@ -4,6 +4,7 @@ package release
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,12 +18,12 @@ import (
 
 // ReleaseBaseURL is hardcoded for supply-chain auditability.
 const ReleaseBaseURL = "https://releases.quilibrium.com/"
-const QClientReleaseManifest = "qclient-release"
+const QClientVersionManifest = "qclient-version.json"
 
 // DownloadTimeout bounds each release artifact fetch. A stalled CDN/socket
 // should fail the current install/update attempt instead of leaving the agent
 // command in an unbounded downloading state.
-const DownloadTimeout = 5 * time.Minute
+const DownloadTimeout = 20 * time.Minute
 
 var downloadHTTPClient = &http.Client{Timeout: DownloadTimeout}
 
@@ -150,23 +151,109 @@ func DownloadRelease(baseURL, version, platform, destDir string) error {
 }
 
 func DownloadQClientLatest(baseURL, platform, destDir string) (string, error) {
-	manifestURL := strings.TrimRight(baseURL, "/") + "/" + QClientReleaseManifest
+	return DownloadQClientLatestFromVersionManifest(baseURL, platform, destDir)
+}
+
+func FetchQClientLatestVersion(baseURL, platform string) (string, error) {
+	manifestURL := strings.TrimRight(baseURL, "/") + "/" + QClientVersionManifest
 	raw, err := fetchText(manifestURL)
 	if err != nil {
-		return "", fmt.Errorf("fetch qclient release manifest: %w", err)
+		return "", fmt.Errorf("fetch qclient version manifest: %w", err)
 	}
-	version := LatestVersionForPrefix(raw, "qclient", platform)
+	version := LatestVersionForQClientVersionManifest(raw, platform)
 	if version == "" {
-		return "", fmt.Errorf("qclient release manifest missing qclient for %s", platform)
+		return "", fmt.Errorf("qclient version manifest missing qclient for %s", platform)
 	}
-	names, err := FilesForPrefixManifest(raw, "qclient", version, platform)
+	return version, nil
+}
+
+type QClientVersionInfo struct {
+	Schema      int                  `json:"schema"`
+	Channel     string               `json:"channel"`
+	Version     string               `json:"version"`
+	GeneratedAt string               `json:"generated_at"`
+	BaseURL     string               `json:"base_url"`
+	Manifest    string               `json:"manifest"`
+	Files       []QClientVersionFile `json:"files"`
+}
+
+type QClientVersionFile struct {
+	Platform      string `json:"platform"`
+	Binary        string `json:"binary"`
+	Digest        string `json:"digest"`
+	Signature     string `json:"signature"`
+	SignatureType string `json:"signature_type"`
+	SHA3256       string `json:"sha3_256"`
+}
+
+func DownloadQClientLatestFromVersionManifest(baseURL, platform, destDir string) (string, error) {
+	manifestURL := strings.TrimRight(baseURL, "/") + "/" + QClientVersionManifest
+	raw, err := fetchText(manifestURL)
+	if err != nil {
+		return "", fmt.Errorf("fetch qclient version manifest: %w", err)
+	}
+	manifest, target, err := ParseQClientVersionManifest(raw, platform)
+	if err != nil {
+		return "", err
+	}
+	names, err := qclientVersionFileNames(target)
 	if err != nil {
 		return "", err
 	}
 	if err := DownloadAll(baseURL, names, destDir); err != nil {
 		return "", err
 	}
-	return version, nil
+	return manifest.Version, nil
+}
+
+func LatestVersionForQClientVersionManifest(raw, platform string) string {
+	manifest, _, err := ParseQClientVersionManifest(raw, platform)
+	if err != nil {
+		return ""
+	}
+	return manifest.Version
+}
+
+func ParseQClientVersionManifest(raw, platform string) (*QClientVersionInfo, *QClientVersionFile, error) {
+	var manifest QClientVersionInfo
+	if err := json.Unmarshal([]byte(raw), &manifest); err != nil {
+		return nil, nil, fmt.Errorf("parse qclient version manifest: %w", err)
+	}
+	if manifest.Version == "" {
+		return nil, nil, fmt.Errorf("qclient version manifest missing version")
+	}
+	var target *QClientVersionFile
+	for i := range manifest.Files {
+		if manifest.Files[i].Platform == platform {
+			target = &manifest.Files[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, nil, fmt.Errorf("qclient version manifest missing qclient for %s", platform)
+	}
+	if target.Binary == "" {
+		return nil, nil, fmt.Errorf("qclient version manifest missing binary for %s", platform)
+	}
+	if target.Signature == "" {
+		return nil, nil, fmt.Errorf("qclient version manifest missing signature for %s", platform)
+	}
+	return &manifest, target, nil
+}
+
+func qclientVersionFileNames(file *QClientVersionFile) ([]string, error) {
+	var names []string
+	for _, raw := range []string{file.Binary, file.Digest, file.Signature} {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		name := releaseFileName(raw)
+		if name == "" || name != raw {
+			return nil, fmt.Errorf("unsafe qclient manifest file name %q", raw)
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func FetchLatestNodeVersion(baseURL, platform string) (string, error) {

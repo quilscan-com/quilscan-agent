@@ -10,6 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const DefaultQClientReleaseURL = "https://releases.quilscan.com"
+
 // Config holds startup settings. Fields fall back to DefaultConfig() when the
 // file is absent or missing a key.
 //
@@ -24,6 +26,7 @@ type Config struct {
 	AgentBinaryPath   string `yaml:"agent_binary_path"`
 	NodeBinaryPath    string `yaml:"node_binary_path"`
 	QClientBinaryPath string `yaml:"qclient_binary_path"`
+	QClientReleaseURL string `yaml:"qclient_release_url"`
 	NodeServiceName   string `yaml:"node_service_name"`  // systemd unit name OR launchd label
 	AgentServiceName  string `yaml:"agent_service_name"` // ditto, but for the agent itself
 	TokenPath         string `yaml:"token_path"`
@@ -51,6 +54,7 @@ func DefaultConfig() Config {
 			AgentBinaryPath:   filepath.Join(home, ".local/bin/quilscan-agent"),
 			NodeBinaryPath:    filepath.Join(home, ".local/bin/quilibrium-node"),
 			QClientBinaryPath: filepath.Join(home, ".local/bin/qclient"),
+			QClientReleaseURL: DefaultQClientReleaseURL,
 			NodeServiceName:   "com.quilscan.node",
 			AgentServiceName:  "com.quilscan.agent",
 			TokenPath:         filepath.Join(appSupport, "token"),
@@ -68,6 +72,7 @@ func DefaultConfig() Config {
 		AgentBinaryPath:   "/usr/local/bin/quilscan-agent",
 		NodeBinaryPath:    "/usr/local/bin/quilibrium-node",
 		QClientBinaryPath: "/usr/local/bin/qclient",
+		QClientReleaseURL: DefaultQClientReleaseURL,
 		NodeServiceName:   "quilibrium-node.service",
 		AgentServiceName:  "quilscan-agent.service",
 		TokenPath:         "/etc/quilscan-agent/token",

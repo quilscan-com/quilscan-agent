@@ -193,10 +193,15 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 }
 
 func signatureFiles(binary string) []string {
-	files, err := filepath.Glob(binary + ".dgst.sig.*")
-	if err != nil {
-		return nil
+	files := []string{}
+	if st, err := os.Stat(binary + ".sig"); err == nil && !st.IsDir() {
+		files = append(files, binary+".sig")
 	}
+	digestSigs, err := filepath.Glob(binary + ".dgst.sig.*")
+	if err != nil {
+		return files
+	}
+	files = append(files, digestSigs...)
 	return files
 }
 

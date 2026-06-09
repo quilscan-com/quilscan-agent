@@ -52,7 +52,7 @@ func fieldsForType(typ string) []string {
 	case "cmd":
 		return []string{"id", "action"}
 	case "cmd_status":
-		return []string{"id", "step", "progress", "error"}
+		return []string{"id", "action", "step", "progress", "error"}
 	case "stream_on", "stream_off":
 		return nil
 	case "logs_on", "logs_off", "logs":

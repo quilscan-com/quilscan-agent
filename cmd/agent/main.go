@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,7 +32,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.0.9"
+var version = "1.1.0"
 
 type startStopCtl interface {
 	Start(string) error
@@ -190,11 +191,19 @@ func run() {
 	if runtime.GOOS == "darwin" {
 		installUser = "" // launchd runs jobs as the user that bootstrapped them
 	}
+	qclientReleaseURL := strings.TrimSpace(os.Getenv("QUILSCAN_QCLIENT_RELEASE_URL"))
+	if qclientReleaseURL == "" {
+		qclientReleaseURL = defaults.QClientReleaseURL
+	}
+	qclientLatestVersionURL := ""
+	if qclientReleaseURL != "" {
+		qclientLatestVersionURL = strings.TrimRight(qclientReleaseURL, "/") + "/" + release.QClientVersionManifest
+	}
 	qclientInstallDeps := func() actions.QClientInstallDeps {
 		return actions.QClientInstallDeps{
 			BinaryPath: defaults.QClientBinaryPath,
 			Platform:   platform,
-			Downloader: actions.QClientReleaseDownloader{},
+			Downloader: actions.QClientReleaseDownloader{BaseURL: qclientReleaseURL},
 			LoadState:  func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
 			SaveState:  func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
 			EmitRaw:    func(m map[string]interface{}) { _ = client.Send(m) },
@@ -204,14 +213,7 @@ func run() {
 	installQClient := func() (string, error) {
 		qclientInstallMu.Lock()
 		defer qclientInstallMu.Unlock()
-		if hasExistingQClient(defaults) {
-			client.Meta.HasQClient = true
-			if state, err := config.LoadState(defaults.StatePath); err == nil && state != nil {
-				return state.QClientVersion, nil
-			}
-			return "", nil
-		}
-		version, err := actions.InstallQClient(qclientInstallDeps())
+		version, err := actions.EnsureQClientCurrent(qclientInstallDeps())
 		if err == nil {
 			client.Meta.HasQClient = true
 		}
@@ -249,6 +251,26 @@ func run() {
 					return false
 				}
 				return rec.RunVerifyNow()
+			}),
+			"refresh_qclient_allocations": actions.NewRefreshQClientAllocationsHandler(actions.RefreshQClientAllocationsDeps{
+				StatePath:         defaults.StatePath,
+				QClientBinaryPath: defaults.QClientBinaryPath,
+				ManagedConfigDir:  defaults.ManagedConfigDir,
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
+			}),
+			"qclient_manage_action": actions.NewQClientManageActionHandler(actions.QClientManageActionDeps{
+				StatePath:         defaults.StatePath,
+				QClientBinaryPath: defaults.QClientBinaryPath,
+				ManagedConfigDir:  defaults.ManagedConfigDir,
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
 			}),
 			"update_agent": actions.NewUpdateAgentHandler(actions.AgentUpdaterDeps{
 				AgentBinaryPath: defaults.AgentBinaryPath,
@@ -392,6 +414,7 @@ func run() {
 		log.Printf("[cmd] received id=%s action=%s", cmd.ID, cmd.Action)
 		err := d.Dispatch(cmd, func(s actions.Status) {
 			s.ID = cmd.ID
+			s.Action = cmd.Action
 			_ = client.Send(statusMessage(s))
 		})
 		if err != nil {
@@ -448,6 +471,9 @@ func run() {
 		Svc:                  reconcileSvc,
 		NodeManifestURL:      nodemanifest.DefaultURL,
 		OfficialArtifactsURL: nodemanifest.OfficialArtifactsURLFromBackend(cfg.BackendURL),
+	}
+	if qclientLatestVersionURL != "" {
+		rec.LatestQClientVersionURL = qclientLatestVersionURL
 	}
 	go rec.Run(ctx)
 
@@ -631,8 +657,10 @@ func statusMessage(s actions.Status) map[string]interface{} {
 	return map[string]interface{}{
 		"type":     "cmd_status",
 		"id":       s.ID,
+		"action":   s.Action,
 		"step":     s.Step,
 		"progress": s.Progress,
 		"error":    s.Error,
+		"message":  s.Message,
 	}
 }
