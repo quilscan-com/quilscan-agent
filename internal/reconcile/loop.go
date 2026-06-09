@@ -968,29 +968,7 @@ func (l *Loop) runVersionPoll() {
 				_ = config.SaveState(l.StatePath, state)
 			}
 		}
-		if l.qclientInstalled() {
-			qclientCurrent := state.QClientVersion
-			if observed := l.statusString("qclient_version"); observed != "" {
-				qclientCurrent = observed
-			}
-			if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
-				qclientFetcher := l.LatestQClientVersionFetcher
-				if qclientFetcher == nil {
-					qclientFetcher = fetchLatestQClientVersion
-				}
-				latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-				if err == nil && latestQClient != "" {
-					patch["qclient_version"] = qclientCurrent
-					patch["latest_qclient_version"] = latestQClient
-					patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
-					patch["qclient_version_polled_at"] = now
-				}
-			} else {
-				patch["qclient_update_available"] = false
-			}
-		} else {
-			patch["qclient_update_available"] = false
-		}
+		l.patchQClientVersionStatus(state, patch, now)
 		if len(patch) > 0 {
 			l.updateNodeStatus(patch)
 		}
@@ -1001,29 +979,7 @@ func (l *Loop) runVersionPoll() {
 		patch["node_update_source"] = nodemanifest.SourceUnknown
 		patch["node_update_available"] = false
 		patch["version_polled_at"] = now
-		if l.qclientInstalled() {
-			qclientCurrent := state.QClientVersion
-			if observed := l.statusString("qclient_version"); observed != "" {
-				qclientCurrent = observed
-			}
-			if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
-				qclientFetcher := l.LatestQClientVersionFetcher
-				if qclientFetcher == nil {
-					qclientFetcher = fetchLatestQClientVersion
-				}
-				latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-				if err == nil && latestQClient != "" {
-					patch["qclient_version"] = qclientCurrent
-					patch["latest_qclient_version"] = latestQClient
-					patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
-					patch["qclient_version_polled_at"] = now
-				}
-			} else {
-				patch["qclient_update_available"] = false
-			}
-		} else {
-			patch["qclient_update_available"] = false
-		}
+		l.patchQClientVersionStatus(state, patch, now)
 		l.updateNodeStatus(patch)
 		return
 	}
@@ -1045,32 +1001,39 @@ func (l *Loop) runVersionPoll() {
 		patch["version_polled_at"] = now
 	}
 
-	if l.qclientInstalled() {
-		qclientCurrent := state.QClientVersion
-		if observed := l.statusString("qclient_version"); observed != "" {
-			qclientCurrent = observed
-		}
-		if strings.TrimSpace(l.LatestQClientVersionURL) != "" {
-			qclientFetcher := l.LatestQClientVersionFetcher
-			if qclientFetcher == nil {
-				qclientFetcher = fetchLatestQClientVersion
-			}
-			latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
-			if err == nil && latestQClient != "" {
-				patch["qclient_version"] = qclientCurrent
-				patch["latest_qclient_version"] = latestQClient
-				patch["qclient_update_available"] = !l.qclientManaged(state) || releaseVersionNewerThan(latestQClient, qclientCurrent)
-				patch["qclient_version_polled_at"] = now
-			}
-		} else {
-			patch["qclient_update_available"] = false
-		}
-	} else {
-		patch["qclient_update_available"] = false
-	}
+	l.patchQClientVersionStatus(state, patch, now)
 
 	if len(patch) > 0 {
 		l.updateNodeStatus(patch)
+	}
+}
+
+func (l *Loop) patchQClientVersionStatus(state *config.State, patch map[string]interface{}, now string) {
+	if !l.qclientInstalled() {
+		patch["qclient_update_available"] = false
+		return
+	}
+
+	qclientCurrent := state.QClientVersion
+	if observed := l.statusString("qclient_version"); observed != "" {
+		qclientCurrent = observed
+	}
+	managed := l.qclientManaged(state)
+	patch["qclient_version"] = qclientCurrent
+	patch["qclient_update_available"] = !managed
+	patch["qclient_version_polled_at"] = now
+
+	if strings.TrimSpace(l.LatestQClientVersionURL) == "" {
+		return
+	}
+	qclientFetcher := l.LatestQClientVersionFetcher
+	if qclientFetcher == nil {
+		qclientFetcher = fetchLatestQClientVersion
+	}
+	latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
+	if err == nil && latestQClient != "" {
+		patch["latest_qclient_version"] = latestQClient
+		patch["qclient_update_available"] = !managed || releaseVersionNewerThan(latestQClient, qclientCurrent)
 	}
 }
 

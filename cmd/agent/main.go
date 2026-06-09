@@ -207,6 +207,11 @@ func run() {
 			LoadState:  func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
 			SaveState:  func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
 			EmitRaw:    func(m map[string]interface{}) { _ = client.Send(m) },
+			PatchNodeStatus: func(patch map[string]interface{}) {
+				if rec != nil {
+					rec.PatchNodeStatus(patch)
+				}
+			},
 		}
 	}
 	var qclientInstallMu sync.Mutex

@@ -28,6 +28,7 @@ type QClientInstallDeps struct {
 	LoadState              func() (*config.State, error)
 	SaveState              func(*config.State) error
 	EmitRaw                func(map[string]interface{})
+	PatchNodeStatus        func(map[string]interface{})
 }
 
 func NewInstallQClientHandler(d QClientInstallDeps) Handler {
@@ -134,15 +135,26 @@ func installQClient(d QClientInstallDeps, progress func(step string, progress fl
 	if state == nil {
 		state = &config.State{}
 	}
+	installedAt := time.Now().UTC()
 	state.QClientBinaryPath = d.BinaryPath
 	state.QClientVersion = version
-	state.QClientInstalledAt = time.Now().UTC()
+	state.QClientInstalledAt = installedAt
 	if d.SaveState != nil {
 		if err := d.SaveState(state); err != nil {
 			return "", err
 		}
 	}
 
+	if d.PatchNodeStatus != nil {
+		d.PatchNodeStatus(map[string]interface{}{
+			"has_qclient":               true,
+			"qclient_binary_path":       d.BinaryPath,
+			"qclient_version":           version,
+			"latest_qclient_version":    version,
+			"qclient_update_available":  false,
+			"qclient_version_polled_at": installedAt.Format(time.RFC3339),
+		})
+	}
 	if d.EmitRaw != nil {
 		d.EmitRaw(map[string]interface{}{
 			"type":                "meta_update",
