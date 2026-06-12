@@ -40,7 +40,7 @@ func NewRefreshQClientAllocationsHandler(d RefreshQClientAllocationsDeps) Handle
 		if runner == nil {
 			runner = qclient.RunManageOnce
 		}
-		rows, err := runner(context.Background(), req, 15*time.Second)
+		rows, err := runner(context.Background(), req, 60*time.Second)
 		if err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err

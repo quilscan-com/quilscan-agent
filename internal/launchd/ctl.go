@@ -1,8 +1,6 @@
 package launchd
 
 import (
-	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -13,10 +11,11 @@ import (
 // systemd.Ctl <-> launchd.Ctl based on runtime.GOOS without changing
 // any handler internals.
 //
-// Every call targets the user's gui/<UID> domain — never `system` —
-// so no sudo is required.
+// Calls target either the user's gui/<UID> domain or the system domain,
+// depending on UnitDir. /Library/LaunchDaemons is system-scope; user
+// LaunchAgents stay under gui/<UID>.
 type Ctl struct {
-	UnitDir string // ~/Library/LaunchAgents — used to resolve the plist file for Start
+	UnitDir string // LaunchAgents or LaunchDaemons dir; used to resolve domain + plist
 }
 
 // Start re-uses FSOps.Start so the bootstrap+kickstart logic stays in one place.
@@ -24,14 +23,14 @@ func (c Ctl) Start(name string) error {
 	return FSOps{UnitDir: c.unitDirOrDefault()}.Start(name)
 }
 
-// Stop bootouts the job in the user domain. Idempotent: if the job is
-// not loaded we silently succeed.
+// Stop bootouts the job. Idempotent: if the job is not loaded we silently
+// succeed.
 func (c Ctl) Stop(name string) error {
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	domain := c.domain()
 	if !isLoaded(domain, name) {
 		return nil
 	}
-	return launchctl("bootout", domain+"/"+name)
+	return launchctl("bootout", launchTarget(domain, name))
 }
 
 // Disable on macOS is the same as Stop — bootout removes the job and
@@ -49,8 +48,8 @@ func (Ctl) Reload() error { return nil }
 // cross-imported to keep the platform handler-side Ctl symmetric with
 // systemd.Ctl (no svcctl dependency leaking into either).
 func (c Ctl) IsActive(name string) bool {
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
-	out, err := launchctlOutput("print", domain+"/"+name)
+	domain := c.domain()
+	out, err := launchctlOutput("print", launchTarget(domain, name))
 	if err != nil {
 		return false
 	}
@@ -71,9 +70,9 @@ func launchctlOutput(args ...string) (string, error) {
 }
 
 func (c Ctl) unitDirOrDefault() string {
-	if c.UnitDir != "" {
-		return c.UnitDir
-	}
-	home, _ := os.UserHomeDir()
-	return home + "/Library/LaunchAgents"
+	return unitDirOrDefault(c.UnitDir)
+}
+
+func (c Ctl) domain() string {
+	return domainForUnitDir(c.unitDirOrDefault())
 }

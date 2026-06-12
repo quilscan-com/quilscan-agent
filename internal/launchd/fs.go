@@ -9,17 +9,17 @@ import (
 )
 
 // FSOps implements actions.SystemdOps + (a superset of) what install
-// needs to put a LaunchAgent on disk and ask launchd to bootstrap it.
+// needs to put a launchd plist on disk and ask launchd to bootstrap it.
 // The struct field name is "UnitDir" purely for parallelism with
-// systemd.FSOps — for launchd it's the LaunchAgents directory
-// (~/Library/LaunchAgents).
+// systemd.FSOps. On macOS it can be either the legacy user LaunchAgents
+// directory or the current system LaunchDaemons directory.
 type FSOps struct {
 	UnitDir string
 }
 
 // WriteUnit drops the rendered plist body at <UnitDir>/<name>. `name` is
 // expected to already include the .plist extension (callers pass label +
-// ".plist"). Permissions 0644 — the file is read by launchd as the user.
+// ".plist"). Permissions 0644 match launchd's plist requirements.
 func (f FSOps) WriteUnit(name, content string) error {
 	if !strings.HasSuffix(name, ".plist") {
 		// systemd path passed "quilibrium-node.service"; on macOS we need
@@ -35,23 +35,24 @@ func (f FSOps) WriteUnit(name, content string) error {
 // systemctl daemon-reload to trigger.
 func (FSOps) DaemonReload() error { return nil }
 
-// Start bootstraps the LaunchAgent into the user's gui/<UID> domain and
-// then kickstarts it so it transitions to the running state immediately.
+// Start bootstraps the launchd job into the right domain and then kickstarts
+// it so it transitions to the running state immediately.
 // `name` is the launchd label (without .plist suffix) — the install
 // handler passes the same identifier used as systemd unit name on Linux.
 func (f FSOps) Start(name string) error {
-	plistPath := filepath.Join(f.UnitDir, plistFileName(name))
+	unitDir := unitDirOrDefault(f.UnitDir)
+	plistPath := filepath.Join(unitDir, plistFileName(name))
 	if _, err := os.Stat(plistPath); err != nil {
 		return fmt.Errorf("plist not found: %s", plistPath)
 	}
 	// Idempotent: if already loaded skip bootstrap; just kickstart.
-	domain := fmt.Sprintf("gui/%d", os.Getuid())
+	domain := domainForUnitDir(unitDir)
 	if !isLoaded(domain, name) {
 		if err := launchctl("bootstrap", domain, plistPath); err != nil {
 			return err
 		}
 	}
-	return launchctl("kickstart", fmt.Sprintf("%s/%s", domain, name))
+	return launchctl("kickstart", launchTarget(domain, name))
 }
 
 func plistFileName(name string) string {
@@ -62,7 +63,7 @@ func plistFileName(name string) string {
 }
 
 func isLoaded(domain, label string) bool {
-	return exec.Command("launchctl", "print", fmt.Sprintf("%s/%s", domain, label)).Run() == nil
+	return exec.Command("launchctl", "print", launchTarget(domain, label)).Run() == nil
 }
 
 func launchctl(args ...string) error {
@@ -72,4 +73,23 @@ func launchctl(args ...string) error {
 		return fmt.Errorf("launchctl %v: %w — %s", args, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+func unitDirOrDefault(unitDir string) string {
+	if strings.TrimSpace(unitDir) != "" {
+		return unitDir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library/LaunchAgents")
+}
+
+func domainForUnitDir(unitDir string) string {
+	if filepath.Clean(unitDir) == "/Library/LaunchDaemons" {
+		return "system"
+	}
+	return fmt.Sprintf("gui/%d", os.Getuid())
+}
+
+func launchTarget(domain, label string) string {
+	return domain + "/" + label
 }

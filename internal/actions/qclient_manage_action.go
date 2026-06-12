@@ -102,7 +102,7 @@ func refreshAllocationsAfterManageAction(d QClientManageActionDeps, req qclient.
 	if runner == nil {
 		runner = qclient.RunManageOnce
 	}
-	rows, err := runner(context.Background(), req, 15*time.Second)
+	rows, err := runner(context.Background(), req, 60*time.Second)
 	if err != nil {
 		return nil
 	}

@@ -1,12 +1,12 @@
 // Package svcctl is the platform-agnostic service-controller interface used
 // by command handlers to manage long-running services. On Linux this is a
-// thin wrapper around systemd; on macOS, around launchd LaunchAgents.
+// thin wrapper around systemd; on macOS, around launchd.
 //
 // The "name" argument is the service identifier in whatever form the
 // underlying service manager expects:
 //
 //	Linux  : a systemd unit name, e.g. "quilibrium-node.service"
-//	macOS  : a LaunchAgent label,   e.g. "com.quilscan.node"
+//	macOS  : a launchd label,       e.g. "com.quilscan.node"
 //
 // The svcctl package never assumes one form or the other — handlers just
 // pass through whatever the platform's PathBundle gave them.
@@ -55,7 +55,7 @@ func hasServiceSuffix(name string) bool {
 // WorkDir so relative paths inside config.yml continue to resolve.
 type NodeServiceInput struct {
 	BinaryPath string
-	User       string // ignored on macOS — launchd runs jobs as the user that bootstrapped them
+	User       string // ignored on macOS; launchd scope is selected by the plist location
 	ConfigPath string // when non-empty, emit `-config <path>`; otherwise omit the flag
 	WorkDir    string // when non-empty, set as service WorkingDirectory
 	Label      string // service identifier (systemd unit name OR launchd label)
@@ -87,7 +87,7 @@ type Ctl interface {
 	// deadlock; on macOS uses launchctl kickstart -k for the same reason.
 	Restart(name string) error
 	// Enable marks the service to start at boot/login. On Linux:
-	// systemctl enable. On macOS this is a no-op because the LaunchAgent
+	// systemctl enable. On macOS this is a no-op because the launchd
 	// plist's RunAtLoad attribute already encodes that behaviour.
 	Enable(name string) error
 	// Disable removes the start-at-boot/login link. On Linux:

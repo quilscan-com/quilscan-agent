@@ -5,9 +5,9 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 ## Why this is safe
 
 - **Outbound only** — the agent opens a single WebSocket to Quilscan's backend; it never listens on any port.
-- **Action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `rescan`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `delete_node_store`, `delete_node_store_backup`, and `install_qclient`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
+- **Action whitelist, hardcoded** — `install`, `migrate`, `start`, `stop`, `rescan`, `refresh_qclient_allocations`, `check_public_stream_ports`, `qclient_manage_action`, `restart_agent`, `update_agent`, `update_node`, `switch_node_source`, `cleanup_residue`, `delete_node_store`, `delete_node_store_backup`, and `install_qclient`. Everything else is rejected by the dispatcher. Grep `cmd/agent/main.go` for the registered handlers and `internal/actions/dispatcher.go` for the rejection path.
 - **Key files stay off-limits** — the agent does not read key files such as `keys.yml`. It reads `config.yml` locally for RPC detection and peer-ID parsing; the contents are never transmitted.
-- **Downloads are constrained and verified** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go` and pass the built-in Ed25519 signature check before replacement.
+- **Runtime downloads are constrained and verified where applicable** — node release downloads use the compile-time `ReleaseBaseURL` in `internal/release/download.go`; agent self-update URLs must match `DefaultAgentReleaseURLPrefix` in `internal/actions/update_agent.go` and pass the built-in Ed25519 signature check before replacement. The bootstrap install and macOS migration shell scripts trust HTTPS plus the release bucket.
 - **Audit log is human-readable** — every command received is appended to a flat file. You can `cat` it at any time to verify what was done and when.
 - **Token is local** — generated on install via `crypto/rand`, stored `chmod 600`. Not persisted on Quilscan's servers.
 
@@ -15,18 +15,41 @@ Open-source remote-control agent for Quilibrium nodes. Pairs with [Quilscan](htt
 
 | Platform | Command | Notes |
 |---|---|---|
-| Linux (amd64 / arm64, systemd) | `sudo curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh \| sudo bash` | Installs system-wide, requires sudo. |
-| macOS (Apple Silicon) | `curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh \| bash` | User-level LaunchAgent, no sudo. |
+| Linux (amd64 / arm64, systemd) | `curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh \| sudo bash` | Installs system-wide, requires sudo. |
+| macOS (Apple Silicon) | `curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh \| sudo bash` | System LaunchDaemon, requires sudo so it survives lock/logout. |
 
 The installer:
 
 1. Detects your OS/arch and downloads the matching binary.
 2. Generates a token, stores it with `0600` perms, prints it once to your terminal.
-3. Registers a service (`quilscan-agent.service` on Linux, `com.quilscan.agent` LaunchAgent on macOS) and starts it.
+3. Registers a service (`quilscan-agent.service` on Linux, `com.quilscan.agent` LaunchDaemon on macOS) and starts it.
 
 Fresh node installs may patch empty local RPC listen addresses in `config.yml` so the dashboard can read local node data. Migrated/imported node configs are not modified.
 
 Copy the token. Paste it into Quilscan's `/node-console` page to pair.
+
+## macOS user-mode migration
+
+Older macOS installs used a per-user LaunchAgent under `~/Library/LaunchAgents`
+and binaries under `~/.local/bin`. Current macOS installs use root-owned system
+LaunchDaemons so the agent and managed node survive lock/logout.
+
+If the installer detects a legacy user-mode agent, run:
+
+```bash
+curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/migrate-macos-root.sh | sudo bash -s -- --yes
+```
+
+The migration script:
+
+1. Downloads the latest macOS agent from the release bucket.
+2. Moves the agent, and any managed node/qclient service + binaries, to system paths.
+3. Backs up old user-mode agent/node/qclient LaunchAgents and binaries under `/Library/Application Support/quilscan-agent/backups/`.
+4. Leaves existing node `.config` directories, keys, worker store, and data in place.
+
+If only a Quilibrium node is present and no Quilscan agent token/state exists,
+the script does not adopt that node automatically. Install the agent first, then
+use "Migrate Existing" from the dashboard.
 
 ## Agent self-update verification
 
@@ -98,13 +121,17 @@ binary.
 
 | Item | Linux | macOS |
 |---|---|---|
-| Agent binary | `/usr/local/bin/quilscan-agent` | `~/.local/bin/quilscan-agent` |
-| Service def | `/etc/systemd/system/quilscan-agent.service` | `~/Library/LaunchAgents/com.quilscan.agent.plist` |
-| Token | `/etc/quilscan-agent/token` | `~/Library/Application Support/quilscan-agent/token` |
-| State | `/etc/quilscan-agent/state.yaml` | `~/Library/Application Support/quilscan-agent/state.yaml` |
-| Audit log | `/var/log/quilscan-agent.log` | `~/Library/Logs/quilscan-agent.log` |
-| Node binary | `/usr/local/bin/quilibrium-node` | `~/.local/bin/quilibrium-node` |
-| Node `.config` (fresh) | `/var/lib/quilscan/node/.config` | `~/Library/Application Support/quilibrium/.config` |
+| Agent binary | `/usr/local/bin/quilscan-agent` | `/usr/local/bin/quilscan-agent` |
+| Service def | `/etc/systemd/system/quilscan-agent.service` | `/Library/LaunchDaemons/com.quilscan.agent.plist` |
+| Token | `/etc/quilscan-agent/token` | `/Library/Application Support/quilscan-agent/token` |
+| State | `/etc/quilscan-agent/state.yaml` | `/Library/Application Support/quilscan-agent/state.yaml` |
+| Audit log | `/var/log/quilscan-agent.log` | `/Library/Logs/quilscan-agent.log` |
+| Node binary | `/usr/local/bin/quilibrium-node` | `/usr/local/bin/quilibrium-node` |
+| Node `.config` (fresh) | `/var/lib/quilscan/node/.config` | `/Library/Application Support/quilibrium/.config` |
+
+`state.yaml` is created when node/qclient state is first persisted. A fresh
+agent-only install can have `config.yaml` and `token` without a `state.yaml`
+until a node is installed or imported.
 
 ## First pairing
 
@@ -119,10 +146,10 @@ When importing an existing node, provide the absolute path to its `.config` dire
 
 ```bash
 # Linux
-sudo curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash
+curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash
 
 # macOS
-curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | bash
+curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash
 ```
 
 Removes the agent binary, agent service definition, agent support directory, and agent log. **Never touches your node data.** The Quilibrium node binary, plist/unit, and `.config` directory are explicitly preserved.
@@ -191,6 +218,7 @@ quilscan-agent/
 │   ├── token/            # crypto/rand bearer-token gen + 0600 save
 │   └── ws/               # outbound WebSocket client
 ├── install.sh            # Linux + macOS installer
+├── migrate-macos-root.sh # migrate legacy macOS user-mode installs to system LaunchDaemons
 ├── uninstall.sh          # Linux + macOS uninstaller
 ├── remove-node.sh        # remove node only (keep agent)
 └── Makefile

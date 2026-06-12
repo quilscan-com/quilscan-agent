@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 )
 
@@ -32,7 +33,7 @@ type CleanupDeps struct {
 	QClientBinaryPath string // /usr/local/bin/qclient
 	UnitName          string // systemd unit name OR launchd label
 	BackupRootDir     string // /var/lib/quilscan/backups
-	UnitDir           string // systemd unit dir OR LaunchAgents dir
+	UnitDir           string // systemd unit dir OR launchd plist dir
 	Systemd           SystemdControl
 	EmitRaw           func(map[string]interface{})
 	// PatchNodeStatus, when set, lets cleanup zero out the reconcile loop's
@@ -58,6 +59,7 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 		emit(Status{ID: c.ID, Step: "preparing", Progress: 0.05})
 
 		unitFile := svcctl.UnitFilePath(d.UnitDir, d.UnitName)
+		state, _ := config.LoadState(d.StatePath)
 
 		// Stop + disable the service if loaded so the node process exits
 		// cleanly. IsActive goes through the platform-aware Ctl on both
@@ -133,7 +135,9 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 
 		mvBinaryBundle(d.BinaryPath, "node")
 		mvBinaryBundle(d.QClientBinaryPath, "qclient")
-		mvBackup(d.ManagedConfigDir, "managed .config directory")
+		for _, cfgPath := range cleanupConfigPaths(state, d.ManagedConfigDir) {
+			mvBackup(cfgPath, "managed .config directory")
+		}
 		mvBackup(unitFile, "systemd unit")
 		mvBackup(d.StatePath, "agent state file")
 
@@ -190,6 +194,27 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 		return nil
 	}
+}
+
+func cleanupConfigPaths(state *config.State, managedConfigDir string) []string {
+	paths := []string{}
+	add := func(path string) {
+		if path == "" {
+			return
+		}
+		for _, existing := range paths {
+			if existing == path {
+				return
+			}
+		}
+		paths = append(paths, path)
+	}
+
+	if state != nil && state.InstallSource == "fresh" {
+		add(state.ConfigPath)
+	}
+	add(managedConfigDir)
+	return paths
 }
 
 func signatureFiles(binary string) []string {

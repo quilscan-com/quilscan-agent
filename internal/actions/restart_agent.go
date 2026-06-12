@@ -19,7 +19,7 @@ type RestartAgentDeps struct {
 }
 
 // NewRestartAgentHandler returns a handler that restarts the quilscan-agent
-// systemd unit (Linux) or LaunchAgent job (macOS). The agent restarts
+// systemd unit (Linux) or launchd job (macOS). The agent restarts
 // itself, so cmd_status `done` is emitted before the restart is scheduled;
 // once the service manager kills this PID the WS connection dies and the
 // frontend will see a brief offline window before the new process

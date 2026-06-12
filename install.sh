@@ -3,16 +3,16 @@
 #
 # Linux  : downloads the prebuilt binary to /usr/local/bin, registers a
 #          systemd service, prints the pairing token. Requires sudo.
-# macOS  : downloads to ~/.local/bin (creates dir + adds to PATH if missing),
-#          registers a user-level LaunchAgent, prints the pairing token.
-#          Does NOT require sudo — everything stays under the current user.
+# macOS  : downloads to /usr/local/bin, registers a system LaunchDaemon,
+#          prints the pairing token. Requires sudo so it stays alive across
+#          user lock/logout.
 #
 # Environment (optional):
 #   QSA_RELEASE_URL  Override the release asset prefix (for private mirrors)
 #
 # Usage:
-#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh | bash              (macOS)
-#   sudo curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh | sudo bash    (Linux)
+#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh | sudo bash    (macOS)
+#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh | sudo bash    (Linux)
 
 set -euo pipefail
 
@@ -44,19 +44,71 @@ print_node_blocker_message() {
   echo "If you want Quilscan to manage that old node later, install the agent after cleanup and use Migrate Existing from the dashboard." >&2
 }
 
+pgrep_first() {
+  pgrep -x "$1" 2>/dev/null | head -1 || true
+}
+
 # ─────────────────────────────────────────────────────────────
-# macOS branch (LaunchAgent / user-scope, no sudo)
+# macOS branch (LaunchDaemon / system-scope, requires sudo)
 # ─────────────────────────────────────────────────────────────
 install_macos() {
-  local home="$HOME"
-  local bin_dir="$home/.local/bin"
-  local app_support="$home/Library/Application Support/quilscan-agent"
-  local logs_dir="$home/Library/Logs"
-  local launch_dir="$home/Library/LaunchAgents"
+  if [[ $EUID -ne 0 ]]; then
+    echo "Please run with sudo on macOS:" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/install.sh | sudo bash" >&2
+    exit 1
+  fi
+
+  local bin_dir="/usr/local/bin"
+  local app_support="/Library/Application Support/quilscan-agent"
+  local logs_dir="/Library/Logs"
+  local launch_dir="/Library/LaunchDaemons"
   local plist_path="$launch_dir/${AGENT_LABEL}.plist"
   local agent_bin="$bin_dir/quilscan-agent"
   local node_bin="$bin_dir/quilibrium-node"
   local token_path="$app_support/token"
+  local target_user="${SUDO_USER:-}"
+  local target_home=""
+  local running_agent_pid=""
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    target_home="$(dscl . -read "/Users/$target_user" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory:[[:space:]]*//' || true)"
+  fi
+  running_agent_pid="$(pgrep_first quilscan-agent)"
+
+  local legacy=()
+  local legacy_launch_target=""
+  local legacy_loaded=0
+  if [[ -n "$target_home" ]]; then
+    [[ -e "$target_home/.local/bin/quilscan-agent" ]] && legacy+=("$target_home/.local/bin/quilscan-agent")
+    [[ -e "$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist" ]] && legacy+=("$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist")
+    [[ -e "$target_home/Library/Application Support/quilscan-agent" ]] && legacy+=("$target_home/Library/Application Support/quilscan-agent")
+    legacy_launch_target="gui/$(id -u "$target_user")/$AGENT_LABEL"
+    if launchctl print "$legacy_launch_target" >/dev/null 2>&1; then
+      legacy_loaded=1
+    fi
+  fi
+  if [[ "$legacy_loaded" == "1" && ${#legacy[@]} -eq 0 ]]; then
+    echo ""
+    echo "[note] Stale legacy macOS quilscan-agent LaunchAgent registration detected:"
+    echo "  - $legacy_launch_target"
+    echo "[note] No legacy agent files were found under $target_home, so there is no token/config to migrate."
+    echo "[note] Removing stale launchd registration and continuing with a fresh system install."
+    launchctl bootout "$legacy_launch_target" >/dev/null 2>&1 || true
+    running_agent_pid="$(pgrep_first quilscan-agent)"
+  elif [[ "$legacy_loaded" == "1" ]]; then
+    legacy+=("legacy LaunchAgent loaded for $target_user: $AGENT_LABEL")
+  fi
+  if [[ -n "$running_agent_pid" && ${#legacy[@]} -gt 0 ]]; then
+    legacy+=("running legacy process: quilscan-agent (pid $running_agent_pid)")
+  fi
+  if (( ${#legacy[@]} > 0 )); then
+    echo "" >&2
+    echo "A legacy user-mode macOS quilscan-agent install was detected:" >&2
+    for p in "${legacy[@]}"; do echo "  - $p" >&2; done
+    echo "" >&2
+    echo "Run the migration script instead of a fresh install:" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/migrate-macos-root.sh | sudo bash -s -- --yes" >&2
+    exit 1
+  fi
 
   # Pre-flight: refuse to overwrite an existing install. The uninstall path
   # (uninstall.sh) is the canonical way to back up + remove.
@@ -64,11 +116,11 @@ install_macos() {
   [[ -e "$agent_bin" ]] && existing+=("$agent_bin")
   [[ -e "$plist_path" ]] && existing+=("$plist_path")
   [[ -e "$app_support" ]] && existing+=("$app_support")
-  if launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1; then
+  if launchctl print "system/$AGENT_LABEL" >/dev/null 2>&1; then
     existing+=("launchd job loaded: $AGENT_LABEL")
   fi
-  if pgrep -x quilscan-agent >/dev/null 2>&1; then
-    existing+=("running process: quilscan-agent (pid $(pgrep -x quilscan-agent | head -1))")
+  if [[ -n "$running_agent_pid" ]]; then
+    existing+=("running process: quilscan-agent (pid $running_agent_pid)")
   fi
   if (( ${#existing[@]} > 0 )); then
     echo "" >&2
@@ -76,7 +128,7 @@ install_macos() {
     for p in "${existing[@]}"; do echo "  - $p" >&2; done
     echo "" >&2
     echo "Run the macOS uninstall first, then re-run this installer:" >&2
-    echo "  curl -fsSL ${QSA_RELEASE_URL}/uninstall.sh | bash" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/uninstall.sh | sudo bash" >&2
     exit 1
   fi
 
@@ -92,40 +144,49 @@ install_macos() {
   for sig in "$bin_dir/qclient".dgst.sig.*; do
     [[ -e "$sig" ]] && node_blockers+=("$sig")
   done
-  [[ -e "$home/Library/LaunchAgents/com.quilscan.node.plist" ]] && node_blockers+=("$home/Library/LaunchAgents/com.quilscan.node.plist")
-  [[ -e "$home/Library/Application Support/quilibrium/.config" ]] && node_blockers+=("$home/Library/Application Support/quilibrium/.config")
-  if pgrep -x quilibrium-node >/dev/null 2>&1; then
-    node_blockers+=("running process: quilibrium-node (pid $(pgrep -x quilibrium-node | head -1))")
+  [[ -e "/Library/LaunchDaemons/com.quilscan.node.plist" ]] && node_blockers+=("/Library/LaunchDaemons/com.quilscan.node.plist")
+  [[ -e "/Library/Application Support/quilibrium/.config" ]] && node_blockers+=("/Library/Application Support/quilibrium/.config")
+  if [[ -n "$target_home" ]]; then
+    [[ -e "$target_home/.local/bin/quilibrium-node" ]] && node_blockers+=("$target_home/.local/bin/quilibrium-node")
+    [[ -e "$target_home/Library/LaunchAgents/com.quilscan.node.plist" ]] && node_blockers+=("$target_home/Library/LaunchAgents/com.quilscan.node.plist")
+    [[ -e "$target_home/Library/Application Support/quilibrium/.config" ]] && node_blockers+=("$target_home/Library/Application Support/quilibrium/.config")
+  fi
+  local running_node_pid
+  running_node_pid="$(pgrep_first quilibrium-node)"
+  if [[ -n "$running_node_pid" ]]; then
+    node_blockers+=("running process: quilibrium-node (pid $running_node_pid)")
   fi
   if (( ${#node_blockers[@]} > 0 )); then
     print_node_blocker_message "Mac" "${node_blockers[@]}"
     exit 1
   fi
 
-  # Make sure ~/.local/bin exists and is on PATH for future shells. We modify
-  # the user's shell rc only when the directory is missing from PATH; this
-  # avoids appending duplicate lines on re-installs.
-  mkdir -p "$bin_dir"
-  if ! echo ":$PATH:" | grep -q ":$bin_dir:"; then
-    local shell_name rc
-    shell_name=$(basename "${SHELL:-zsh}")
-    case "$shell_name" in
-      zsh)  rc="$home/.zshrc" ;;
-      bash) rc="$home/.bash_profile" ;;
-      *)    rc="$home/.profile" ;;
-    esac
-    echo "" >> "$rc"
-    echo '# Added by quilscan-agent installer' >> "$rc"
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
-    echo "[note] Added $bin_dir to PATH in $rc — open a new terminal or run: source \"$rc\""
-  fi
-
   echo "[1/5] Downloading agent → $agent_bin"
+  mkdir -p "$bin_dir"
   curl -fsSL "$QSA_RELEASE_URL/quilscan-agent-$PLATFORM" -o "$agent_bin"
   chmod +x "$agent_bin"
 
   echo "[2/5] Creating support directories"
   mkdir -p "$app_support" "$logs_dir" "$launch_dir"
+  cat > "$app_support/config.yaml" <<YAML
+backend_url: "wss://api.quilscan.com/api/agent/ws"
+service_mode: "system"
+service_user: "root"
+node_service_mode: "system"
+agent_binary_path: "/usr/local/bin/quilscan-agent"
+node_binary_path: "/usr/local/bin/quilibrium-node"
+qclient_binary_path: "/usr/local/bin/qclient"
+qclient_release_url: "https://releases.quilscan.com"
+node_service_name: "com.quilscan.node"
+agent_service_name: "com.quilscan.agent"
+token_path: "/Library/Application Support/quilscan-agent/token"
+state_path: "/Library/Application Support/quilscan-agent/state.yaml"
+audit_log_path: "/Library/Logs/quilscan-agent.log"
+unit_dir: "/Library/LaunchDaemons"
+managed_config_dir: "/Library/Application Support/quilibrium/.config"
+backup_root_dir: "/Library/Application Support/quilscan-agent/backups"
+node_log_path: "/Library/Logs/quilibrium-node.log"
+YAML
 
   echo "[3/5] Generating token"
   # init-token writes "$token_path" with 0600 inside the agent binary so the
@@ -135,7 +196,7 @@ install_macos() {
   # Belt-and-braces: ensure perms in case the user's umask is unusual.
   chmod 600 "$token_path" 2>/dev/null || true
 
-  echo "[4/5] Installing LaunchAgent at $plist_path"
+  echo "[4/5] Installing LaunchDaemon at $plist_path"
   cat > "$plist_path" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -157,17 +218,20 @@ install_macos() {
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>${logs_dir}/quilscan-agent.log</string>
+  <string>/Library/Logs/quilscan-agent.log</string>
   <key>StandardErrorPath</key>
-  <string>${logs_dir}/quilscan-agent.log</string>
+  <string>/Library/Logs/quilscan-agent.log</string>
 </dict>
 </plist>
 PLIST
 
-  launchctl bootstrap "gui/$(id -u)" "$plist_path"
+  chown root:wheel "$plist_path" "$app_support/config.yaml" "$token_path" 2>/dev/null || true
+  chmod 644 "$plist_path" "$app_support/config.yaml"
+  launchctl bootstrap system "$plist_path"
+  launchctl kickstart -k "system/$AGENT_LABEL"
   # Brief pause + verify
   sleep 1
-  if ! launchctl print "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null | grep -q "state = running"; then
+  if ! launchctl print "system/$AGENT_LABEL" 2>/dev/null | grep -q "state = running"; then
     echo "[warn] launchd loaded the job but it didn't reach 'running' state." >&2
     echo "       Check $logs_dir/quilscan-agent.log for details." >&2
   fi
@@ -183,11 +247,11 @@ PLIST
   echo "============================================================"
   echo
   echo "Useful commands:"
-  echo "  tail -f $logs_dir/quilscan-agent.log"
+  echo "  tail -f /Library/Logs/quilscan-agent.log"
   echo "      # live agent log"
-  echo "  launchctl print gui/$(id -u)/$AGENT_LABEL"
+  echo "  sudo launchctl print system/$AGENT_LABEL"
   echo "      # service state"
-  echo "  launchctl kickstart -k gui/$(id -u)/$AGENT_LABEL"
+  echo "  sudo launchctl kickstart -k system/$AGENT_LABEL"
   echo "      # restart agent"
 }
 
@@ -231,11 +295,14 @@ install_linux() {
       node_blockers+=("systemd service running: quilibrium-node.service (active)")
     fi
   fi
-  if command -v pgrep >/dev/null 2>&1 && pgrep -x quilscan-agent >/dev/null 2>&1; then
-    existing+=("running process: quilscan-agent (pid $(pgrep -x quilscan-agent | head -1))")
+  local running_agent_pid running_node_pid
+  running_agent_pid="$(pgrep_first quilscan-agent)"
+  running_node_pid="$(pgrep_first quilibrium-node)"
+  if command -v pgrep >/dev/null 2>&1 && [[ -n "$running_agent_pid" ]]; then
+    existing+=("running process: quilscan-agent (pid $running_agent_pid)")
   fi
-  if command -v pgrep >/dev/null 2>&1 && pgrep -x quilibrium-node >/dev/null 2>&1; then
-    node_blockers+=("running process: quilibrium-node (pid $(pgrep -x quilibrium-node | head -1))")
+  if command -v pgrep >/dev/null 2>&1 && [[ -n "$running_node_pid" ]]; then
+    node_blockers+=("running process: quilibrium-node (pid $running_node_pid)")
   fi
 
   if (( ${#existing[@]} > 0 )); then
@@ -245,7 +312,7 @@ install_linux() {
     echo "" >&2
     echo "Run the agent uninstall script first, then re-run this installer:" >&2
     echo "The uninstall script does not remove Quilibrium node data." >&2
-    echo "  sudo curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash" >&2
+    echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash" >&2
     exit 1
   fi
 

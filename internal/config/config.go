@@ -18,7 +18,7 @@ const DefaultQClientReleaseURL = "https://releases.quilscan.com"
 // Platform notes:
 //   - On Linux, NodeServiceName is the systemd unit ("quilibrium-node.service")
 //     and the unit file lives under UnitDir.
-//   - On macOS, NodeServiceName is the LaunchAgent label
+//   - On macOS, NodeServiceName is the launchd label
 //     ("com.quilscan.node") and the plist file lives under UnitDir.
 type Config struct {
 	ConfigPath        string `yaml:"-"` // path of the loaded config file itself; not persisted
@@ -29,6 +29,8 @@ type Config struct {
 	QClientReleaseURL string `yaml:"qclient_release_url"`
 	NodeServiceName   string `yaml:"node_service_name"`  // systemd unit name OR launchd label
 	AgentServiceName  string `yaml:"agent_service_name"` // ditto, but for the agent itself
+	ServiceMode       string `yaml:"service_mode"`       // user OR system, primarily for macOS migration gating
+	NodeServiceMode   string `yaml:"node_service_mode"`  // user OR system, mirrors the managed node service scope
 	TokenPath         string `yaml:"token_path"`
 	StatePath         string `yaml:"state_path"`
 	AuditLogPath      string `yaml:"audit_log_path"`
@@ -40,12 +42,32 @@ type Config struct {
 
 // DefaultConfig returns sane defaults for the current platform.
 //   - Linux: /usr/local/bin + /etc/quilscan-agent + /etc/systemd/system + ...
-//   - macOS: ~/.local/bin + ~/Library/Application Support + ~/Library/LaunchAgents
-//
-// The macOS layout is intentionally user-scope (Apple Silicon LaunchAgents)
-// so install never needs sudo for any path the agent touches.
+//   - macOS system mode uses /usr/local/bin, /Library/Application Support,
+//     and /Library/LaunchDaemons; legacy user mode remains supported for migration.
 func DefaultConfig() Config {
 	if runtime.GOOS == "darwin" {
+		if os.Geteuid() == 0 {
+			appSupport := "/Library/Application Support/quilscan-agent"
+			return Config{
+				ConfigPath:        filepath.Join(appSupport, "config.yaml"),
+				BackendURL:        "wss://api.quilscan.com/api/agent/ws",
+				AgentBinaryPath:   "/usr/local/bin/quilscan-agent",
+				NodeBinaryPath:    "/usr/local/bin/quilibrium-node",
+				QClientBinaryPath: "/usr/local/bin/qclient",
+				QClientReleaseURL: DefaultQClientReleaseURL,
+				NodeServiceName:   "com.quilscan.node",
+				AgentServiceName:  "com.quilscan.agent",
+				ServiceMode:       "system",
+				NodeServiceMode:   "system",
+				TokenPath:         filepath.Join(appSupport, "token"),
+				StatePath:         filepath.Join(appSupport, "state.yaml"),
+				AuditLogPath:      "/Library/Logs/quilscan-agent.log",
+				UnitDir:           "/Library/LaunchDaemons",
+				ManagedConfigDir:  "/Library/Application Support/quilibrium/.config",
+				BackupRootDir:     filepath.Join(appSupport, "backups"),
+				NodeLogPath:       "/Library/Logs/quilibrium-node.log",
+			}
+		}
 		home, _ := os.UserHomeDir()
 		appSupport := filepath.Join(home, "Library/Application Support/quilscan-agent")
 		return Config{
@@ -57,6 +79,8 @@ func DefaultConfig() Config {
 			QClientReleaseURL: DefaultQClientReleaseURL,
 			NodeServiceName:   "com.quilscan.node",
 			AgentServiceName:  "com.quilscan.agent",
+			ServiceMode:       "user",
+			NodeServiceMode:   "user",
 			TokenPath:         filepath.Join(appSupport, "token"),
 			StatePath:         filepath.Join(appSupport, "state.yaml"),
 			AuditLogPath:      filepath.Join(home, "Library/Logs/quilscan-agent.log"),
@@ -75,6 +99,8 @@ func DefaultConfig() Config {
 		QClientReleaseURL: DefaultQClientReleaseURL,
 		NodeServiceName:   "quilibrium-node.service",
 		AgentServiceName:  "quilscan-agent.service",
+		ServiceMode:       "system",
+		NodeServiceMode:   "system",
 		TokenPath:         "/etc/quilscan-agent/token",
 		StatePath:         "/etc/quilscan-agent/state.yaml",
 		AuditLogPath:      "/var/log/quilscan-agent.log",

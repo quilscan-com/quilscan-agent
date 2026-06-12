@@ -8,12 +8,13 @@
 #
 # Linux : reads /etc/quilscan-agent/state.yaml, uses systemd to stop the
 #         node, backs up under /var/lib/quilscan/backups/. Requires sudo.
-# macOS : reads ~/Library/Application Support/quilscan-agent/state.yaml,
-#         uses launchctl to stop the node, backs up under
-#         ~/Library/Application Support/quilscan-agent/backups/. No sudo.
+# macOS : supports both legacy user LaunchAgents and root LaunchDaemons.
+#         Fresh/default .config dirs are backed up; imported .config dirs are
+#         preserved at their original path.
 #
 # Usage:
-#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | bash         (macOS)
+#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash    (macOS system-mode)
+#   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | bash         (macOS legacy user-mode)
 #   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash    (Linux)
 
 set -euo pipefail
@@ -26,27 +27,53 @@ remove_node_macos() {
   local plist="$home/Library/LaunchAgents/com.quilscan.node.plist"
   local fresh_cfg="$home/Library/Application Support/quilibrium/.config"
   local label="com.quilscan.node"
+  local launch_target="gui/$(id -u)/$label"
+  local service_scope="user"
+  if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+    state="/Library/Application Support/quilscan-agent/state.yaml"
+    bin="/usr/local/bin/quilibrium-node"
+    qclient_bin="/usr/local/bin/qclient"
+    plist="/Library/LaunchDaemons/com.quilscan.node.plist"
+    fresh_cfg="/Library/Application Support/quilibrium/.config"
+    launch_target="system/$label"
+    service_scope="system"
+  elif [ -f "/Library/Application Support/quilscan-agent/state.yaml" ] || launchctl print "system/$label" >/dev/null 2>&1; then
+    echo "System-mode node detected. Re-run with sudo:" >&2
+    echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash" >&2
+    exit 1
+  fi
   local ts
   ts=$(date -u +%Y%m%d-%H%M%S)
-  local backup="$home/Library/Application Support/quilscan-agent/backups/node-removal-$ts"
+  local backup
+  if [ "$service_scope" = "system" ]; then
+    backup="/Library/Application Support/quilscan-agent/backups/node-removal-$ts"
+  else
+    backup="$home/Library/Application Support/quilscan-agent/backups/node-removal-$ts"
+  fi
 
   local install_source="unknown"
   local user_cfg=""
+  local config_path=""
   if [ -f "$state" ]; then
     install_source=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$state" | tr -d '"')
     user_cfg=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$state" | tr -d '"')
+    config_path=$(awk -F': *' '/^config_path:/ {print $2; exit}' "$state" | tr -d '"')
     qclient_bin=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$state" | tr -d '"')
-    qclient_bin=${qclient_bin:-"$home/.local/bin/qclient"}
+    if [ "$service_scope" = "system" ]; then
+      qclient_bin=${qclient_bin:-/usr/local/bin/qclient}
+    else
+      qclient_bin=${qclient_bin:-"$home/.local/bin/qclient"}
+    fi
   fi
-  echo "[remove-node] install_source=${install_source:-unknown}"
+  echo "[remove-node] service_scope=$service_scope install_source=${install_source:-unknown}"
   mkdir -p "$backup"
 
-  # Stop the LaunchAgent if loaded so the node exits cleanly.
-  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
-    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  # Stop the launchd job if loaded so the node exits cleanly.
+  if launchctl print "$launch_target" >/dev/null 2>&1; then
+    launchctl bootout "$launch_target" 2>/dev/null || true
   fi
-  # Belt-and-braces: terminate any orphan node process the LaunchAgent
-  # didn't catch (e.g. if the user manually launched it once).
+  # Belt-and-braces: terminate any orphan node process launchd did not catch
+  # (e.g. if the user manually launched it once).
   pkill -TERM -x quilibrium-node 2>/dev/null || true
   sleep 2
   pkill -KILL -x quilibrium-node 2>/dev/null || true
@@ -79,10 +106,14 @@ remove_node_macos() {
 
   move_binary_bundle_to_backup "$bin"
   move_binary_bundle_to_backup "$qclient_bin"
+  if [ "$service_scope" = "system" ]; then
+    rm -f "/var/root/.local/bin/quilibrium-node"
+    rm -f "/var/root/.local/bin/qclient"
+  fi
   move_to_backup "$plist"
   move_to_backup "$state"
   if [ "$install_source" = "fresh" ]; then
-    move_to_backup "$fresh_cfg"
+    move_to_backup "${config_path:-$fresh_cfg}"
   fi
   # macOS has no daemon-reload equivalent — bootout already detached.
 
@@ -97,6 +128,8 @@ remove_node_macos() {
   fi
   if [ "$install_source" = "migrated" ] && [ -n "$user_cfg" ]; then
     echo "[remove-node] Preserved (untouched): $user_cfg"
+  elif [ "$install_source" = "migrated" ] && [ -n "$config_path" ]; then
+    echo "[remove-node] Preserved (untouched): $config_path"
   fi
 }
 
@@ -112,9 +145,11 @@ remove_node_linux() {
 
   local INSTALL_SOURCE="unknown"
   local USER_CFG=""
+  local CONFIG_PATH=""
   if [ -f "$STATE" ]; then
     INSTALL_SOURCE=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$STATE" | tr -d '"')
     USER_CFG=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$STATE" | tr -d '"')
+    CONFIG_PATH=$(awk -F': *' '/^config_path:/ {print $2; exit}' "$STATE" | tr -d '"')
     QCLIENT_BIN=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$STATE" | tr -d '"')
     QCLIENT_BIN=${QCLIENT_BIN:-/usr/local/bin/qclient}
   fi
@@ -157,7 +192,7 @@ remove_node_linux() {
   move_to_backup "$UNIT_FILE"
   move_to_backup "$STATE"
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
-    move_to_backup "$FRESH_CFG"
+    move_to_backup "${CONFIG_PATH:-$FRESH_CFG}"
   fi
   systemctl daemon-reload || true
 
@@ -172,6 +207,8 @@ remove_node_linux() {
   fi
   if [ "$INSTALL_SOURCE" = "migrated" ] && [ -n "$USER_CFG" ]; then
     echo "[remove-node] Preserved (untouched): $USER_CFG"
+  elif [ "$INSTALL_SOURCE" = "migrated" ] && [ -n "$CONFIG_PATH" ]; then
+    echo "[remove-node] Preserved (untouched): $CONFIG_PATH"
   fi
 }
 

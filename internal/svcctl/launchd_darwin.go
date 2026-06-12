@@ -11,22 +11,33 @@ import (
 	"time"
 )
 
-// launchdCtl wraps launchctl invocations against the user's gui/<UID>
-// domain. We never touch the system domain because Mac users (per the
-// A2 design) run their agent as a user-level LaunchAgent — no sudo
-// required for any of these calls.
+// launchdCtl wraps launchctl invocations for both legacy user LaunchAgents
+// and the current system LaunchDaemons. If a system plist exists for the
+// label, commands target system/<label>; otherwise they fall back to the
+// user's gui/<UID>/<label> domain.
 type launchdCtl struct{}
 
 // New returns the platform-appropriate Ctl. On macOS: launchd.
 func New() Ctl { return launchdCtl{} }
 
 func (launchdCtl) plistPath(label string) string {
+	systemPath := "/Library/LaunchDaemons/" + label + ".plist"
+	if _, err := os.Stat(systemPath); err == nil {
+		return systemPath
+	}
 	home, _ := os.UserHomeDir()
 	return home + "/Library/LaunchAgents/" + label + ".plist"
 }
 
+func (l launchdCtl) domain(label string) string {
+	if strings.HasPrefix(l.plistPath(label), "/Library/LaunchDaemons/") {
+		return "system"
+	}
+	return fmt.Sprintf("gui/%d", os.Getuid())
+}
+
 func (l launchdCtl) domainTarget(label string) string {
-	return fmt.Sprintf("gui/%d/%s", os.Getuid(), label)
+	return l.domain(label) + "/" + label
 }
 
 // Start loads the plist if needed and ensures the job is running.
@@ -39,8 +50,7 @@ func (l launchdCtl) Start(label string) error {
 		return fmt.Errorf("plist not found: %s", plist)
 	}
 	if !l.isLoaded(label) {
-		if err := launchctl("bootstrap",
-			fmt.Sprintf("gui/%d", os.Getuid()), plist); err != nil {
+		if err := launchctl("bootstrap", l.domain(label), plist); err != nil {
 			return err
 		}
 	}

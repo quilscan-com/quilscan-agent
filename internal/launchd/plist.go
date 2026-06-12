@@ -1,7 +1,7 @@
-// Package launchd renders LaunchAgent plist files and wraps launchctl
-// invocations against the gui/<UID> domain. Mirrors internal/systemd in
-// purpose but targets macOS user-level service management — no sudo, no
-// /etc/systemd, no daemon-reload.
+// Package launchd renders launchd plist files and wraps launchctl
+// invocations for both legacy user LaunchAgents and current system
+// LaunchDaemons. Mirrors internal/systemd in purpose but targets macOS
+// launchd instead of systemd.
 package launchd
 
 import (
@@ -65,7 +65,7 @@ func pair(k, v string) []any {
 	return []any{plistKey{Value: k}, plistString{Value: v}}
 }
 
-// RenderNodePlist returns the LaunchAgent plist body for the Quilibrium
+// RenderNodePlist returns the launchd plist body for the Quilibrium
 // node service. Mirrors systemd.RenderNodeUnit semantics:
 //
 //   - Fresh install: ConfigPath empty, WorkDir set to the parent of the
@@ -73,7 +73,7 @@ func pair(k, v string) []any {
 //   - Migrated install: ConfigPath empty, WorkDir set to the parent of the
 //     user-supplied `.config` directory; startup matches the fresh install shape.
 //
-// RunAtLoad=true so the job starts automatically when the user logs in.
+// RunAtLoad=true so the job starts automatically when its launchd domain is bootstrapped.
 // KeepAlive's `Crashed` clause restarts the process on non-zero exits but
 // not on graceful exits (so cleanup_residue / Stop don't trigger relaunch).
 func RenderNodePlist(in svcctl.NodeServiceInput) string {
@@ -128,7 +128,7 @@ func nodeFileLimitDict(limit int) plistInlineDict {
 	}}
 }
 
-// EnsureNodeFileLimit updates an existing LaunchAgent plist so older managed
+// EnsureNodeFileLimit updates an existing launchd plist so older managed
 // node installs get the same file descriptor limit as freshly rendered plists.
 func EnsureNodeFileLimit(plistPath string, limit int) (bool, error) {
 	raw, err := os.ReadFile(plistPath)

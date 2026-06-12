@@ -36,7 +36,7 @@ type InstallDeps struct {
 	DevInstaller    DevNodeInstaller
 	NodeManifestURL string
 	Systemd         SystemdOps
-	// RenderServiceDef returns the systemd unit file (Linux) or LaunchAgent
+	// RenderServiceDef returns the systemd unit file (Linux) or launchd
 	// plist (macOS) body for the supplied node-launch parameters. The
 	// install handler does not care which format it gets — it just hands
 	// the bytes to Systemd.WriteUnit.
@@ -44,7 +44,7 @@ type InstallDeps struct {
 	Platform         string // e.g. "linux-amd64"
 	DefaultCfgDir    string // default node .config directory when args.config_path is empty
 	UnitName         string // e.g. "quilibrium-node.service" or "com.quilscan.node"
-	UnitDir          string // systemd unit dir or LaunchAgents dir; used for residue detection
+	UnitDir          string // systemd unit dir or launchd plist dir; used for residue detection
 	BinaryPath       string
 	User             string
 	// NodeLogPath is the redirect target for plist Stdout/Err on macOS.

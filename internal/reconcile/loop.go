@@ -78,6 +78,8 @@ type Loop struct {
 	AgentConfigYAMLPath string
 	AgentAuditLogPath   string
 	AgentServiceName    string // systemd unit name OR launchd label
+	ServiceMode         string
+	NodeServiceMode     string
 	NodeLogPath         string // macOS node log file; Linux uses journalctl
 
 	// Svc is the service-manager probe used for IsActive / StartedAt.
@@ -398,6 +400,9 @@ func (l *Loop) runVerify() {
 			"dev_node_signature_verified": state.DevNodeSignatureVerified,
 			"install_source":              state.InstallSource,
 			"node_residues":               detection.Residues,
+			"service_mode":                l.ServiceMode,
+			"agent_service_mode":          l.ServiceMode,
+			"node_service_mode":           l.NodeServiceMode,
 		}
 		if peerID, _ := nodePatch["peer_id"].(string); peerID != "" {
 			meta["peer_id"] = peerID

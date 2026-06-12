@@ -32,7 +32,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.1.0"
+var version = "1.1.1"
 
 type startStopCtl interface {
 	Start(string) error
@@ -62,7 +62,8 @@ func main() {
 // special-casing here:
 //
 //	Linux : /etc/quilscan-agent/token  → mkdir /etc/quilscan-agent
-//	macOS : ~/Library/Application Support/quilscan-agent/token → mkdir that.
+//	macOS : /Library/Application Support/quilscan-agent/token in system mode,
+//	        or the legacy user support directory when running user-mode.
 func bootstrapToken() {
 	defaults := config.DefaultConfig()
 	tok, err := token.Generate()
@@ -84,6 +85,7 @@ func run() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	defaults = cfg
 
 	tok, err := token.Load(defaults.TokenPath)
 	if err != nil {
@@ -110,16 +112,19 @@ func run() {
 	go func() { <-sigs; cancel() }()
 
 	startedAt := time.Now()
+	agentServiceMode, nodeServiceMode := serviceModes(cfg)
 
 	// Create client first so installDeps callbacks can close over it.
 	client := &ws.Client{
 		URL:   cfg.BackendURL,
 		Token: tok,
 		Meta: ws.Meta{
-			Version:    version,
-			OS:         platform,
-			HasNode:    hasExistingNode(defaults),
-			HasQClient: hasExistingQClient(defaults),
+			Version:         version,
+			OS:              platform,
+			HasNode:         hasExistingNode(defaults),
+			HasQClient:      hasExistingQClient(defaults),
+			ServiceMode:     agentServiceMode,
+			NodeServiceMode: nodeServiceMode,
 		},
 	}
 
@@ -266,6 +271,10 @@ func run() {
 						rec.PatchNodeStatus(patch)
 					}
 				},
+			}),
+			"check_public_stream_ports": actions.NewCheckPublicStreamPortsHandler(actions.CheckPublicStreamPortsDeps{
+				StatePath:        defaults.StatePath,
+				ManagedConfigDir: defaults.ManagedConfigDir,
 			}),
 			"qclient_manage_action": actions.NewQClientManageActionHandler(actions.QClientManageActionDeps{
 				StatePath:         defaults.StatePath,
@@ -472,6 +481,8 @@ func run() {
 		AgentConfigYAMLPath:  defaults.ConfigPath,
 		AgentAuditLogPath:    defaults.AuditLogPath,
 		AgentServiceName:     defaults.AgentServiceName,
+		ServiceMode:          agentServiceMode,
+		NodeServiceMode:      nodeServiceMode,
 		NodeLogPath:          defaults.NodeLogPath,
 		Svc:                  reconcileSvc,
 		NodeManifestURL:      nodemanifest.DefaultURL,
@@ -557,6 +568,41 @@ func hasExistingQClient(defaults config.Config) bool {
 	}
 	st, err := os.Stat(defaults.QClientBinaryPath)
 	return err == nil && !st.IsDir()
+}
+
+func serviceModes(cfg config.Config) (string, string) {
+	agentMode := normalizeServiceMode(cfg.ServiceMode)
+	if agentMode == "" {
+		agentMode = inferServiceMode(cfg.UnitDir)
+	}
+	nodeMode := normalizeServiceMode(cfg.NodeServiceMode)
+	if nodeMode == "" {
+		nodeMode = agentMode
+	}
+	return agentMode, nodeMode
+}
+
+func normalizeServiceMode(value string) string {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "root", "daemon", "launchdaemon":
+		return "system"
+	case "launchagent":
+		return "user"
+	default:
+		return v
+	}
+}
+
+func inferServiceMode(unitDir string) string {
+	if runtime.GOOS != "darwin" {
+		return "system"
+	}
+	clean := filepath.Clean(unitDir)
+	if clean == "/Library/LaunchDaemons" {
+		return "system"
+	}
+	return "user"
 }
 
 func ensureQClientInstalledOnStartup(defaults config.Config, installQClient func() (string, error)) {
