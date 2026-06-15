@@ -1,0 +1,71 @@
+name: Build signed agent artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sign:
+    name: Build and sign
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Verify signing secret
+        env:
+          AGENT_SIGNING_PRIVATE_KEY: ${{ secrets.AGENT_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AGENT_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::AGENT_SIGNING_PRIVATE_KEY repository secret is not configured"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build three platforms
+        run: make build
+
+      - name: Sign artifacts
+        env:
+          AGENT_SIGNING_PRIVATE_KEY: ${{ secrets.AGENT_SIGNING_PRIVATE_KEY }}
+        run: |
+          go run ./scripts/sign-agent-artifacts.go \
+            dist/quilscan-agent-linux-amd64 \
+            dist/quilscan-agent-linux-arm64 \
+            dist/quilscan-agent-darwin-arm64
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum \
+            quilscan-agent-linux-amd64 \
+            quilscan-agent-linux-amd64.sig \
+            quilscan-agent-linux-arm64 \
+            quilscan-agent-linux-arm64.sig \
+            quilscan-agent-darwin-arm64 \
+            quilscan-agent-darwin-arm64.sig \
+            > SHA256SUMS
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: quilscan-agent-signed-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            dist/quilscan-agent-linux-amd64
+            dist/quilscan-agent-linux-amd64.sig
+            dist/quilscan-agent-linux-arm64
+            dist/quilscan-agent-linux-arm64.sig
+            dist/quilscan-agent-darwin-arm64
+            dist/quilscan-agent-darwin-arm64.sig
+            dist/SHA256SUMS

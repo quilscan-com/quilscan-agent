@@ -401,6 +401,22 @@ The build writes platform binaries to `dist/`.
 
 Requires Go 1.22 or newer.
 
+## GitHub Signed Builds
+
+The `Build signed agent artifacts` GitHub Actions workflow builds and signs the
+three release artifacts:
+
+```text
+quilscan-agent-linux-amd64
+quilscan-agent-linux-arm64
+quilscan-agent-darwin-arm64
+```
+
+It runs only when manually started with `workflow_dispatch`. The workflow
+requires the repository secret `AGENT_SIGNING_PRIVATE_KEY`, containing the
+base64-encoded Ed25519 private key. It uploads the binaries, `.sig` files, and
+`SHA256SUMS` as workflow artifacts.
+
 ## Directory Structure
 
 ```text
