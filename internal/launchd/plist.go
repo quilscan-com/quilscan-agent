@@ -14,7 +14,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 )
 
-const NodeFileLimit = 61440
+const NodeFileLimit = 524288
 
 // plistDoc + plistDict are the minimal subset of Apple's plist DTD we
 // emit. Using encoding/xml gives us correct character escaping for paths

@@ -17,6 +17,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/actions"
 	"github.com/quilscan-com/quilscan-agent/internal/audit"
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/launchd"
 	"github.com/quilscan-com/quilscan-agent/internal/logstream"
 	"github.com/quilscan-com/quilscan-agent/internal/metrics"
@@ -32,7 +33,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.1.1"
+var version = "1.1.2"
 
 type startStopCtl interface {
 	Start(string) error
@@ -151,8 +152,6 @@ func run() {
 			})
 		}
 	}
-	ensureDarwinNodeFileLimitOnStartup(defaults, sdCtl)
-
 	// Post-install hook: wait for node's auto-generated config.yml, set
 	// loopback listen multiaddrs (without overriding user values), restart
 	// the service so the agent can talk to RPC. Persists rpc_patched flag.
@@ -368,6 +367,12 @@ func run() {
 						rec.PatchNodeStatus(patch)
 					}
 				},
+			}),
+			"repair_fd_limit": newRepairFDLimitHandler(defaults, sdCtl, func() bool {
+				if rec == nil {
+					return false
+				}
+				return rec.RunVerifyNow()
 			}),
 			"install_qclient": actions.NewInstallQClientHandler(qclientInstallDeps()),
 		},
@@ -609,7 +614,7 @@ func ensureQClientInstalledOnStartup(defaults config.Config, installQClient func
 	if hasExistingQClient(defaults) || installQClient == nil {
 		return
 	}
-	if !hasRecordedNode(defaults.StatePath) {
+	if !hasRecordedNode(defaults.StatePath, defaults.NodeBinaryPath) {
 		log.Printf("[qclient] missing at %s; no recorded node yet, skipping startup install", defaults.QClientBinaryPath)
 		return
 	}
@@ -626,31 +631,24 @@ func ensureQClientInstalledOnStartup(defaults config.Config, installQClient func
 	}
 }
 
-func hasRecordedNode(statePath string) bool {
+func hasRecordedNode(statePath, binaryPath string) bool {
 	state, err := config.LoadState(statePath)
 	if err != nil || state == nil || state.ConfigPath == "" {
+		return false
+	}
+	nodeBinaryPath := state.BinaryPath
+	if nodeBinaryPath == "" {
+		nodeBinaryPath = binaryPath
+	}
+	if st, err := os.Stat(nodeBinaryPath); err != nil || st.IsDir() {
 		return false
 	}
 	st, err := os.Stat(state.ConfigPath)
 	return err == nil && st.IsDir()
 }
 
-func ensureDarwinNodeFileLimitOnStartup(defaults config.Config, ctl startStopCtl) {
-	if runtime.GOOS != "darwin" {
-		return
-	}
-	changed, err := ensureNodeLaunchdFileLimit(defaults, ctl)
-	if err != nil {
-		log.Printf("[launchd] node file limit check failed: %v", err)
-		return
-	}
-	if changed {
-		log.Printf("[launchd] node file limit set to %d", launchd.NodeFileLimit)
-	}
-}
-
-func ensureNodeLaunchdFileLimit(defaults config.Config, ctl startStopCtl) (bool, error) {
-	if ctl == nil || defaults.NodeBinaryPath == "" || defaults.UnitDir == "" || defaults.NodeServiceName == "" {
+func ensureNodeLaunchdFileLimit(defaults config.Config) (bool, error) {
+	if defaults.NodeBinaryPath == "" || defaults.UnitDir == "" || defaults.NodeServiceName == "" {
 		return false, nil
 	}
 	if st, err := os.Stat(defaults.NodeBinaryPath); err != nil || st.IsDir() {
@@ -660,39 +658,111 @@ func ensureNodeLaunchdFileLimit(defaults config.Config, ctl startStopCtl) (bool,
 	if st, err := os.Stat(plistPath); err != nil || st.IsDir() {
 		return false, nil
 	}
-	wasActive := ctl.IsActive(defaults.NodeServiceName)
-	changed, err := launchd.EnsureNodeFileLimit(plistPath, launchd.NodeFileLimit)
-	if err != nil || !changed || !wasActive {
+	changed := false
+	if filepath.Clean(defaults.UnitDir) == "/Library/LaunchDaemons" {
+		globalChanged, err := launchd.EnsureSystemFileLimit(launchd.NodeFileLimit)
+		if err != nil {
+			return changed, err
+		}
+		changed = changed || globalChanged
+	}
+	plistChanged, err := launchd.EnsureNodeFileLimit(plistPath, launchd.NodeFileLimit)
+	if err != nil {
 		return changed, err
 	}
-	if err := ctl.Stop(defaults.NodeServiceName); err != nil {
-		return true, fmt.Errorf("restart node after file limit update: stop: %w", err)
-	}
-	if err := startNodeAfterLaunchdFileLimitUpdate(ctl, defaults.NodeServiceName); err != nil {
-		return true, fmt.Errorf("restart node after file limit update: start: %w", err)
-	}
-	return true, nil
+	changed = changed || plistChanged
+	return changed, nil
 }
 
-var launchdFileLimitRestartDelay = time.Second
-
-func startNodeAfterLaunchdFileLimitUpdate(ctl startStopCtl, name string) error {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(launchdFileLimitRestartDelay)
-		}
-		if err := ctl.Start(name); err != nil {
-			lastErr = err
-			continue
-		}
-		time.Sleep(launchdFileLimitRestartDelay)
-		if ctl.IsActive(name) {
-			return nil
-		}
-		lastErr = fmt.Errorf("service did not become active")
+func ensureNodeSystemdFileLimit(defaults config.Config, ctl startStopCtl) (bool, error) {
+	if ctl == nil || defaults.NodeBinaryPath == "" || defaults.UnitDir == "" || defaults.NodeServiceName == "" {
+		return false, nil
 	}
-	return lastErr
+	if st, err := os.Stat(defaults.NodeBinaryPath); err != nil || st.IsDir() {
+		return false, nil
+	}
+	unitPath := filepath.Join(defaults.UnitDir, defaults.NodeServiceName)
+	if st, err := os.Stat(unitPath); err != nil || st.IsDir() {
+		return false, nil
+	}
+	changed, err := systemd.EnsureNodeFileLimit(unitPath, systemd.NodeFileLimit)
+	if err != nil || !changed {
+		return changed, err
+	}
+	return true, ctl.Reload()
+}
+
+func newRepairFDLimitHandler(defaults config.Config, ctl startStopCtl, refresh func() bool) actions.Handler {
+	return func(c actions.Command, emit actions.Emitter) error {
+		emit(actions.Status{ID: c.ID, Step: "checking", Progress: 0.15})
+		wasActive := ctl != nil && ctl.IsActive(defaults.NodeServiceName)
+		restartRequired := nodeFileLimitRestartRequired(defaults)
+		changed, err := repairNodeFileLimit(defaults, ctl)
+		if err != nil {
+			emit(actions.Status{ID: c.ID, Step: "failed", Error: err.Error()})
+			return err
+		}
+		if wasActive || changed || restartRequired {
+			emit(actions.Status{ID: c.ID, Step: "stopping", Progress: 0.45})
+			if err := ctl.Stop(defaults.NodeServiceName); err != nil {
+				emit(actions.Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+			emit(actions.Status{ID: c.ID, Step: "starting", Progress: 0.70})
+			if err := ctl.Start(defaults.NodeServiceName); err != nil {
+				emit(actions.Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+		}
+		emit(actions.Status{ID: c.ID, Step: "refreshing", Progress: 0.90})
+		if refresh != nil {
+			refresh()
+		}
+		message := "file descriptor limit already matches the recommended value"
+		if changed || restartRequired {
+			message = "file descriptor limit updated and node restarted"
+		} else if wasActive {
+			message = "file descriptor limit already matched the recommended value; node restarted"
+		}
+		emit(actions.Status{ID: c.ID, Step: "done", Progress: 1.0, Message: message})
+		return nil
+	}
+}
+
+func nodeFileLimitRestartRequired(defaults config.Config) bool {
+	if defaults.NodeBinaryPath == "" || defaults.UnitDir == "" || defaults.NodeServiceName == "" {
+		return false
+	}
+	if st, err := os.Stat(defaults.NodeBinaryPath); err != nil || st.IsDir() {
+		return false
+	}
+	unitName := defaults.NodeServiceName
+	unitPath := filepath.Join(defaults.UnitDir, unitName)
+	if runtime.GOOS == "darwin" {
+		if !strings.HasSuffix(unitName, ".plist") {
+			unitPath = filepath.Join(defaults.UnitDir, unitName+".plist")
+		}
+	}
+	if st, err := os.Stat(unitPath); err != nil || st.IsDir() {
+		return false
+	}
+	status := fdlimit.Inspect(fdlimit.InspectRequest{
+		Platform: runtime.GOOS,
+		UnitDir:  defaults.UnitDir,
+		UnitName: defaults.NodeServiceName,
+	})
+	return status.RestartRequired && status.Status != fdlimit.StatusDisabled && status.Status != fdlimit.StatusError
+}
+
+func repairNodeFileLimit(defaults config.Config, ctl startStopCtl) (bool, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		return ensureNodeLaunchdFileLimit(defaults)
+	case "linux":
+		return ensureNodeSystemdFileLimit(defaults, ctl)
+	default:
+		return false, fmt.Errorf("file descriptor limit repair is unsupported on %s", runtime.GOOS)
+	}
 }
 
 func hasExistingNodeAt(binaryPath, stateCfgPath, defaultCfgDir, unitFilePath string) bool {

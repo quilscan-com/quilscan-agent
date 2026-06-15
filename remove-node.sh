@@ -83,6 +83,11 @@ remove_node_macos() {
     local src="$1"
     [ -e "$src" ] || return 0
     local dst="$backup/$(basename "$src")"
+    local n=2
+    while [ -e "$dst" ]; do
+      dst="$backup/$(basename "$src")-$n"
+      n=$((n + 1))
+    done
     if mv "$src" "$dst" 2>/dev/null; then
       items+=("$src -> $dst")
       return 0
@@ -110,6 +115,19 @@ remove_node_macos() {
     rm -f "/var/root/.local/bin/quilibrium-node"
     rm -f "/var/root/.local/bin/qclient"
   fi
+  move_to_backup "$plist"
+  move_to_backup "$state"
+  if [ "$install_source" = "fresh" ]; then
+    move_to_backup "${config_path:-$fresh_cfg}"
+  fi
+  # A node that is still winding down can recreate .config after the first
+  # move. Do one final stop-and-sweep pass so fresh installs are actually
+  # clean after this script exits.
+  pkill -TERM -x quilibrium-node 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x quilibrium-node 2>/dev/null || true
+  move_binary_bundle_to_backup "$bin"
+  move_binary_bundle_to_backup "$qclient_bin"
   move_to_backup "$plist"
   move_to_backup "$state"
   if [ "$install_source" = "fresh" ]; then
@@ -167,6 +185,11 @@ remove_node_linux() {
     local src="$1"
     [ -e "$src" ] || return 0
     local dst="$BACKUP/$(basename "$src")"
+    local n=2
+    while [ -e "$dst" ]; do
+      dst="$BACKUP/$(basename "$src")-$n"
+      n=$((n + 1))
+    done
     if mv "$src" "$dst" 2>/dev/null; then
       ITEMS+=("$src -> $dst")
       return 0
@@ -187,6 +210,19 @@ remove_node_linux() {
       move_to_backup "$sig"
     done
   }
+  move_binary_bundle_to_backup "$BIN"
+  move_binary_bundle_to_backup "$QCLIENT_BIN"
+  move_to_backup "$UNIT_FILE"
+  move_to_backup "$STATE"
+  if [ "$INSTALL_SOURCE" = "fresh" ]; then
+    move_to_backup "${CONFIG_PATH:-$FRESH_CFG}"
+  fi
+  # A node that is still winding down can recreate .config after the first
+  # move. Do one final stop-and-sweep pass so fresh installs are actually
+  # clean after this script exits.
+  pkill -TERM -x quilibrium-node 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x quilibrium-node 2>/dev/null || true
   move_binary_bundle_to_backup "$BIN"
   move_binary_bundle_to_backup "$QCLIENT_BIN"
   move_to_backup "$UNIT_FILE"

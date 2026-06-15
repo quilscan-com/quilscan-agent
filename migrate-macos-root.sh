@@ -21,6 +21,10 @@ NODE_LABEL="com.quilscan.node"
 DEFAULT_BACKEND_URL="wss://api.quilscan.com/api/agent/ws"
 QSA_RELEASE_URL="${QSA_RELEASE_URL:-https://qstorage.quilibrium.com/quilscan-agent}"
 AGENT_PLATFORM="darwin-arm64"
+NODE_FILE_LIMIT=524288
+MAXFILES_LABEL="limit.maxfiles"
+MAXFILES_PLIST="/Library/LaunchDaemons/${MAXFILES_LABEL}.plist"
+SYSCTL_CONF="/etc/sysctl.conf"
 
 TARGET_USER=""
 YES=0
@@ -134,7 +138,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 require_commands() {
   local missing=() cmd
-  for cmd in launchctl id dscl stat install ditto awk sed mktemp chown chmod curl; do
+  for cmd in launchctl id dscl stat install ditto awk sed mktemp chown chmod curl sysctl cp; do
     command_exists "$cmd" || missing+=("$cmd")
   done
   if (( ${#missing[@]} > 0 )); then
@@ -202,6 +206,16 @@ backup_existing() {
   run mkdir -p "$(dirname "$dst")"
   run mv "$path" "$dst"
   log "backed up $path -> $dst"
+}
+
+copy_backup_existing() {
+  local path="$1"
+  path_exists "$path" || return 0
+  local rel="${path#/}"
+  local dst="$backup_root/$rel"
+  run mkdir -p "$(dirname "$dst")"
+  run cp -p "$path" "$dst"
+  log "copied backup $path -> $dst"
 }
 
 first_existing_file() {
@@ -515,12 +529,12 @@ write_node_plist() {
   <key>SoftResourceLimits</key>
   <dict>
     <key>NumberOfFiles</key>
-    <integer>61440</integer>
+    <integer>${NODE_FILE_LIMIT}</integer>
   </dict>
   <key>HardResourceLimits</key>
   <dict>
     <key>NumberOfFiles</key>
-    <integer>61440</integer>
+    <integer>${NODE_FILE_LIMIT}</integer>
   </dict>
   <key>StandardOutPath</key>
   <string>/Library/Logs/quilibrium-node.log</string>
@@ -529,6 +543,96 @@ write_node_plist() {
 </dict>
 </plist>
 PLIST
+}
+
+ensure_live_sysctl_at_least() {
+  local key="$1"
+  local target="$2"
+  local current
+  current="$(sysctl -n "$key" 2>/dev/null || printf '0')"
+  case "$current" in
+    ''|*[!0-9]*) current=0 ;;
+  esac
+  if (( current >= target )); then
+    return 0
+  fi
+  run sysctl -w "${key}=${target}"
+}
+
+ensure_sysctl_conf_value() {
+  local key="$1"
+  local target="$2"
+  local line="${key}=${target}"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '+ ensure %s in %s\n' "$line" "$SYSCTL_CONF"
+    return 0
+  fi
+  touch "$SYSCTL_CONF"
+  local tmp
+  tmp="$(mktemp "/tmp/quilscan-sysctl.XXXXXX")"
+  awk -v key="$key" -v line="$line" '
+    BEGIN { done = 0 }
+    {
+      trimmed = $0
+      sub(/^[ \t]+/, "", trimmed)
+      if (trimmed ~ "^" key "([ \t=]|$)") {
+        if (!done) {
+          print line
+          done = 1
+        }
+        next
+      }
+      print
+    }
+    END {
+      if (!done) {
+        print line
+      }
+    }
+  ' "$SYSCTL_CONF" > "$tmp"
+  install -m 0644 "$tmp" "$SYSCTL_CONF"
+  rm -f "$tmp"
+}
+
+write_maxfiles_plist() {
+  write_file "$MAXFILES_PLIST" 0644 <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${MAXFILES_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>launchctl</string>
+    <string>limit</string>
+    <string>maxfiles</string>
+    <string>${NODE_FILE_LIMIT}</string>
+    <string>${NODE_FILE_LIMIT}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ServiceIPC</key>
+  <false/>
+</dict>
+</plist>
+PLIST
+}
+
+ensure_macos_file_limits() {
+  log "ensuring macOS maxfiles limit ${NODE_FILE_LIMIT}"
+  ensure_live_sysctl_at_least "kern.maxfiles" "$NODE_FILE_LIMIT"
+  ensure_live_sysctl_at_least "kern.maxfilesperproc" "$NODE_FILE_LIMIT"
+  copy_backup_existing "$SYSCTL_CONF"
+  ensure_sysctl_conf_value "kern.maxfiles" "$NODE_FILE_LIMIT"
+  ensure_sysctl_conf_value "kern.maxfilesperproc" "$NODE_FILE_LIMIT"
+  copy_backup_existing "$MAXFILES_PLIST"
+  write_maxfiles_plist
+  run chown root:wheel "$MAXFILES_PLIST"
+  run chmod 644 "$MAXFILES_PLIST"
+  stop_service_if_loaded "system/$MAXFILES_LABEL"
+  bootstrap_service "$MAXFILES_LABEL" "$MAXFILES_PLIST"
 }
 
 ensure_symlink() {
@@ -754,6 +858,7 @@ YAML
     write_node_plist "$sys_node_plist" "$node_work_dir"
     run chown root:wheel "$sys_node_plist"
     run chmod 644 "$sys_node_plist"
+    ensure_macos_file_limits
   fi
 
   log "[6/7] Disabling old user LaunchAgents and backing up user-mode residues"

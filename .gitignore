@@ -1,4 +1,5 @@
 dist/
+.gocache/
 *.test
 *.out
 .idea/

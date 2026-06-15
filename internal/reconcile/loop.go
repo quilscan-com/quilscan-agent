@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinfo"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinstall"
 	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
@@ -239,6 +240,13 @@ func (l *Loop) runVerify() {
 		UnitFilePath:      svcctl.UnitFilePath(l.UnitDir, l.UnitName),
 		ProcessRunning:    processRunning("quilibrium-node"),
 	})
+	if !detection.HasNode && removableNodeResidue(detection.Residues, l.managedConfigDir()) {
+		if err := os.Remove(l.StatePath); err == nil || os.IsNotExist(err) {
+			_ = os.Remove(l.managedConfigDir())
+			state = &config.State{}
+			detection.Residues = []string{}
+		}
+	}
 
 	signals := 0
 	if detection.HasNode {
@@ -290,7 +298,7 @@ func (l *Loop) runVerify() {
 				nodePatch["current_node_version"] = info.Version
 				if state.NodeVersion != info.Version {
 					state.NodeVersion = info.Version
-					_ = config.SaveState(l.StatePath, state)
+					_ = l.saveState(state)
 				}
 				if state.NodeSource != nodemanifest.SourceDev {
 					if latest := l.statusString("latest_node_version"); latest != "" {
@@ -316,7 +324,7 @@ func (l *Loop) runVerify() {
 					nodePatch["current_node_version"] = qstatus.Version
 					if state.NodeVersion != qstatus.Version {
 						state.NodeVersion = qstatus.Version
-						_ = config.SaveState(l.StatePath, state)
+						_ = l.saveState(state)
 					}
 					if state.NodeSource != nodemanifest.SourceDev {
 						if latest := l.statusString("latest_node_version"); latest != "" {
@@ -379,8 +387,13 @@ func (l *Loop) runVerify() {
 	if !state.LastStartedAt.IsZero() {
 		nodePatch["node_started_at"] = state.LastStartedAt.UTC().Format(time.RFC3339)
 	}
+	mergePatch(nodePatch, fdlimit.Inspect(fdlimit.InspectRequest{
+		Platform: l.Platform,
+		UnitDir:  l.UnitDir,
+		UnitName: l.UnitName,
+	}).NodeStatusPatch())
 	if state.ConfigPath != "" || state.NodeVersion != "" || state.PeerID != "" {
-		_ = config.SaveState(l.StatePath, state)
+		_ = l.saveState(state)
 	}
 	l.updateNodeStatus(nodePatch)
 	if l.Sender != nil {
@@ -420,6 +433,38 @@ func (l *Loop) runVerify() {
 	// Same idea for the surrounding agent + node service files. Lets the
 	// Settings tab show every relevant path and (where safe) the file body.
 	l.broadcastSystemFilesIfChanged(state.ConfigPath)
+}
+
+func (l *Loop) saveState(state *config.State) error {
+	if state == nil {
+		return nil
+	}
+	latest, err := config.LoadState(l.StatePath)
+	if err == nil && latest != nil {
+		l.preserveQClientState(state, latest)
+	}
+	return config.SaveState(l.StatePath, state)
+}
+
+func (l *Loop) preserveQClientState(state, latest *config.State) {
+	if state == nil || latest == nil {
+		return
+	}
+	if !l.qclientInstalled() {
+		state.QClientBinaryPath = ""
+		state.QClientVersion = ""
+		state.QClientInstalledAt = time.Time{}
+		return
+	}
+	if strings.TrimSpace(state.QClientBinaryPath) == "" {
+		state.QClientBinaryPath = latest.QClientBinaryPath
+	}
+	if strings.TrimSpace(state.QClientVersion) == "" {
+		state.QClientVersion = latest.QClientVersion
+	}
+	if state.QClientInstalledAt.IsZero() {
+		state.QClientInstalledAt = latest.QClientInstalledAt
+	}
 }
 
 func (l *Loop) readNodeInfo(state *config.State) *nodeinfo.Info {
@@ -915,7 +960,7 @@ func (l *Loop) runDu() {
 	}
 	state.WorkerStoreBytes = size
 	state.WorkerStoreMeasuredAt = time.Now().UTC()
-	_ = config.SaveState(l.StatePath, state)
+	_ = l.saveState(state)
 
 	l.updateNodeStatus(map[string]interface{}{
 		"worker_store_path": target,
@@ -970,7 +1015,7 @@ func (l *Loop) runVersionPoll() {
 				state.LatestDevNodeURL = artifact.URL
 				state.LatestDevNodeSHA256 = artifact.SHA256
 				state.LatestDevNodeBuildNumber = latest.BuildNumber
-				_ = config.SaveState(l.StatePath, state)
+				_ = l.saveState(state)
 			}
 		}
 		l.patchQClientVersionStatus(state, patch, now)
@@ -1040,6 +1085,32 @@ func (l *Loop) patchQClientVersionStatus(state *config.State, patch map[string]i
 		patch["latest_qclient_version"] = latestQClient
 		patch["qclient_update_available"] = !managed || releaseVersionNewerThan(latestQClient, qclientCurrent)
 	}
+}
+
+func removableNodeResidue(residues []string, managedConfigDir string) bool {
+	if len(residues) == 0 {
+		return false
+	}
+	for _, residue := range residues {
+		switch residue {
+		case "state_file", "missing_recorded_config":
+		case "managed_config":
+			if !emptyDir(managedConfigDir) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func emptyDir(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	entries, err := os.ReadDir(path)
+	return err == nil && len(entries) == 0
 }
 
 // PatchNodeStatus is the exported entry point so command handlers (e.g.

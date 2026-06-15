@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // FSOps implements actions.SystemdOps + (a superset of) what install
@@ -47,12 +48,32 @@ func (f FSOps) Start(name string) error {
 	}
 	// Idempotent: if already loaded skip bootstrap; just kickstart.
 	domain := domainForUnitDir(unitDir)
-	if !isLoaded(domain, name) {
-		if err := launchctl("bootstrap", domain, plistPath); err != nil {
-			return err
+	return startJobWithRetry(domain, name, plistPath, isLoaded, launchctl, func() {
+		time.Sleep(launchdStartRetryDelay)
+	})
+}
+
+var launchdStartRetryDelay = time.Second
+
+func startJobWithRetry(domain, name, plistPath string, loaded func(string, string) bool, run func(...string) error, sleep func()) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 && sleep != nil {
+			sleep()
 		}
+		if !loaded(domain, name) {
+			if err := run("bootstrap", domain, plistPath); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		if err := run("kickstart", launchTarget(domain, name)); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
 	}
-	return launchctl("kickstart", launchTarget(domain, name))
+	return lastErr
 }
 
 func plistFileName(name string) string {

@@ -62,9 +62,9 @@ User=%s
 %sExecStart=%s%s
 Restart=on-failure
 RestartSec=5
-LimitNOFILE=65535
+LimitNOFILE=%d
 
 [Install]
 WantedBy=multi-user.target
-`, in.User, workDirLine, in.BinaryPath, configFlag)
+`, in.User, workDirLine, in.BinaryPath, configFlag, NodeFileLimit)
 }
