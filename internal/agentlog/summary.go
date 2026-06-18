@@ -58,7 +58,7 @@ func fieldsForType(typ string) []string {
 	case "logs_on", "logs_off", "logs":
 		return []string{"target", "lines", "error"}
 	case "metrics":
-		return []string{"node_running", "uptime_sec", "node_frame_height"}
+		return []string{"node_running", "uptime_sec"}
 	case "meta_update":
 		return []string{"has_node", "node_version", "peer_id", "node_residues"}
 	case "node_status":

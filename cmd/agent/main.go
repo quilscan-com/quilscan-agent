@@ -17,6 +17,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/actions"
 	"github.com/quilscan-com/quilscan-agent/internal/audit"
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/download"
 	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/launchd"
 	"github.com/quilscan-com/quilscan-agent/internal/logstream"
@@ -87,6 +88,12 @@ func run() {
 		log.Fatalf("config: %v", err)
 	}
 	defaults = cfg
+	if err := download.ConfigureProxy(defaults.EffectiveDownloadProxyURL()); err != nil {
+		log.Fatalf("download proxy: %v", err)
+	}
+	if proxyURL := download.ConfiguredProxyURL(); proxyURL != "" {
+		log.Printf("[download] using proxy %s", proxyURL)
+	}
 
 	tok, err := token.Load(defaults.TokenPath)
 	if err != nil {

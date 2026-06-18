@@ -135,11 +135,19 @@ func parseAllocationRow(line string) (Allocation, bool) {
 	} else if len(fields) >= 1 && strings.HasPrefix(fields[0], "[") {
 		offset = 1
 	}
-	if len(fields) < offset+8 {
+
+	filter := ""
+	valueOffset := offset
+	if len(fields) >= offset+8 {
+		filter = fields[offset]
+		valueOffset = offset + 1
+	} else if len(fields) >= offset+7 {
+		valueOffset = offset
+	} else {
 		return Allocation{}, false
 	}
 
-	rest := append([]string(nil), fields[offset+8:]...)
+	rest := append([]string(nil), fields[valueOffset+7:]...)
 	mode := ""
 	if len(rest) > 0 && isManageMode(rest[0]) {
 		mode = rest[0]
@@ -147,20 +155,20 @@ func parseAllocationRow(line string) (Allocation, bool) {
 	}
 	nextAction := strings.Join(rest, " ")
 	defaultAction := ""
-	status := fields[offset+7]
+	status := fields[valueOffset+6]
 	if len(rest) > 0 && hasManageDefaultAction(status) {
 		defaultAction = rest[len(rest)-1]
 		nextAction = strings.Join(rest[:len(rest)-1], " ")
 	}
 
 	return Allocation{
-		Filter:        fields[offset],
-		Provers:       atoi64(fields[offset+1]),
-		Ring:          atoi64(fields[offset+2]),
-		SizeMB:        fields[offset+3],
-		Shards:        atoi64(fields[offset+4]),
-		Reward:        fields[offset+5],
-		Worker:        fields[offset+6],
+		Filter:        filter,
+		Provers:       atoi64(fields[valueOffset]),
+		Ring:          atoi64(fields[valueOffset+1]),
+		SizeMB:        fields[valueOffset+2],
+		Shards:        atoi64(fields[valueOffset+3]),
+		Reward:        fields[valueOffset+4],
+		Worker:        fields[valueOffset+5],
 		Status:        status,
 		Mode:          mode,
 		NextAction:    nextAction,

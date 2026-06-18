@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,6 +28,8 @@ type Config struct {
 	NodeBinaryPath    string `yaml:"node_binary_path"`
 	QClientBinaryPath string `yaml:"qclient_binary_path"`
 	QClientReleaseURL string `yaml:"qclient_release_url"`
+	DownloadProxyURL  string `yaml:"download_proxy_url"`
+	DownloadProxy     string `yaml:"download_proxy"`
 	NodeServiceName   string `yaml:"node_service_name"`  // systemd unit name OR launchd label
 	AgentServiceName  string `yaml:"agent_service_name"` // ditto, but for the agent itself
 	ServiceMode       string `yaml:"service_mode"`       // user OR system, primarily for macOS migration gating
@@ -38,6 +41,13 @@ type Config struct {
 	ManagedConfigDir  string `yaml:"managed_config_dir"` // fresh-install node .config parent
 	BackupRootDir     string `yaml:"backup_root_dir"`    // cleanup_residue / removal target
 	NodeLogPath       string `yaml:"node_log_path"`      // macOS only: redirect target for plist Stdout/Err
+}
+
+func (c Config) EffectiveDownloadProxyURL() string {
+	if strings.TrimSpace(c.DownloadProxyURL) != "" {
+		return strings.TrimSpace(c.DownloadProxyURL)
+	}
+	return strings.TrimSpace(c.DownloadProxy)
 }
 
 // DefaultConfig returns sane defaults for the current platform.

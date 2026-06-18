@@ -293,6 +293,9 @@ rejected by `internal/actions/dispatcher.go`.
 - Downloads are constrained: node downloads use the configured release base URL;
   agent self-updates require the trusted release prefix and an Ed25519
   signature check before replacement.
+- Optional download proxy: `download_proxy_url` in `config.yaml` only affects
+  release, dev-node, qclient, and agent-update downloads. It does not proxy the
+  Quilscan WebSocket connection.
 - Human-readable audit log: every received action is appended to the local agent
   log.
 
@@ -312,6 +315,20 @@ rejected by `internal/actions/dispatcher.go`.
 
 `state.yaml` is created after node or qclient state is first persisted. A fresh
 agent-only install can have `config.yaml` and `token` without `state.yaml`.
+
+### Download Proxy
+
+If release downloads are slow from a Mac or server, add a local proxy to the
+agent config and restart the agent:
+
+```yaml
+download_proxy_url: "http://127.0.0.1:7897"
+```
+
+`socks5://127.0.0.1:7897` is also supported. If the scheme is omitted, the
+agent treats the value as an HTTP proxy. On macOS system-mode installs, the
+agent runs as root, so the proxy must be reachable from the root LaunchDaemon
+process on `127.0.0.1`.
 
 ## Install, Remove, And Uninstall Scripts
 

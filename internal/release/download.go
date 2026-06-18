@@ -7,13 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/quilscan-com/quilscan-agent/internal/download"
 )
 
 // ReleaseBaseURL is hardcoded for supply-chain auditability.
@@ -25,7 +26,7 @@ const QClientVersionManifest = "qclient-version.json"
 // command in an unbounded downloading state.
 const DownloadTimeout = 20 * time.Minute
 
-var downloadHTTPClient = &http.Client{Timeout: DownloadTimeout}
+var downloadHTTPClient = download.NewClient(DownloadTimeout)
 
 // DetectPlatform maps Go runtime GOOS/GOARCH to the release file suffix.
 // Supported: linux-amd64, linux-arm64, darwin-arm64. Unknown combos return empty.

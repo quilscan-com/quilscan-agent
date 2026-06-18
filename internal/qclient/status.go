@@ -18,7 +18,6 @@ type ProverStatus struct {
 	RunningWorkers   int64
 	AllocatedWorkers int64
 	LastReceived     int64
-	LastGlobalHead   int64
 	Reachable        bool
 }
 
@@ -80,8 +79,6 @@ func ParseProverStatus(raw string) (*ProverStatus, error) {
 			status.AllocatedWorkers = atoi64(val)
 		case "Last Received":
 			status.LastReceived = atoi64(val)
-		case "Last Global Head":
-			status.LastGlobalHead = atoi64(val)
 		case "Reachable":
 			status.Reachable = strings.EqualFold(val, "true")
 		}

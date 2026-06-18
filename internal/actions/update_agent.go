@@ -5,11 +5,12 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/quilscan-com/quilscan-agent/internal/download"
 )
 
 // urlPrefixSeparator is what we require between the trusted prefix and
@@ -169,7 +170,7 @@ func downloadAgentBinary(url, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := download.NewClient(5 * time.Minute)
 	resp, err := client.Get(url)
 	if err != nil {
 		return fmt.Errorf("http get: %w", err)

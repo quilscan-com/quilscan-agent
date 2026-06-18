@@ -24,7 +24,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +34,7 @@ import (
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/download"
 	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinfo"
 	"github.com/quilscan-com/quilscan-agent/internal/nodeinstall"
@@ -309,9 +309,6 @@ func (l *Loop) runVerify() {
 			}
 			nodePatch["node_running_workers"] = info.RunningWorkers
 			nodePatch["node_active_workers"] = info.ActiveWorkers
-			if info.FrameNumber > 0 {
-				nodePatch["node_frame_height"] = info.FrameNumber
-			}
 		}
 		if qclientInstalled {
 			if qstatus := l.readQClientProverStatus(state); qstatus != nil {
@@ -335,9 +332,6 @@ func (l *Loop) runVerify() {
 				}
 				if qstatus.RunningWorkers > 0 {
 					nodePatch["node_running_workers"] = qstatus.RunningWorkers
-				}
-				if qstatus.LastReceived > 0 {
-					nodePatch["node_frame_height"] = qstatus.LastReceived
 				}
 			} else {
 				nodePatch["qclient_status"] = "unavailable"
@@ -761,7 +755,6 @@ func applyQClientStatus(patch map[string]interface{}, status *qclient.ProverStat
 	patch["qclient_running_workers"] = status.RunningWorkers
 	patch["qclient_allocated_workers"] = status.AllocatedWorkers
 	patch["qclient_last_received"] = status.LastReceived
-	patch["qclient_last_global_head"] = status.LastGlobalHead
 }
 
 func nodeCommandWorkDir(configPath, managedConfigDir string) string {
@@ -1199,7 +1192,7 @@ func processRunning(name string) bool {
 }
 
 func fetchLatestVersion(url string) (string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := download.NewClient(30 * time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", err
@@ -1222,7 +1215,7 @@ func fetchLatestQClientVersion(url, platform string) (string, error) {
 	if platform == "" {
 		return "", fmt.Errorf("missing platform")
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := download.NewClient(30 * time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
 		return "", err

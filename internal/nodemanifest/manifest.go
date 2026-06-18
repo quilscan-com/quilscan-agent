@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/quilscan-com/quilscan-agent/internal/download"
 )
 
 const DefaultURL = "https://releases.quilscan.com/node-version.json"
@@ -93,7 +95,7 @@ func Fetch(url string) (*Manifest, error) {
 	if strings.TrimSpace(url) == "" {
 		url = DefaultURL
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := download.NewClient(30 * time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -115,7 +117,7 @@ func FetchOfficialArtifacts(rawURL string) (*OfficialArtifacts, error) {
 	if strings.TrimSpace(rawURL) == "" {
 		rawURL = DefaultOfficialArtifactsURL
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := download.NewClient(30 * time.Second)
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return nil, err
@@ -286,7 +288,7 @@ func DownloadFile(url, dst string) error {
 	if url == "" {
 		return fmt.Errorf("missing url")
 	}
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := download.NewClient(5 * time.Minute)
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
