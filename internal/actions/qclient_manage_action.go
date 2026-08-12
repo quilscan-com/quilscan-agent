@@ -42,8 +42,8 @@ func NewQClientManageActionHandler(d QClientManageActionDeps) Handler {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
-		if requiresManageWorkers(action) && len(workers) == 0 {
-			err := fmt.Errorf("%s requires at least one worker", action)
+		if len(workers) > 0 {
+			err := fmt.Errorf("worker selection is not supported by the current qclient")
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
@@ -113,7 +113,7 @@ func manageActionArg(args map[string]interface{}) (string, error) {
 	raw, _ := args["action"].(string)
 	action := strings.ToLower(strings.TrimSpace(raw))
 	switch action {
-	case "join", "leave", "confirm", "reject", "pause", "resume", "manual", "auto":
+	case "join", "leave", "confirm", "reject", "pause", "resume":
 		return action, nil
 	default:
 		return "", fmt.Errorf("unsupported qclient manage action %q", raw)
@@ -127,10 +127,6 @@ func requiresManageFilters(action string) bool {
 	default:
 		return false
 	}
-}
-
-func requiresManageWorkers(action string) bool {
-	return action == "manual" || action == "auto"
 }
 
 func qclientActionLabel(action string) string {
@@ -147,10 +143,6 @@ func qclientActionLabel(action string) string {
 		return "Pause"
 	case "resume":
 		return "Resume"
-	case "manual":
-		return "Manual"
-	case "auto":
-		return "Auto"
 	default:
 		return action
 	}

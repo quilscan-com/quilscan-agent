@@ -41,11 +41,7 @@ func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{}
-	if req.ConfigPath != "" {
-		args = append(args, "--config", req.ConfigPath)
-	}
-	args = append(args, "node", "prover", "manage", "--once")
+	args := []string{"node", "prover", "manage", "--once"}
 	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
@@ -64,19 +60,10 @@ func RunManageAction(ctx context.Context, req ManageActionRequest, timeout time.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{}
-	if req.ConfigPath != "" {
-		args = append(args, "--config", req.ConfigPath)
-	}
-	args = append(args, "node", "prover", "manage", "--action", strings.ToLower(strings.TrimSpace(req.Action)))
-	for _, worker := range req.Workers {
-		args = append(args, "--worker", fmt.Sprintf("%d", worker))
-	}
-	for _, filter := range req.Filters {
-		filter = strings.TrimSpace(filter)
-		if filter != "" {
-			args = append(args, filter)
-		}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	args, err := directProverActionArgs(action, req.Filters, req.Workers)
+	if err != nil {
+		return nil, err
 	}
 
 	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
@@ -92,9 +79,39 @@ func RunManageAction(ctx context.Context, req ManageActionRequest, timeout time.
 		return nil, fmt.Errorf("run %s %s: %w", req.BinaryPath, strings.Join(args, " "), err)
 	}
 	if output == "" {
-		output = fmt.Sprintf("%s completed", titleAction(req.Action))
+		output = fmt.Sprintf("%s completed", titleAction(action))
 	}
 	return &ManageActionResult{Output: output}, nil
+}
+
+func directProverActionArgs(action string, filters []string, workers []uint32) ([]string, error) {
+	if len(workers) > 0 {
+		return nil, fmt.Errorf("qclient node prover %s does not support worker selection", action)
+	}
+
+	args := []string{"node", "prover", action}
+	for _, filter := range filters {
+		filter = strings.TrimSpace(filter)
+		if filter != "" {
+			args = append(args, filter)
+		}
+	}
+
+	if len(args) == 3 {
+		return nil, fmt.Errorf("%s requires at least one filter", action)
+	}
+
+	switch action {
+	case "join", "leave", "confirm", "reject":
+		return args, nil
+	case "pause", "resume":
+		if len(args) != 4 {
+			return nil, fmt.Errorf("%s requires exactly one filter", action)
+		}
+		return args, nil
+	default:
+		return nil, fmt.Errorf("unsupported qclient prover action %q", action)
+	}
 }
 
 func ParseManageAllocations(raw string) ([]Allocation, error) {

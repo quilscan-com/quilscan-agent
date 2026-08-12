@@ -34,11 +34,7 @@ func Run(ctx context.Context, req RunRequest, timeout time.Duration) (*ProverSta
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{}
-	if req.ConfigPath != "" {
-		args = append(args, "--config", req.ConfigPath)
-	}
-	args = append(args, "node", "prover", "status")
+	args := []string{"node", "prover", "status"}
 	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
