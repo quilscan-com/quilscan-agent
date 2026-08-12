@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -42,7 +41,7 @@ func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (
 	defer cancel()
 
 	args := []string{"node", "prover", "manage", "--once"}
-	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
+	cmd := newCommand(ctx, req.BinaryPath, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
@@ -66,7 +65,7 @@ func RunManageAction(ctx context.Context, req ManageActionRequest, timeout time.
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
+	cmd := newCommand(ctx, req.BinaryPath, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}

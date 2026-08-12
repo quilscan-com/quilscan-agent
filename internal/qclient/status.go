@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -35,7 +37,7 @@ func Run(ctx context.Context, req RunRequest, timeout time.Duration) (*ProverSta
 	defer cancel()
 
 	args := []string{"node", "prover", "status"}
-	cmd := exec.CommandContext(ctx, req.BinaryPath, args...)
+	cmd := newCommand(ctx, req.BinaryPath, args...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
@@ -44,6 +46,35 @@ func Run(ctx context.Context, req RunRequest, timeout time.Duration) (*ProverSta
 		return nil, fmt.Errorf("run %s %s: %w", req.BinaryPath, strings.Join(args, " "), err)
 	}
 	return ParseProverStatus(string(out))
+}
+
+func newCommand(ctx context.Context, binaryPath string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, binaryPath, args...)
+	if env := commandEnv(os.Environ(), runtime.GOOS); env != nil {
+		cmd.Env = env
+	}
+	return cmd
+}
+
+func commandEnv(env []string, goos string) []string {
+	if goos != "darwin" {
+		return nil
+	}
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && key == "HOME" && value != "" {
+			return nil
+		}
+	}
+	updated := append([]string(nil), env...)
+	for index, entry := range updated {
+		key, _, ok := strings.Cut(entry, "=")
+		if ok && key == "HOME" {
+			updated[index] = "HOME=/var/root"
+			return updated
+		}
+	}
+	return append(updated, "HOME=/var/root")
 }
 
 func ParseProverStatus(raw string) (*ProverStatus, error) {

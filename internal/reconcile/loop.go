@@ -714,7 +714,7 @@ func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatu
 		ConfigPath: cfg,
 		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
 	}
-	status, err := runner(context.Background(), req, 8*time.Second)
+	status, err := runner(context.Background(), req, 30*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -732,7 +732,7 @@ func (l *Loop) readQClientAllocations(state *config.State) []qclient.Allocation 
 		ConfigPath: cfg,
 		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
 	}
-	allocations, err := runner(context.Background(), req, 8*time.Second)
+	allocations, err := runner(context.Background(), req, 30*time.Second)
 	if err != nil {
 		return nil
 	}
