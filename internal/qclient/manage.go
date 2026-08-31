@@ -4,22 +4,27 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Allocation struct {
-	Filter        string `json:"filter"`
-	Provers       int64  `json:"provers"`
-	Ring          int64  `json:"ring"`
-	SizeMB        string `json:"sizeMb"`
-	Shards        int64  `json:"shards"`
-	Reward        string `json:"reward"`
-	Worker        string `json:"worker"`
-	Status        string `json:"status"`
-	Mode          string `json:"mode"`
-	NextAction    string `json:"nextAction"`
-	DefaultAction string `json:"defaultAction"`
+	Filter               string `json:"filter"`
+	Provers              int64  `json:"provers"`
+	Ring                 int64  `json:"ring"`
+	SizeMB               string `json:"sizeMb"`
+	Shards               int64  `json:"shards"`
+	MaterializedFrame    string `json:"materializedFrame"`
+	Lag                  string `json:"lag"`
+	MaterializationState string `json:"materializationState"`
+	Reward               string `json:"reward"`
+	Worker               string `json:"worker"`
+	Status               string `json:"status"`
+	Mode                 string `json:"mode"`
+	NextAction           string `json:"nextAction"`
+	DefaultAction        string `json:"defaultAction"`
 }
 
 type ManageActionRequest struct {
@@ -145,51 +150,130 @@ func ParseManageAllocations(raw string) ([]Allocation, error) {
 
 func parseAllocationRow(line string) (Allocation, bool) {
 	fields := strings.Fields(line)
-	offset := 0
+	markerOffset := 0
 	if len(fields) >= 2 && fields[0] == "[" && fields[1] == "]" {
-		offset = 2
+		markerOffset = 2
 	} else if len(fields) >= 1 && strings.HasPrefix(fields[0], "[") {
-		offset = 1
+		markerOffset = 1
 	}
 
-	filter := ""
-	valueOffset := offset
-	if len(fields) >= offset+8 {
-		filter = fields[offset]
-		valueOffset = offset + 1
-	} else if len(fields) >= offset+7 {
-		valueOffset = offset
-	} else {
+	for _, candidate := range []int{markerOffset, markerOffset + 1} {
+		allocation, ok := parseLatestAllocation(fields, candidate)
+		if !ok {
+			continue
+		}
+		if candidate == markerOffset+1 {
+			allocation.Filter = fields[markerOffset]
+		}
+		return allocation, true
+	}
+	return Allocation{}, false
+}
+
+var signedIntegerPattern = regexp.MustCompile(`^[+-]?[0-9]+$`)
+var unsignedIntegerPattern = regexp.MustCompile(`^[0-9]+$`)
+var decimalPattern = regexp.MustCompile(`^[+-]?[0-9]+(?:\.[0-9]+)?$`)
+var manageSizePattern = regexp.MustCompile(`^(?:[0-9]+(?:\.[0-9]+)?|<0\.1)$`)
+var frameActionHintPattern = regexp.MustCompile(`^f[0-9]+$`)
+var renewActionHintPattern = regexp.MustCompile(`^renew<f[0-9]+$`)
+var activeEpochActionHintPattern = regexp.MustCompile(`^(?:active|departs)@e[0-9]+$`)
+
+func parseLatestAllocation(fields []string, valueOffset int) (Allocation, bool) {
+	const fixedValues = 10
+	if len(fields) < valueOffset+fixedValues {
+		return Allocation{}, false
+	}
+	values := fields[valueOffset : valueOffset+fixedValues]
+	provers, ok := parseManageSignedInteger(values[0])
+	if !ok {
+		return Allocation{}, false
+	}
+	ring, ok := parseManageSignedInteger(values[1])
+	if !ok {
+		return Allocation{}, false
+	}
+	shards, ok := parseManageSignedInteger(values[3])
+	if !ok ||
+		!isManageSize(values[2]) ||
+		!isManageUnsignedInteger(values[4]) ||
+		(values[5] != "-" && !isManageUnsignedInteger(values[5])) ||
+		!isMaterializationState(values[6]) ||
+		!isManageReward(values[7]) ||
+		(values[8] != "-" && !isManageSigned(values[8])) ||
+		!isManageStatus(values[9]) {
 		return Allocation{}, false
 	}
 
-	rest := append([]string(nil), fields[valueOffset+7:]...)
+	rest := append([]string(nil), fields[valueOffset+fixedValues:]...)
 	mode := ""
 	if len(rest) > 0 && isManageMode(rest[0]) {
 		mode = rest[0]
 		rest = rest[1:]
 	}
-	nextAction := strings.Join(rest, " ")
-	defaultAction := ""
-	status := fields[valueOffset+6]
-	if len(rest) > 0 && hasManageDefaultAction(status) {
-		defaultAction = rest[len(rest)-1]
-		nextAction = strings.Join(rest[:len(rest)-1], " ")
-	}
+	nextAction, defaultAction := splitManageActionHints(rest)
 
 	return Allocation{
-		Filter:        filter,
-		Provers:       atoi64(fields[valueOffset]),
-		Ring:          atoi64(fields[valueOffset+1]),
-		SizeMB:        fields[valueOffset+2],
-		Shards:        atoi64(fields[valueOffset+3]),
-		Reward:        fields[valueOffset+4],
-		Worker:        fields[valueOffset+5],
-		Status:        status,
-		Mode:          mode,
-		NextAction:    nextAction,
-		DefaultAction: defaultAction,
+		Provers:              provers,
+		Ring:                 ring,
+		SizeMB:               values[2],
+		Shards:               shards,
+		MaterializedFrame:    values[4],
+		Lag:                  values[5],
+		MaterializationState: values[6],
+		Reward:               values[7],
+		Worker:               values[8],
+		Status:               values[9],
+		Mode:                 mode,
+		NextAction:           nextAction,
+		DefaultAction:        defaultAction,
 	}, true
+}
+
+func parseManageSignedInteger(value string) (int64, bool) {
+	if !signedIntegerPattern.MatchString(value) {
+		return 0, false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return parsed, err == nil
+}
+
+func isManageSigned(value string) bool {
+	_, ok := parseManageSignedInteger(value)
+	return ok
+}
+
+func isManageUnsignedInteger(value string) bool {
+	if !unsignedIntegerPattern.MatchString(value) {
+		return false
+	}
+	_, err := strconv.ParseUint(value, 10, 64)
+	return err == nil
+}
+
+func isManageSize(value string) bool {
+	return manageSizePattern.MatchString(value)
+}
+
+func isMaterializationState(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "unknown", "unmat", "lag", "current":
+		return true
+	default:
+		return false
+	}
+}
+
+func isManageReward(value string) bool {
+	return strings.HasPrefix(value, "~") && decimalPattern.MatchString(strings.TrimPrefix(value, "~"))
+}
+
+func isManageStatus(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "idle", "joining", "active", "paused", "leaving", "expiredjoin", "expiredleave", "re-confirm!", "rejected", "kicked", "unknown":
+		return true
+	default:
+		return false
+	}
 }
 
 func isManageMode(value string) bool {
@@ -201,12 +285,33 @@ func isManageMode(value string) bool {
 	}
 }
 
-func hasManageDefaultAction(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "joining", "leaving":
+func splitManageActionHints(actions []string) (nextAction, defaultAction string) {
+	defaultStart := len(actions)
+	if len(actions) >= 2 &&
+		((actions[len(actions)-2] == "thru" && frameActionHintPattern.MatchString(actions[len(actions)-1])) ||
+			(actions[len(actions)-2] == "epoch" && isManageUnsignedInteger(actions[len(actions)-1]))) {
+		defaultStart -= 2
+	} else if len(actions) > 0 && isSingleManageActionHint(actions[len(actions)-1]) {
+		defaultStart--
+	}
+
+	nextAction = strings.Join(actions[:defaultStart], " ")
+	defaultAction = strings.Join(actions[defaultStart:], " ")
+	if nextAction == "-" {
+		nextAction = ""
+	}
+	if defaultAction == "-" {
+		defaultAction = ""
+	}
+	return nextAction, defaultAction
+}
+
+func isSingleManageActionHint(value string) bool {
+	switch value {
+	case "expired", "re-confirm!", "-":
 		return true
 	default:
-		return false
+		return renewActionHintPattern.MatchString(value) || activeEpochActionHintPattern.MatchString(value)
 	}
 }
 

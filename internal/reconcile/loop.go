@@ -92,6 +92,7 @@ type Loop struct {
 	VerifyTick        time.Duration
 	DuTick            time.Duration
 	LatestVersionTick time.Duration
+	QClientTokenTick  time.Duration
 
 	// LatestVersionURL points at the source-of-truth release endpoint.
 	// Defaults to https://releases.quilibrium.com/release.
@@ -104,10 +105,12 @@ type Loop struct {
 	OfficialArtifactsURL        string
 	OfficialArtifactsFetcher    func(string) (*nodemanifest.OfficialArtifacts, error)
 
-	NodeInfoRunner           func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
-	QClientStatusRunner      func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
-	QClientManageRunner      func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
-	PeerConnectionsLogReader func(context.Context, string, string, int, time.Duration) (int, bool)
+	NodeInfoRunner                func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
+	QClientStatusRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
+	QClientManageRunner           func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
+	QClientClaimableRewardsRunner func(context.Context, qclient.RunRequest, time.Duration) (string, error)
+	QClientTokenBalanceRunner     func(context.Context, qclient.RunRequest, time.Duration) (string, error)
+	PeerConnectionsLogReader      func(context.Context, string, string, int, time.Duration) (int, bool)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
@@ -167,6 +170,7 @@ func (l *Loop) Run(ctx context.Context) {
 		l.OfficialArtifactsURL = defaultOfficialArtifactsURL
 	}
 	l.nodeStatus = map[string]interface{}{}
+	go l.runQClientTokenStatus(ctx)
 
 	// Run all three immediately on startup so a fresh agent doesn't have to
 	// wait a full hour for first version-availability signal.
@@ -192,6 +196,88 @@ func (l *Loop) Run(ctx context.Context) {
 		case <-lt.C:
 			l.runVersionPoll()
 		}
+	}
+}
+
+func (l *Loop) qclientTokenTick() time.Duration {
+	if l.QClientTokenTick > 0 {
+		return l.QClientTokenTick
+	}
+	return time.Minute
+}
+
+// runQClientTokenStatus refreshes token values independently from verify so a
+// slow or failing qclient token command cannot delay normal reconciliation.
+func (l *Loop) runQClientTokenStatus(ctx context.Context) {
+	l.refreshQClientTokenStatus(ctx)
+
+	ticker := time.NewTicker(l.qclientTokenTick())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.refreshQClientTokenStatus(ctx)
+		}
+	}
+}
+
+func (l *Loop) refreshQClientTokenStatus(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	if !l.qclientInstalled() {
+		return
+	}
+	state, err := config.LoadState(l.StatePath)
+	if err != nil {
+		return
+	}
+	configPath := l.nodeInfoConfigPath(state)
+	if configPath == "" {
+		return
+	}
+	req := qclient.RunRequest{
+		BinaryPath: l.qclientBinaryPath(),
+		ConfigPath: configPath,
+		WorkDir:    nodeCommandWorkDir(configPath, l.managedConfigDir()),
+	}
+
+	claimableRunner := l.QClientClaimableRewardsRunner
+	if claimableRunner == nil {
+		claimableRunner = qclient.RunClaimableRewards
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	claimable, claimableErr := claimableRunner(ctx, req, 30*time.Second)
+	if ctx.Err() != nil {
+		return
+	}
+	if claimableErr == nil {
+		l.updateNodeStatus(map[string]interface{}{
+			"qclient_claimable_rewards":              claimable,
+			"qclient_claimable_rewards_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+
+	balanceRunner := l.QClientTokenBalanceRunner
+	if balanceRunner == nil {
+		balanceRunner = qclient.RunTokenBalance
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	balance, balanceErr := balanceRunner(ctx, req, 30*time.Second)
+	if ctx.Err() != nil {
+		return
+	}
+	if balanceErr == nil {
+		l.updateNodeStatus(map[string]interface{}{
+			"qclient_token_balance":              balance,
+			"qclient_token_balance_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+		})
 	}
 }
 
