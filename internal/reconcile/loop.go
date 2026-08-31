@@ -350,7 +350,7 @@ func (l *Loop) runVerify() {
 		ProcessRunning:    processRunning("quilibrium-node"),
 	})
 	if !detection.HasNode && removableNodeResidue(detection.Residues, l.managedConfigDir()) {
-		if err := os.Remove(l.StatePath); err == nil || os.IsNotExist(err) {
+		if err := config.RemoveState(l.StatePath); err == nil || os.IsNotExist(err) {
 			_ = os.Remove(l.managedConfigDir())
 			state = &config.State{}
 			detection.Residues = []string{}

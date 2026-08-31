@@ -121,6 +121,23 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 			}
 			items = append(items, CleanupItem{Label: label, From: src, To: dst})
 		}
+		mvStateBackup := func(src, label string) {
+			if src == "" {
+				return
+			}
+			if _, err := os.Stat(src); err != nil {
+				return
+			}
+			dst := filepath.Join(backupDir, filepath.Base(src))
+			// Avoid name collisions when two artifacts share a basename.
+			if _, err := os.Stat(dst); err == nil {
+				dst = dst + "-" + ts
+			}
+			if err := config.MoveState(src, dst); err != nil {
+				return
+			}
+			items = append(items, CleanupItem{Label: label, From: src, To: dst})
+		}
 
 		mvBinaryBundle := func(binary, label string) {
 			if binary == "" {
@@ -139,7 +156,7 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 			mvBackup(cfgPath, "managed .config directory")
 		}
 		mvBackup(unitFile, "systemd unit")
-		mvBackup(d.StatePath, "agent state file")
+		mvStateBackup(d.StatePath, "agent state file")
 
 		emit(Status{ID: c.ID, Step: "reloading", Progress: 0.85})
 		_ = d.Systemd.Reload()
