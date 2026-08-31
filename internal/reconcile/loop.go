@@ -89,10 +89,11 @@ type Loop struct {
 	Svc ServiceCtl
 
 	// Override cadences (mainly for tests). Zero values fall back to defaults.
-	VerifyTick        time.Duration
-	DuTick            time.Duration
-	LatestVersionTick time.Duration
-	QClientTokenTick  time.Duration
+	VerifyTick               time.Duration
+	DuTick                   time.Duration
+	LatestVersionTick        time.Duration
+	LatestQClientVersionTick time.Duration
+	QClientTokenTick         time.Duration
 
 	// LatestVersionURL points at the source-of-truth release endpoint.
 	// Defaults to https://releases.quilibrium.com/release.
@@ -171,6 +172,7 @@ func (l *Loop) Run(ctx context.Context) {
 	}
 	l.nodeStatus = map[string]interface{}{}
 	go l.runQClientTokenStatus(ctx)
+	go l.runQClientVersionPolling(ctx)
 
 	// Run all three immediately on startup so a fresh agent doesn't have to
 	// wait a full hour for first version-availability signal.
@@ -204,6 +206,27 @@ func (l *Loop) qclientTokenTick() time.Duration {
 		return l.QClientTokenTick
 	}
 	return time.Minute
+}
+
+func (l *Loop) qclientVersionTick() time.Duration {
+	if l.LatestQClientVersionTick > 0 {
+		return l.LatestQClientVersionTick
+	}
+	return time.Minute
+}
+
+func (l *Loop) runQClientVersionPolling(ctx context.Context) {
+	l.runQClientVersionPoll()
+	ticker := time.NewTicker(l.qclientVersionTick())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.runQClientVersionPoll()
+		}
+	}
 }
 
 // runQClientTokenStatus refreshes token values independently from verify so a
@@ -1097,7 +1120,6 @@ func (l *Loop) runVersionPoll() {
 				_ = l.saveState(state)
 			}
 		}
-		l.patchQClientVersionStatus(state, patch, now)
 		if len(patch) > 0 {
 			l.updateNodeStatus(patch)
 		}
@@ -1108,7 +1130,6 @@ func (l *Loop) runVersionPoll() {
 		patch["node_update_source"] = nodemanifest.SourceUnknown
 		patch["node_update_available"] = false
 		patch["version_polled_at"] = now
-		l.patchQClientVersionStatus(state, patch, now)
 		l.updateNodeStatus(patch)
 		return
 	}
@@ -1130,8 +1151,18 @@ func (l *Loop) runVersionPoll() {
 		patch["version_polled_at"] = now
 	}
 
-	l.patchQClientVersionStatus(state, patch, now)
+	if len(patch) > 0 {
+		l.updateNodeStatus(patch)
+	}
+}
 
+func (l *Loop) runQClientVersionPoll() {
+	state, err := config.LoadState(l.StatePath)
+	if err != nil {
+		return
+	}
+	patch := map[string]interface{}{}
+	l.patchQClientVersionStatus(state, patch, time.Now().UTC().Format(time.RFC3339))
 	if len(patch) > 0 {
 		l.updateNodeStatus(patch)
 	}
