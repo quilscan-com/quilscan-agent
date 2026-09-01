@@ -76,6 +76,10 @@ trap 'exit 1' HUP INT TERM
 
 pause_agent_linux() {
   if systemctl is-active --quiet quilscan-agent.service; then
+    if [[ ! -f /etc/systemd/system/quilscan-agent.service ]]; then
+      echo "[remove-node] ERROR: Agent systemd unit missing; Node files were not changed." >&2
+      return 1
+    fi
     AGENT_RESTORE_KIND="linux"
     AGENT_RESTORE_ACTIVE=1
     if ! systemctl stop quilscan-agent.service; then
@@ -90,6 +94,10 @@ pause_agent_macos() {
   AGENT_LAUNCH_TARGET="$2"
   AGENT_PLIST="$3"
   if launchctl print "$AGENT_LAUNCH_TARGET" >/dev/null 2>&1; then
+    if [[ ! -f "$AGENT_PLIST" ]]; then
+      echo "[remove-node] ERROR: Agent plist missing; Node files were not changed: $AGENT_PLIST" >&2
+      return 1
+    fi
     AGENT_RESTORE_KIND="macos"
     AGENT_RESTORE_ACTIVE=1
     if ! launchctl bootout "$AGENT_LAUNCH_TARGET"; then
