@@ -37,11 +37,17 @@ remove_agent_support_files() {
 }
 
 append_preserved_if_exists() {
-  [[ -e "$1" ]] && preserved+=("$1")
+  if [[ -e "$1" ]]; then
+    preserved+=("$1")
+  fi
+  return 0
 }
 
 append_backup_if_exists() {
-  [[ -e "$1" ]] && backups+=("$1")
+  if [[ -e "$1" ]]; then
+    backups+=("$1")
+  fi
+  return 0
 }
 
 uninstall_macos() {
