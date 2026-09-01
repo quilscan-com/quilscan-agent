@@ -36,6 +36,7 @@ type Deps struct {
 	LoadState         func(string) (*config.State, error)
 	PersistState      func(string, func(*config.State) error) (*config.State, error)
 	Update            actions.Handler
+	UpdateOwner       func() string
 	PatchNodeStatus   func(map[string]interface{})
 	EmitCommandStatus func(actions.Status)
 	Tick              time.Duration
@@ -259,6 +260,10 @@ func (c *Controller) Tick() {
 	}
 
 	now := c.now()
+	owner := ""
+	if c.deps.UpdateOwner != nil {
+		owner = c.deps.UpdateOwner()
+	}
 	var launch bool
 	var cancelDue func()
 	var runLifecycle uint64
@@ -270,7 +275,7 @@ func (c *Controller) Tick() {
 			} else {
 				c.state = StateScheduled
 			}
-		} else {
+		} else if owner == "" {
 			cancelDue = c.detachDueUnlocked()
 			c.running = true
 			c.retrying = false
@@ -278,6 +283,10 @@ func (c *Controller) Tick() {
 			c.state = StateUpdating
 			runLifecycle = c.lifecycle
 			launch = true
+		} else if c.retrying {
+			c.state = StateRetrying
+		} else {
+			c.state = StateScheduled
 		}
 	}
 	c.mu.Unlock()

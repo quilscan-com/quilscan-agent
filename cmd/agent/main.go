@@ -258,17 +258,18 @@ func run() {
 	})
 	nodeUpdateGate := &actions.NodeUpdateGate{}
 	nodeUpdateHandler := actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
-		UnitName:        defaults.NodeServiceName,
-		BinaryPath:      defaults.NodeBinaryPath,
-		Platform:        platform,
-		StartStop:       sdCtl,
-		Downloader:      actions.ReleaseDownloader{},
-		DevInstaller:    actions.ManifestDevNodeInstaller{},
-		NodeManifestURL: nodemanifest.DefaultURL,
-		Gate:            nodeUpdateGate,
-		LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-		SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
-		EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
+		UnitName:                          defaults.NodeServiceName,
+		BinaryPath:                        defaults.NodeBinaryPath,
+		Platform:                          platform,
+		StartStop:                         sdCtl,
+		Downloader:                        actions.ReleaseDownloader{},
+		DevInstaller:                      actions.ManifestDevNodeInstaller{},
+		NodeManifestURL:                   nodemanifest.DefaultURL,
+		Gate:                              nodeUpdateGate,
+		SuppressAutomaticContentionStatus: true,
+		LoadState:                         func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+		SaveState:                         func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+		EmitRaw:                           func(m map[string]interface{}) { _ = client.Send(m) },
 		PatchNodeStatus: func(patch map[string]interface{}) {
 			if rec != nil {
 				rec.PatchNodeStatus(patch)
@@ -276,8 +277,9 @@ func run() {
 		},
 	})
 	devAutoController := devnodeautoupdate.NewController(devnodeautoupdate.Deps{
-		StatePath: defaults.StatePath,
-		Update:    nodeUpdateHandler,
+		StatePath:   defaults.StatePath,
+		Update:      nodeUpdateHandler,
+		UpdateOwner: nodeUpdateGate.Owner,
 		PatchNodeStatus: func(patch map[string]interface{}) {
 			if rec != nil {
 				rec.PatchNodeStatus(patch)

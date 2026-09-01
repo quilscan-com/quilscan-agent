@@ -75,13 +75,14 @@ type NodeUpdaterDeps struct {
 		Stop(unit string) error
 	}
 
-	Downloader      Downloader
-	DevInstaller    DevNodeInstaller
-	NodeManifestURL string
-	Gate            *NodeUpdateGate
-	LoadState       func() (*config.State, error)
-	SaveState       func(*config.State) error
-	EmitRaw         func(map[string]interface{})
+	Downloader                        Downloader
+	DevInstaller                      DevNodeInstaller
+	NodeManifestURL                   string
+	Gate                              *NodeUpdateGate
+	SuppressAutomaticContentionStatus bool
+	LoadState                         func() (*config.State, error)
+	SaveState                         func(*config.State) error
+	EmitRaw                           func(map[string]interface{})
 	// PatchNodeStatus folds an authoritative patch into reconcile's cached
 	// node_status snapshot. Used right after a successful update so the
 	// stale `node_update_available: true` doesn't linger for up to an hour
@@ -113,7 +114,9 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 				if owner == NodeUpdateOwnerManual && current == NodeUpdateOwnerAutomatic {
 					err = ErrDevNodeAutoUpdateInProgress
 				}
-				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				if !(automatic && d.SuppressAutomaticContentionStatus) {
+					emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				}
 				return err
 			}
 			defer release()
