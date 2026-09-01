@@ -170,7 +170,7 @@ func (l *Loop) Run(ctx context.Context) {
 	if l.OfficialArtifactsURL == "" {
 		l.OfficialArtifactsURL = defaultOfficialArtifactsURL
 	}
-	l.nodeStatus = map[string]interface{}{}
+	l.initializeNodeStatus()
 	go l.runQClientTokenStatus(ctx)
 	go l.runQClientVersionPolling(ctx)
 
@@ -198,6 +198,14 @@ func (l *Loop) Run(ctx context.Context) {
 		case <-lt.C:
 			l.runVersionPoll()
 		}
+	}
+}
+
+func (l *Loop) initializeNodeStatus() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.nodeStatus == nil {
+		l.nodeStatus = map[string]interface{}{}
 	}
 }
 

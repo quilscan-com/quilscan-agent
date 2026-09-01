@@ -17,6 +17,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/actions"
 	"github.com/quilscan-com/quilscan-agent/internal/audit"
 	"github.com/quilscan-com/quilscan-agent/internal/config"
+	"github.com/quilscan-com/quilscan-agent/internal/devnodeautoupdate"
 	"github.com/quilscan-com/quilscan-agent/internal/download"
 	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/launchd"
@@ -255,6 +256,37 @@ func run() {
 		OnInstalled:      onInstalled,
 		InstallQClient:   installQClient,
 	})
+	nodeUpdateGate := &actions.NodeUpdateGate{}
+	nodeUpdateHandler := actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
+		UnitName:        defaults.NodeServiceName,
+		BinaryPath:      defaults.NodeBinaryPath,
+		Platform:        platform,
+		StartStop:       sdCtl,
+		Downloader:      actions.ReleaseDownloader{},
+		DevInstaller:    actions.ManifestDevNodeInstaller{},
+		NodeManifestURL: nodemanifest.DefaultURL,
+		Gate:            nodeUpdateGate,
+		LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+		SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+		EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
+		PatchNodeStatus: func(patch map[string]interface{}) {
+			if rec != nil {
+				rec.PatchNodeStatus(patch)
+			}
+		},
+	})
+	devAutoController := devnodeautoupdate.NewController(devnodeautoupdate.Deps{
+		StatePath: defaults.StatePath,
+		Update:    nodeUpdateHandler,
+		PatchNodeStatus: func(patch map[string]interface{}) {
+			if rec != nil {
+				rec.PatchNodeStatus(patch)
+			}
+		},
+		EmitCommandStatus: func(s actions.Status) {
+			_ = client.Send(statusMessage(s))
+		},
+	})
 
 	d := &actions.Dispatcher{
 		Handlers: map[string]actions.Handler{
@@ -339,23 +371,8 @@ func run() {
 					}
 				},
 			}),
-			"update_node": actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
-				UnitName:        defaults.NodeServiceName,
-				BinaryPath:      defaults.NodeBinaryPath,
-				Platform:        platform,
-				StartStop:       sdCtl,
-				Downloader:      actions.ReleaseDownloader{},
-				DevInstaller:    actions.ManifestDevNodeInstaller{},
-				NodeManifestURL: nodemanifest.DefaultURL,
-				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
-				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
-				PatchNodeStatus: func(patch map[string]interface{}) {
-					if rec != nil {
-						rec.PatchNodeStatus(patch)
-					}
-				},
-			}),
+			"update_node":              nodeUpdateHandler,
+			"set_dev_node_auto_update": devnodeautoupdate.NewSetEnabledHandler(devAutoController),
 			"switch_node_source": actions.NewSwitchNodeSourceHandler(actions.NodeSourceSwitcherDeps{
 				UnitName:        defaults.NodeServiceName,
 				UnitDir:         defaults.UnitDir,
@@ -504,6 +521,7 @@ func run() {
 		rec.LatestQClientVersionURL = qclientLatestVersionURL
 	}
 	go rec.Run(ctx)
+	go devAutoController.Run(ctx)
 
 	// netinfo: resolve public IP + country once at startup and every 24h, then
 	// re-send on each WS reconnect via OnConnected so the backend's per-token

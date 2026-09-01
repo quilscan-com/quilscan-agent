@@ -273,6 +273,7 @@ user-facing actions include:
 - `restart_agent`
 - `update_agent`
 - `update_node`
+- `set_dev_node_auto_update`
 - `switch_node_source`
 - `cleanup_residue`
 - `delete_node_store`
@@ -378,6 +379,29 @@ then replaces only the managed node binary. Config files, keys, peer ID, worker
 store, and node data are not replaced.
 
 Unsigned Dev Node artifacts are refused.
+
+## Dev Node Automatic Updates
+
+Dev Node automatic updates are off by default. The browser Settings control is
+the supported way to enable or disable them, and the Agent persists the
+setting locally. Automatic updates are available only while the managed node
+source is `dev`; switching to `releases` or detecting an unknown source turns
+the setting off.
+
+The Agent owns this behavior independently of the browser and reports its
+automatic-update status in `node_status` about every three seconds. Reconcile
+detects the latest Dev Node manifest on its normal roughly 60-second cadence.
+When it finds an eligible new build, the Agent waits a cryptographically random
+whole-second delay from zero through ten seconds before running the existing
+Dev Node update flow. A failed automatic update retries after five minutes
+while the same target remains eligible.
+
+Automatic updates use the current no-rollback update strategy: a failure before
+replacement attempts to restart the existing binary, while a failure after the
+new binary replaces it does not restore an older binary. Successful and failed
+attempts publish an event ID, outcome, source version, target version, and
+completion time in `node_status`; these fields are retained for future
+notification handling.
 
 ## Verify The Security Claims
 
