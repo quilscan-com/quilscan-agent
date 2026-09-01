@@ -3,8 +3,8 @@
 # quilscan-agent. Also backs up the managed qclient bundle. Reads the agent
 # state file to decide whether the install was fresh or migrated;
 # user-imported .config dirs are preserved at their original path. The agent
-# itself is left running so the user can re-install or migrate again from the
-# browser console without re-pairing.
+# itself is paused while node artifacts are removed, then restored so the user
+# can re-install or migrate again from the browser console without re-pairing.
 #
 # Linux : reads /etc/quilscan-agent/state.yaml, uses systemd to stop the
 #         node, backs up under /var/lib/quilscan/backups/. Requires sudo.
@@ -37,28 +37,37 @@ restore_agent_service() {
   if [[ "$AGENT_RESTORE_KIND" == "linux" ]]; then
     if systemctl start quilscan-agent.service; then
       echo "[remove-node] Agent service restored."
+      return 0
     else
       echo "[remove-node] ERROR: failed to restore quilscan-agent.service." >&2
+      return 1
     fi
-    return 0
   fi
   if [[ "$AGENT_RESTORE_KIND" == "macos" ]]; then
     if [[ ! -f "$AGENT_PLIST" ]]; then
       echo "[remove-node] ERROR: Agent plist missing during restore: $AGENT_PLIST" >&2
-      return 0
+      return 1
     fi
     if launchctl bootstrap "$AGENT_BOOTSTRAP_DOMAIN" "$AGENT_PLIST" && launchctl kickstart -k "$AGENT_LAUNCH_TARGET"; then
       echo "[remove-node] Agent service restored."
+      return 0
     else
       echo "[remove-node] ERROR: failed to restore Agent service: $AGENT_LAUNCH_TARGET" >&2
+      return 1
     fi
   fi
+  echo "[remove-node] ERROR: Agent restore intent was invalid." >&2
+  return 1
 }
 
 cleanup_remove_node() {
   local status=$?
+  local restore_status=0
   trap - EXIT HUP INT TERM
-  restore_agent_service
+  restore_agent_service || restore_status=$?
+  if [[ "$status" -eq 0 && "$restore_status" -ne 0 ]]; then
+    exit "$restore_status"
+  fi
   exit "$status"
 }
 
@@ -67,12 +76,12 @@ trap 'exit 1' HUP INT TERM
 
 pause_agent_linux() {
   if systemctl is-active --quiet quilscan-agent.service; then
+    AGENT_RESTORE_KIND="linux"
+    AGENT_RESTORE_ACTIVE=1
     if ! systemctl stop quilscan-agent.service; then
       echo "[remove-node] ERROR: failed to pause quilscan-agent.service; Node files were not changed." >&2
       return 1
     fi
-    AGENT_RESTORE_KIND="linux"
-    AGENT_RESTORE_ACTIVE=1
   fi
 }
 
@@ -81,12 +90,12 @@ pause_agent_macos() {
   AGENT_LAUNCH_TARGET="$2"
   AGENT_PLIST="$3"
   if launchctl print "$AGENT_LAUNCH_TARGET" >/dev/null 2>&1; then
+    AGENT_RESTORE_KIND="macos"
+    AGENT_RESTORE_ACTIVE=1
     if ! launchctl bootout "$AGENT_LAUNCH_TARGET"; then
       echo "[remove-node] ERROR: failed to pause Agent service; Node files were not changed." >&2
       return 1
     fi
-    AGENT_RESTORE_KIND="macos"
-    AGENT_RESTORE_ACTIVE=1
   fi
 }
 
