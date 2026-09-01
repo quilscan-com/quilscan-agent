@@ -20,3 +20,4 @@ keys.yml
 *.crt
 *.log
 *_test.go
+/docs/
