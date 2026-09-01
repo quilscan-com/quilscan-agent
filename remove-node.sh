@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# remove-node.sh — back up and stop the Quilibrium node managed by
-# quilscan-agent. Also backs up the managed qclient bundle. Reads the agent
+# remove-node.sh — stop and remove the Quilibrium node and qclient runtime
+# managed by quilscan-agent. Only a fresh-install platform-default .config is
+# backed up. Reads the agent
 # state file to decide whether the install was fresh or migrated;
 # user-imported .config dirs are preserved at their original path. The agent
-# itself is paused while node artifacts are removed, then restored so the user
+# itself is paused while Node artifacts are removed, then restored so the user
 # can re-install or migrate again from the browser console without re-pairing.
 #
 # Linux : reads /etc/quilscan-agent/state.yaml, uses systemd to stop the
@@ -25,6 +26,8 @@ AGENT_RESTORE_KIND=""
 AGENT_BOOTSTRAP_DOMAIN=""
 AGENT_LAUNCH_TARGET=""
 AGENT_PLIST=""
+REMOVED_ARTIFACTS=()
+BACKED_UP_CONFIG=""
 
 restore_agent_service() {
   if [[ "$AGENT_RESTORE_DONE" == "1" ]]; then
@@ -137,10 +140,33 @@ verify_agent_ownership_macos() {
 remove_binary_bundle() {
   local binary="$1"
   local sidecar
-  rm -f "$binary" "$binary.dgst" "$binary.sig"
+  remove_file_if_exists "$binary"
+  remove_file_if_exists "$binary.dgst"
+  remove_file_if_exists "$binary.sig"
   for sidecar in "$binary".dgst.sig.*; do
-    [[ -e "$sidecar" ]] && rm -f "$sidecar"
+    [[ -e "$sidecar" ]] || continue
+    remove_file_if_exists "$sidecar"
   done
+  return 0
+}
+
+remove_file_if_exists() {
+  local path="$1"
+  [[ -e "$path" ]] || return 0
+  if ! rm -f "$path"; then
+    echo "[remove-node] ERROR: failed to remove runtime artifact: $path" >&2
+    return 1
+  fi
+  REMOVED_ARTIFACTS+=("$path")
+}
+
+stop_node_processes_twice() {
+  pkill -TERM -x quilibrium-node 2>/dev/null || true
+  sleep 2
+  pkill -KILL -x quilibrium-node 2>/dev/null || true
+  pkill -TERM -x quilibrium-node 2>/dev/null || true
+  sleep 1
+  pkill -KILL -x quilibrium-node 2>/dev/null || true
 }
 
 backup_default_config() {
@@ -227,43 +253,32 @@ remove_node_macos() {
     launchctl bootout "$launch_target" 2>/dev/null || true
   fi
   # Belt-and-braces: terminate any orphan node process launchd did not catch
-  # (e.g. if the user manually launched it once).
-  pkill -TERM -x quilibrium-node 2>/dev/null || true
-  sleep 2
-  pkill -KILL -x quilibrium-node 2>/dev/null || true
+  # before a backup or deletion can touch runtime artifacts.
+  stop_node_processes_twice
 
-  local removed=()
+  REMOVED_ARTIFACTS=()
   BACKED_UP_CONFIG=""
+  if [ "$install_source" = "fresh" ]; then
+    backup_default_config "$fresh_cfg" "$backup"
+  fi
   remove_binary_bundle "$bin"
   remove_binary_bundle "$qclient_bin"
-  removed+=("$bin bundle" "$qclient_bin bundle")
   if [ "$service_scope" = "system" ]; then
     remove_binary_bundle "/var/root/.local/bin/quilibrium-node"
     remove_binary_bundle "/var/root/.local/bin/qclient"
   fi
-  rm -f "$plist" "$state"
-  removed+=("$plist" "$state")
-  if [ "$install_source" = "fresh" ]; then
-    backup_default_config "$fresh_cfg" "$backup"
-  fi
-  # A node that is still winding down can recreate .config after the first
-  # move. Do one final stop-and-sweep pass so fresh installs are actually
-  # clean after this script exits.
-  pkill -TERM -x quilibrium-node 2>/dev/null || true
-  sleep 1
-  pkill -KILL -x quilibrium-node 2>/dev/null || true
-  remove_binary_bundle "$bin"
-  remove_binary_bundle "$qclient_bin"
-  rm -f "$plist" "$state"
-  if [ "$install_source" = "fresh" ]; then
-    backup_default_config "$fresh_cfg" "$backup"
-  fi
+  remove_file_if_exists "$plist"
+  remove_file_if_exists "$state"
   # macOS has no daemon-reload equivalent — bootout already detached.
 
   echo
   echo "[remove-node] Removal complete."
-  echo "[remove-node] Removed artifacts:"
-  for item in "${removed[@]}"; do echo "  - $item"; done
+  if [ ${#REMOVED_ARTIFACTS[@]} -gt 0 ]; then
+    echo "[remove-node] Removed artifacts:"
+    for item in "${REMOVED_ARTIFACTS[@]}"; do echo "  - $item"; done
+  else
+    echo "[remove-node] No managed runtime artifacts were present."
+  fi
   if [ -n "$BACKED_UP_CONFIG" ]; then
     echo "[remove-node] Backed up default config: $BACKED_UP_CONFIG"
   fi
@@ -298,38 +313,28 @@ remove_node_linux() {
 
   systemctl stop quilibrium-node.service 2>/dev/null || true
   systemctl disable quilibrium-node.service 2>/dev/null || true
-  pkill -TERM -x quilibrium-node 2>/dev/null || true
-  sleep 2
-  pkill -KILL -x quilibrium-node 2>/dev/null || true
+  stop_node_processes_twice
 
-  local REMOVED=()
+  REMOVED_ARTIFACTS=()
   BACKED_UP_CONFIG=""
-  remove_binary_bundle "$BIN"
-  remove_binary_bundle "$QCLIENT_BIN"
-  rm -f "$UNIT_FILE" "$STATE"
-  REMOVED+=("$BIN bundle" "$QCLIENT_BIN bundle" "$UNIT_FILE" "$STATE")
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
     backup_default_config "$FRESH_CFG" "$BACKUP"
   fi
-  # A node that is still winding down can recreate .config after the first
-  # move. Do one final stop-and-sweep pass so fresh installs are actually
-  # clean after this script exits.
-  pkill -TERM -x quilibrium-node 2>/dev/null || true
-  sleep 1
-  pkill -KILL -x quilibrium-node 2>/dev/null || true
   remove_binary_bundle "$BIN"
   remove_binary_bundle "$QCLIENT_BIN"
-  rm -f "$UNIT_FILE" "$STATE"
-  if [ "$INSTALL_SOURCE" = "fresh" ]; then
-    backup_default_config "$FRESH_CFG" "$BACKUP"
-  fi
+  remove_file_if_exists "$UNIT_FILE"
+  remove_file_if_exists "$STATE"
   systemctl daemon-reload || true
   rmdir /etc/quilscan-agent 2>/dev/null || true
 
   echo
   echo "[remove-node] Removal complete."
-  echo "[remove-node] Removed artifacts:"
-  for item in "${REMOVED[@]}"; do echo "  - $item"; done
+  if [ ${#REMOVED_ARTIFACTS[@]} -gt 0 ]; then
+    echo "[remove-node] Removed artifacts:"
+    for item in "${REMOVED_ARTIFACTS[@]}"; do echo "  - $item"; done
+  else
+    echo "[remove-node] No managed runtime artifacts were present."
+  fi
   if [ -n "$BACKED_UP_CONFIG" ]; then
     echo "[remove-node] Backed up default config: $BACKED_UP_CONFIG"
   fi
