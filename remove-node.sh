@@ -107,6 +107,69 @@ pause_agent_macos() {
   fi
 }
 
+verify_agent_ownership_linux() {
+  local missing=()
+  [[ -f /usr/local/bin/quilscan-agent ]] || missing+=("/usr/local/bin/quilscan-agent")
+  [[ -f /etc/systemd/system/quilscan-agent.service ]] || missing+=("/etc/systemd/system/quilscan-agent.service")
+  [[ -f /etc/quilscan-agent/state.yaml ]] || missing+=("/etc/quilscan-agent/state.yaml")
+  if (( ${#missing[@]} > 0 )); then
+    echo "[remove-node] Agent is uninstalled or incomplete; Node files are user-managed and nothing changed." >&2
+    for path in "${missing[@]}"; do echo "  - missing: $path" >&2; done
+    return 1
+  fi
+}
+
+verify_agent_ownership_macos() {
+  local agent_bin="$1"
+  local agent_plist="$2"
+  local state="$3"
+  local missing=()
+  [[ -f "$agent_bin" ]] || missing+=("$agent_bin")
+  [[ -f "$agent_plist" ]] || missing+=("$agent_plist")
+  [[ -f "$state" ]] || missing+=("$state")
+  if (( ${#missing[@]} > 0 )); then
+    echo "[remove-node] Agent is uninstalled or incomplete; Node files are user-managed and nothing changed." >&2
+    for path in "${missing[@]}"; do echo "  - missing: $path" >&2; done
+    return 1
+  fi
+}
+
+remove_binary_bundle() {
+  local binary="$1"
+  local sidecar
+  rm -f "$binary" "$binary.dgst" "$binary.sig"
+  for sidecar in "$binary".dgst.sig.*; do
+    [[ -e "$sidecar" ]] && rm -f "$sidecar"
+  done
+}
+
+backup_default_config() {
+  local config_dir="$1"
+  local backup_dir="$2"
+  local destination
+  local suffix=2
+  [[ -e "$config_dir" ]] || return 0
+  mkdir -p "$backup_dir" || return 1
+  destination="$backup_dir/$(basename "$config_dir")"
+  while [[ -e "$destination" ]]; do
+    destination="$backup_dir/$(basename "$config_dir")-$suffix"
+    suffix=$((suffix + 1))
+  done
+  if mv "$config_dir" "$destination"; then
+    BACKED_UP_CONFIG="$config_dir -> $destination"
+    return 0
+  fi
+  if ! cp -a "$config_dir" "$destination"; then
+    echo "[remove-node] ERROR: failed to back up default config: $config_dir" >&2
+    return 1
+  fi
+  if ! rm -rf "$config_dir"; then
+    echo "[remove-node] ERROR: copied default config but failed to remove original: $config_dir" >&2
+    return 1
+  fi
+  BACKED_UP_CONFIG="$config_dir -> $destination"
+}
+
 remove_node_macos() {
   local home="$HOME"
   local state="$home/Library/Application Support/quilscan-agent/state.yaml"
@@ -118,6 +181,7 @@ remove_node_macos() {
   local launch_target="gui/$(id -u)/$label"
   local service_scope="user"
   local agent_plist="$home/Library/LaunchAgents/com.quilscan.agent.plist"
+  local agent_bin="$home/.local/bin/quilscan-agent"
   local agent_target="gui/$(id -u)/com.quilscan.agent"
   local agent_domain="gui/$(id -u)"
   if [ "${EUID:-$(id -u)}" -eq 0 ]; then
@@ -129,6 +193,7 @@ remove_node_macos() {
     launch_target="system/$label"
     service_scope="system"
     agent_plist="/Library/LaunchDaemons/com.quilscan.agent.plist"
+    agent_bin="/usr/local/bin/quilscan-agent"
     agent_target="system/com.quilscan.agent"
     agent_domain="system"
   elif [ -f "/Library/Application Support/quilscan-agent/state.yaml" ] || launchctl print "system/$label" >/dev/null 2>&1; then
@@ -136,6 +201,7 @@ remove_node_macos() {
     echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash" >&2
     exit 1
   fi
+  verify_agent_ownership_macos "$agent_bin" "$agent_plist" "$state"
   local ts
   ts=$(date -u +%Y%m%d-%H%M%S)
   local backup
@@ -152,16 +218,9 @@ remove_node_macos() {
     install_source=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$state" | tr -d '"')
     user_cfg=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$state" | tr -d '"')
     config_path=$(awk -F': *' '/^config_path:/ {print $2; exit}' "$state" | tr -d '"')
-    qclient_bin=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$state" | tr -d '"')
-    if [ "$service_scope" = "system" ]; then
-      qclient_bin=${qclient_bin:-/usr/local/bin/qclient}
-    else
-      qclient_bin=${qclient_bin:-"$home/.local/bin/qclient"}
-    fi
   fi
   echo "[remove-node] service_scope=$service_scope install_source=${install_source:-unknown}"
   pause_agent_macos "$agent_domain" "$agent_target" "$agent_plist"
-  mkdir -p "$backup"
 
   # Stop the launchd job if loaded so the node exits cleanly.
   if launchctl print "$launch_target" >/dev/null 2>&1; then
@@ -173,47 +232,19 @@ remove_node_macos() {
   sleep 2
   pkill -KILL -x quilibrium-node 2>/dev/null || true
 
-  local items=()
-  move_to_backup() {
-    local src="$1"
-    [ -e "$src" ] || return 0
-    local dst="$backup/$(basename "$src")"
-    local n=2
-    while [ -e "$dst" ]; do
-      dst="$backup/$(basename "$src")-$n"
-      n=$((n + 1))
-    done
-    if mv "$src" "$dst" 2>/dev/null; then
-      items+=("$src -> $dst")
-      return 0
-    fi
-    if cp -a "$src" "$dst"; then
-      rm -rf "$src"
-      items+=("$src -> $dst")
-    fi
-  }
-  move_binary_bundle_to_backup() {
-    local binary="$1"
-    local sig
-    move_to_backup "$binary"
-    move_to_backup "$binary.dgst"
-    move_to_backup "$binary.sig"
-    for sig in "$binary".dgst.sig.*; do
-      [ -e "$sig" ] || continue
-      move_to_backup "$sig"
-    done
-  }
-
-  move_binary_bundle_to_backup "$bin"
-  move_binary_bundle_to_backup "$qclient_bin"
+  local removed=()
+  BACKED_UP_CONFIG=""
+  remove_binary_bundle "$bin"
+  remove_binary_bundle "$qclient_bin"
+  removed+=("$bin bundle" "$qclient_bin bundle")
   if [ "$service_scope" = "system" ]; then
-    rm -f "/var/root/.local/bin/quilibrium-node"
-    rm -f "/var/root/.local/bin/qclient"
+    remove_binary_bundle "/var/root/.local/bin/quilibrium-node"
+    remove_binary_bundle "/var/root/.local/bin/qclient"
   fi
-  move_to_backup "$plist"
-  move_to_backup "$state"
+  rm -f "$plist" "$state"
+  removed+=("$plist" "$state")
   if [ "$install_source" = "fresh" ]; then
-    move_to_backup "${config_path:-$fresh_cfg}"
+    backup_default_config "$fresh_cfg" "$backup"
   fi
   # A node that is still winding down can recreate .config after the first
   # move. Do one final stop-and-sweep pass so fresh installs are actually
@@ -221,23 +252,20 @@ remove_node_macos() {
   pkill -TERM -x quilibrium-node 2>/dev/null || true
   sleep 1
   pkill -KILL -x quilibrium-node 2>/dev/null || true
-  move_binary_bundle_to_backup "$bin"
-  move_binary_bundle_to_backup "$qclient_bin"
-  move_to_backup "$plist"
-  move_to_backup "$state"
+  remove_binary_bundle "$bin"
+  remove_binary_bundle "$qclient_bin"
+  rm -f "$plist" "$state"
   if [ "$install_source" = "fresh" ]; then
-    move_to_backup "${config_path:-$fresh_cfg}"
+    backup_default_config "$fresh_cfg" "$backup"
   fi
   # macOS has no daemon-reload equivalent — bootout already detached.
 
   echo
   echo "[remove-node] Removal complete."
-  echo "[remove-node] Backup directory: $backup"
-  if [ ${#items[@]} -gt 0 ]; then
-    echo "[remove-node] Items moved:"
-    for it in "${items[@]}"; do echo "  - $it"; done
-  else
-    echo "[remove-node] No artifacts needed to be moved."
+  echo "[remove-node] Removed artifacts:"
+  for item in "${removed[@]}"; do echo "  - $item"; done
+  if [ -n "$BACKED_UP_CONFIG" ]; then
+    echo "[remove-node] Backed up default config: $BACKED_UP_CONFIG"
   fi
   if [ "$install_source" = "migrated" ] && [ -n "$user_cfg" ]; then
     echo "[remove-node] Preserved (untouched): $user_cfg"
@@ -259,16 +287,14 @@ remove_node_linux() {
   local INSTALL_SOURCE="unknown"
   local USER_CFG=""
   local CONFIG_PATH=""
+  verify_agent_ownership_linux
   if [ -f "$STATE" ]; then
     INSTALL_SOURCE=$(awk -F': *' '/^install_source:/ {print $2; exit}' "$STATE" | tr -d '"')
     USER_CFG=$(awk -F': *' '/^migrated_from:/ {print $2; exit}' "$STATE" | tr -d '"')
     CONFIG_PATH=$(awk -F': *' '/^config_path:/ {print $2; exit}' "$STATE" | tr -d '"')
-    QCLIENT_BIN=$(awk -F': *' '/^qclient_binary_path:/ {print $2; exit}' "$STATE" | tr -d '"')
-    QCLIENT_BIN=${QCLIENT_BIN:-/usr/local/bin/qclient}
   fi
   echo "[remove-node] install_source=${INSTALL_SOURCE:-unknown}"
   pause_agent_linux
-  mkdir -p "$BACKUP"
 
   systemctl stop quilibrium-node.service 2>/dev/null || true
   systemctl disable quilibrium-node.service 2>/dev/null || true
@@ -276,42 +302,14 @@ remove_node_linux() {
   sleep 2
   pkill -KILL -x quilibrium-node 2>/dev/null || true
 
-  local ITEMS=()
-  move_to_backup() {
-    local src="$1"
-    [ -e "$src" ] || return 0
-    local dst="$BACKUP/$(basename "$src")"
-    local n=2
-    while [ -e "$dst" ]; do
-      dst="$BACKUP/$(basename "$src")-$n"
-      n=$((n + 1))
-    done
-    if mv "$src" "$dst" 2>/dev/null; then
-      ITEMS+=("$src -> $dst")
-      return 0
-    fi
-    if cp -a "$src" "$dst"; then
-      rm -rf "$src"
-      ITEMS+=("$src -> $dst")
-    fi
-  }
-  move_binary_bundle_to_backup() {
-    local binary="$1"
-    local sig
-    move_to_backup "$binary"
-    move_to_backup "$binary.dgst"
-    move_to_backup "$binary.sig"
-    for sig in "$binary".dgst.sig.*; do
-      [ -e "$sig" ] || continue
-      move_to_backup "$sig"
-    done
-  }
-  move_binary_bundle_to_backup "$BIN"
-  move_binary_bundle_to_backup "$QCLIENT_BIN"
-  move_to_backup "$UNIT_FILE"
-  move_to_backup "$STATE"
+  local REMOVED=()
+  BACKED_UP_CONFIG=""
+  remove_binary_bundle "$BIN"
+  remove_binary_bundle "$QCLIENT_BIN"
+  rm -f "$UNIT_FILE" "$STATE"
+  REMOVED+=("$BIN bundle" "$QCLIENT_BIN bundle" "$UNIT_FILE" "$STATE")
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
-    move_to_backup "${CONFIG_PATH:-$FRESH_CFG}"
+    backup_default_config "$FRESH_CFG" "$BACKUP"
   fi
   # A node that is still winding down can recreate .config after the first
   # move. Do one final stop-and-sweep pass so fresh installs are actually
@@ -319,23 +317,21 @@ remove_node_linux() {
   pkill -TERM -x quilibrium-node 2>/dev/null || true
   sleep 1
   pkill -KILL -x quilibrium-node 2>/dev/null || true
-  move_binary_bundle_to_backup "$BIN"
-  move_binary_bundle_to_backup "$QCLIENT_BIN"
-  move_to_backup "$UNIT_FILE"
-  move_to_backup "$STATE"
+  remove_binary_bundle "$BIN"
+  remove_binary_bundle "$QCLIENT_BIN"
+  rm -f "$UNIT_FILE" "$STATE"
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
-    move_to_backup "${CONFIG_PATH:-$FRESH_CFG}"
+    backup_default_config "$FRESH_CFG" "$BACKUP"
   fi
   systemctl daemon-reload || true
+  rmdir /etc/quilscan-agent 2>/dev/null || true
 
   echo
   echo "[remove-node] Removal complete."
-  echo "[remove-node] Backup directory: $BACKUP"
-  if [ ${#ITEMS[@]} -gt 0 ]; then
-    echo "[remove-node] Items moved:"
-    for it in "${ITEMS[@]}"; do echo "  - $it"; done
-  else
-    echo "[remove-node] No artifacts needed to be moved."
+  echo "[remove-node] Removed artifacts:"
+  for item in "${REMOVED[@]}"; do echo "  - $item"; done
+  if [ -n "$BACKED_UP_CONFIG" ]; then
+    echo "[remove-node] Backed up default config: $BACKED_UP_CONFIG"
   fi
   if [ "$INSTALL_SOURCE" = "migrated" ] && [ -n "$USER_CFG" ]; then
     echo "[remove-node] Preserved (untouched): $USER_CFG"

@@ -9,6 +9,7 @@
 #   - The fresh-install node .config directory
 #   - Any imported .config directory
 #   - Node keys, worker-store, and data files
+# After Agent uninstall, any remaining Node/qclient artifacts are user-managed.
 #
 # Usage:
 #   curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash         (macOS system-mode)
@@ -135,8 +136,8 @@ uninstall_macos() {
     echo "Preserved Agent backup directories:"
     for p in "${backups[@]}"; do echo "  - $p"; done
   fi
-  echo "Reinstall requires no Node/qclient runtime and no default managed .config."
-  echo "Run remove-node.sh first if those remain; imported configs outside the default path stay untouched."
+  echo "Managed Node removal must be run BEFORE uninstalling the Agent."
+  echo "Remaining Node/qclient files are now user-managed and must be cleaned manually."
   echo
   if [[ "$mode" != "system" ]]; then
     echo "(The PATH line in your shell rc is left in place so a future reinstall works."
@@ -193,8 +194,8 @@ uninstall_linux() {
     echo "Preserved Agent backup directories:"
     for p in "${backups[@]}"; do echo "  - $p"; done
   fi
-  echo "Reinstall requires no Node/qclient runtime and no default managed .config."
-  echo "Run remove-node.sh first if those remain; imported configs outside the default path stay untouched."
+  echo "Managed Node removal must be run BEFORE uninstalling the Agent."
+  echo "Remaining Node/qclient files are now user-managed and must be cleaned manually."
 }
 
 case "$(uname -s)" in
