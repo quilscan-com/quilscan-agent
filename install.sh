@@ -48,6 +48,39 @@ pgrep_first() {
   pgrep -x "$1" 2>/dev/null | head -1 || true
 }
 
+install_staged_agent_binary() {
+  local url="$1"
+  local destination="$2"
+  local destination_dir
+  local temp_bin
+  local version_output
+
+  destination_dir="$(dirname "$destination")"
+  mkdir -p "$destination_dir"
+  temp_bin="$(mktemp "$destination_dir/.quilscan-agent.XXXXXX")"
+
+  if ! curl -fsSL "$url" -o "$temp_bin"; then
+    rm -f "$temp_bin"
+    return 1
+  fi
+  if ! chmod 0755 "$temp_bin"; then
+    rm -f "$temp_bin"
+    return 1
+  fi
+  if ! version_output="$("$temp_bin" --version 2>/dev/null)"; then
+    rm -f "$temp_bin"
+    return 1
+  fi
+  if [[ -z "${version_output//[[:space:]]/}" ]]; then
+    rm -f "$temp_bin"
+    return 1
+  fi
+  if ! mv -f "$temp_bin" "$destination"; then
+    rm -f "$temp_bin"
+    return 1
+  fi
+}
+
 # ─────────────────────────────────────────────────────────────
 # macOS branch (LaunchDaemon / system-scope, requires sudo)
 # ─────────────────────────────────────────────────────────────
@@ -78,7 +111,11 @@ install_macos() {
   local legacy_launch_target=""
   local legacy_loaded=0
   if [[ -n "$target_home" ]]; then
-    [[ -e "$target_home/.local/bin/quilscan-agent" ]] && legacy+=("$target_home/.local/bin/quilscan-agent")
+    local legacy_agent_bin="$target_home/.local/bin/quilscan-agent"
+    [[ -e "$legacy_agent_bin" ]] && legacy+=("$legacy_agent_bin")
+    [[ -e "${legacy_agent_bin}.sig" ]] && legacy+=("${legacy_agent_bin}.sig")
+    [[ -e "${legacy_agent_bin}.new" ]] && legacy+=("${legacy_agent_bin}.new")
+    [[ -e "${legacy_agent_bin}.sig.new" ]] && legacy+=("${legacy_agent_bin}.sig.new")
     [[ -e "$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist" ]] && legacy+=("$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist")
     [[ -e "$target_home/Library/Application Support/quilscan-agent" ]] && legacy+=("$target_home/Library/Application Support/quilscan-agent")
     legacy_launch_target="gui/$(id -u "$target_user")/$AGENT_LABEL"
@@ -105,8 +142,9 @@ install_macos() {
     echo "A legacy user-mode macOS quilscan-agent install was detected:" >&2
     for p in "${legacy[@]}"; do echo "  - $p" >&2; done
     echo "" >&2
-    echo "Run the migration script instead of a fresh install:" >&2
-    echo "  curl -fsSL ${QSA_RELEASE_URL}/migrate-macos-root.sh | sudo bash -s -- --yes" >&2
+    echo "Run uninstall.sh for the old user Agent, then rerun install.sh with sudo:" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/uninstall.sh | bash" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/install.sh | sudo bash" >&2
     exit 1
   fi
 
@@ -114,6 +152,9 @@ install_macos() {
   # (uninstall.sh) is the canonical way to back up + remove.
   local existing=()
   [[ -e "$agent_bin" ]] && existing+=("$agent_bin")
+  [[ -e "$agent_bin.sig" ]] && existing+=("$agent_bin.sig")
+  [[ -e "$agent_bin.new" ]] && existing+=("$agent_bin.new")
+  [[ -e "$agent_bin.sig.new" ]] && existing+=("$agent_bin.sig.new")
   [[ -e "$plist_path" ]] && existing+=("$plist_path")
   [[ -e "$app_support" ]] && existing+=("$app_support")
   if launchctl print "system/$AGENT_LABEL" >/dev/null 2>&1; then
@@ -162,9 +203,7 @@ install_macos() {
   fi
 
   echo "[1/5] Downloading agent → $agent_bin"
-  mkdir -p "$bin_dir"
-  curl -fsSL "$QSA_RELEASE_URL/quilscan-agent-$PLATFORM" -o "$agent_bin"
-  chmod +x "$agent_bin"
+  install_staged_agent_binary "$QSA_RELEASE_URL/quilscan-agent-$PLATFORM" "$agent_bin"
 
   echo "[2/5] Creating support directories"
   mkdir -p "$app_support" "$logs_dir" "$launch_dir"
@@ -267,6 +306,9 @@ install_linux() {
 
   local existing=()
   [[ -e /usr/local/bin/quilscan-agent ]]                    && existing+=("/usr/local/bin/quilscan-agent")
+  [[ -e /usr/local/bin/quilscan-agent.sig ]]                && existing+=("/usr/local/bin/quilscan-agent.sig")
+  [[ -e /usr/local/bin/quilscan-agent.new ]]                && existing+=("/usr/local/bin/quilscan-agent.new")
+  [[ -e /usr/local/bin/quilscan-agent.sig.new ]]            && existing+=("/usr/local/bin/quilscan-agent.sig.new")
   [[ -e /etc/quilscan-agent ]]                              && existing+=("/etc/quilscan-agent/")
   [[ -e /etc/systemd/system/quilscan-agent.service ]]       && existing+=("/etc/systemd/system/quilscan-agent.service")
   [[ -e /var/log/quilscan-agent.log ]]                      && existing+=("/var/log/quilscan-agent.log")
@@ -324,8 +366,7 @@ install_linux() {
 
   local bin_url="$QSA_RELEASE_URL/quilscan-agent-$PLATFORM"
   echo "[1/5] Downloading $bin_url"
-  curl -fsSL "$bin_url" -o /usr/local/bin/quilscan-agent
-  chmod +x /usr/local/bin/quilscan-agent
+  install_staged_agent_binary "$bin_url" /usr/local/bin/quilscan-agent
 
   echo "[2/5] Creating /etc/quilscan-agent/"
   mkdir -p /etc/quilscan-agent
