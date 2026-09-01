@@ -19,6 +19,30 @@ set -euo pipefail
 
 AGENT_LABEL="com.quilscan.agent"
 
+remove_agent_binary_files() {
+  local bin="$1"
+  rm -f "$bin" "$bin.sig" "$bin.new" "$bin.sig.new"
+}
+
+remove_agent_support_files() {
+  local support="$1"
+  [[ -d "$support" ]] || return 0
+  rm -f \
+    "$support/token" "$support/token.new" "$support/token.tmp" \
+    "$support/state.yaml" "$support/state.yaml.new" "$support/state.yaml.tmp" \
+    "$support/config.yaml" "$support/config.yaml.new" "$support/config.yaml.tmp" \
+    "$support/config.yml" "$support/config.yml.new" "$support/config.yml.tmp"
+  rmdir "$support" 2>/dev/null || true
+}
+
+append_preserved_if_exists() {
+  [[ -e "$1" ]] && preserved+=("$1")
+}
+
+append_backup_if_exists() {
+  [[ -e "$1" ]] && backups+=("$1")
+}
+
 uninstall_macos() {
   local home="$HOME"
   local bin="$home/.local/bin/quilscan-agent"
@@ -41,7 +65,7 @@ uninstall_macos() {
       target_uid="$(id -u "$target_user" 2>/dev/null || true)"
       target_home="$(dscl . -read "/Users/$target_user" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory:[[:space:]]*//' || true)"
     fi
-  elif [[ -e "/Library/LaunchDaemons/${AGENT_LABEL}.plist" || -e "/Library/Application Support/quilscan-agent" || -e "/usr/local/bin/quilscan-agent" ]]; then
+  elif [[ -e "/Library/LaunchDaemons/${AGENT_LABEL}.plist" || -e "/Library/Application Support/quilscan-agent" || -e "/usr/local/bin/quilscan-agent" || -e "/usr/local/bin/quilscan-agent.sig" || -e "/usr/local/bin/quilscan-agent.new" || -e "/usr/local/bin/quilscan-agent.sig.new" ]]; then
     echo "System-mode macOS agent detected. Re-run with sudo:" >&2
     echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash" >&2
     exit 1
@@ -56,17 +80,20 @@ uninstall_macos() {
   fi
   pkill -x quilscan-agent 2>/dev/null || true
 
-  echo "[2/3] Removing agent binary, plist, support directory"
-  rm -f "$bin" "$plist" "$log"
-  rm -rf "$app_support"
+  echo "[2/3] Removing agent binary, plist, and known support files"
+  remove_agent_binary_files "$bin"
+  rm -f "$plist" "$log"
+  remove_agent_support_files "$app_support"
   if [[ "$mode" = "system" ]]; then
-    rm -f "/var/root/.local/bin/quilscan-agent"
-    rm -rf "/var/root/Library/Application Support/quilscan-agent"
+    remove_agent_binary_files "/var/root/.local/bin/quilscan-agent"
+    rm -f "/var/root/Library/LaunchAgents/${AGENT_LABEL}.plist"
+    rm -f "/var/root/Library/Logs/quilscan-agent.log"
+    remove_agent_support_files "/var/root/Library/Application Support/quilscan-agent"
     if [[ -n "$target_home" && -d "$target_home" ]]; then
-      rm -f "$target_home/.local/bin/quilscan-agent"
+      remove_agent_binary_files "$target_home/.local/bin/quilscan-agent"
       rm -f "$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist"
       rm -f "$target_home/Library/Logs/quilscan-agent.log"
-      rm -rf "$target_home/Library/Application Support/quilscan-agent"
+      remove_agent_support_files "$target_home/Library/Application Support/quilscan-agent"
     fi
   fi
 
@@ -75,22 +102,41 @@ uninstall_macos() {
   # Only list "preserved" items that actually exist on disk — printing
   # paths the user never created is misleading.
   local preserved=()
+  local backups=()
   if [[ "$mode" = "system" ]]; then
-    [[ -e /usr/local/bin/quilibrium-node ]] && preserved+=("/usr/local/bin/quilibrium-node")
-    [[ -e /Library/LaunchDaemons/com.quilscan.node.plist ]] && preserved+=("/Library/LaunchDaemons/com.quilscan.node.plist")
-    [[ -e "/Library/Application Support/quilibrium/.config" ]] && preserved+=("/Library/Application Support/quilibrium/.config")
+    append_preserved_if_exists /usr/local/bin/quilibrium-node
+    append_preserved_if_exists /usr/local/bin/qclient
+    append_preserved_if_exists /Library/LaunchDaemons/com.quilscan.node.plist
+    append_preserved_if_exists "/Library/Application Support/quilibrium/.config"
+    append_backup_if_exists "/Library/Application Support/quilscan-agent/backups"
+    append_backup_if_exists "/var/root/Library/Application Support/quilscan-agent/backups"
+    if [[ -n "$target_home" ]]; then
+      append_preserved_if_exists "$target_home/.local/bin/quilibrium-node"
+      append_preserved_if_exists "$target_home/.local/bin/qclient"
+      append_preserved_if_exists "$target_home/Library/LaunchAgents/com.quilscan.node.plist"
+      append_preserved_if_exists "$target_home/Library/Application Support/quilibrium/.config"
+      append_backup_if_exists "$target_home/Library/Application Support/quilscan-agent/backups"
+    fi
   else
-    [[ -e "$home/.local/bin/quilibrium-node" ]] && preserved+=("$home/.local/bin/quilibrium-node")
-    [[ -e "$home/Library/LaunchAgents/com.quilscan.node.plist" ]] && preserved+=("$home/Library/LaunchAgents/com.quilscan.node.plist")
-    [[ -e "$home/Library/Application Support/quilibrium/.config" ]] && preserved+=("$home/Library/Application Support/quilibrium/.config")
+    append_preserved_if_exists "$home/.local/bin/quilibrium-node"
+    append_preserved_if_exists "$home/.local/bin/qclient"
+    append_preserved_if_exists "$home/Library/LaunchAgents/com.quilscan.node.plist"
+    append_preserved_if_exists "$home/Library/Application Support/quilibrium/.config"
+    append_backup_if_exists "$home/Library/Application Support/quilscan-agent/backups"
   fi
   if (( ${#preserved[@]} > 0 )); then
-    echo "Removed quilscan-agent only. Preserved Quilibrium node files:"
+    echo "Removed quilscan-agent only. Preserved Quilibrium node and qclient files:"
     for p in "${preserved[@]}"; do echo "  - $p"; done
-    echo "  - any imported .config directory at its original path"
   else
-    echo "Removed quilscan-agent. No Quilibrium node files were present on this machine."
+    echo "Removed quilscan-agent. No default Quilibrium node or qclient runtime files were present on this machine."
   fi
+  echo "  - any imported .config directory at its original path"
+  if (( ${#backups[@]} > 0 )); then
+    echo "Preserved Agent backup directories:"
+    for p in "${backups[@]}"; do echo "  - $p"; done
+  fi
+  echo "Reinstall requires no Node/qclient runtime and no default managed .config."
+  echo "Run remove-node.sh first if those remain; imported configs outside the default path stay untouched."
   echo
   if [[ "$mode" != "system" ]]; then
     echo "(The PATH line in your shell rc is left in place so a future reinstall works."
@@ -114,7 +160,7 @@ uninstall_linux() {
   fi
 
   echo "[2/4] Removing agent binary and systemd unit"
-  rm -f /usr/local/bin/quilscan-agent
+  remove_agent_binary_files /usr/local/bin/quilscan-agent
   rm -f /etc/systemd/system/quilscan-agent.service
 
   echo "[3/4] Removing agent token, state, config, and log"
@@ -130,16 +176,25 @@ uninstall_linux() {
   echo
   # Only list "preserved" items that actually exist on disk.
   local preserved=()
-  [[ -e /usr/local/bin/quilibrium-node ]] && preserved+=("/usr/local/bin/quilibrium-node")
-  [[ -e /etc/systemd/system/quilibrium-node.service ]] && preserved+=("/etc/systemd/system/quilibrium-node.service")
-  [[ -e /var/lib/quilscan/node/.config ]] && preserved+=("/var/lib/quilscan/node/.config")
+  local backups=()
+  append_preserved_if_exists /usr/local/bin/quilibrium-node
+  append_preserved_if_exists /usr/local/bin/qclient
+  append_preserved_if_exists /etc/systemd/system/quilibrium-node.service
+  append_preserved_if_exists /var/lib/quilscan/node/.config
+  append_backup_if_exists /var/lib/quilscan/backups
   if (( ${#preserved[@]} > 0 )); then
-    echo "Done. Removed quilscan-agent only. Preserved Quilibrium node files:"
+    echo "Done. Removed quilscan-agent only. Preserved Quilibrium node and qclient files:"
     for p in "${preserved[@]}"; do echo "  - $p"; done
-    echo "  - any imported .config directory at its original path"
   else
-    echo "Done. Removed quilscan-agent. No Quilibrium node files were present on this server."
+    echo "Done. Removed quilscan-agent. No default Quilibrium node or qclient runtime files were present on this server."
   fi
+  echo "  - any imported .config directory at its original path"
+  if (( ${#backups[@]} > 0 )); then
+    echo "Preserved Agent backup directories:"
+    for p in "${backups[@]}"; do echo "  - $p"; done
+  fi
+  echo "Reinstall requires no Node/qclient runtime and no default managed .config."
+  echo "Run remove-node.sh first if those remain; imported configs outside the default path stay untouched."
 }
 
 case "$(uname -s)" in
