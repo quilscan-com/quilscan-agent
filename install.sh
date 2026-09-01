@@ -18,6 +18,17 @@ set -euo pipefail
 
 QSA_RELEASE_URL="${QSA_RELEASE_URL:-https://qstorage.quilibrium.com/quilscan-agent}"
 AGENT_LABEL="com.quilscan.agent"
+STAGED_TEMP_BIN=""
+
+cleanup_staged_temp() {
+  if [[ -n "$STAGED_TEMP_BIN" ]]; then
+    rm -f "$STAGED_TEMP_BIN"
+    STAGED_TEMP_BIN=""
+  fi
+}
+
+trap cleanup_staged_temp EXIT
+trap 'cleanup_staged_temp; exit 1' HUP INT TERM
 
 PLATFORM=""
 case "$(uname -s)-$(uname -m)" in
@@ -48,6 +59,20 @@ pgrep_first() {
   pgrep -x "$1" 2>/dev/null | head -1 || true
 }
 
+agent_support_has_runtime_files() {
+  local support="$1"
+  local runtime_file
+  [[ -d "$support" ]] || return 1
+  for runtime_file in \
+    token token.new token.tmp \
+    state.yaml state.yaml.new state.yaml.tmp \
+    config.yaml config.yaml.new config.yaml.tmp \
+    config.yml config.yml.new config.yml.tmp; do
+    [[ -e "$support/$runtime_file" ]] && return 0
+  done
+  return 1
+}
+
 install_staged_agent_binary() {
   local url="$1"
   local destination="$2"
@@ -57,28 +82,38 @@ install_staged_agent_binary() {
 
   destination_dir="$(dirname "$destination")"
   mkdir -p "$destination_dir"
-  temp_bin="$(mktemp "$destination_dir/.quilscan-agent.XXXXXX")"
+  if ! temp_bin="$(mktemp "$destination_dir/.quilscan-agent.XXXXXX")"; then
+    echo "[error] agent binary staging failed: $destination" >&2
+    return 1
+  fi
+  STAGED_TEMP_BIN="$temp_bin"
 
   if ! curl -fsSL "$url" -o "$temp_bin"; then
-    rm -f "$temp_bin"
+    echo "[error] agent binary download failed: $url" >&2
+    cleanup_staged_temp
     return 1
   fi
   if ! chmod 0755 "$temp_bin"; then
-    rm -f "$temp_bin"
+    echo "[error] agent binary chmod failed: $temp_bin" >&2
+    cleanup_staged_temp
     return 1
   fi
   if ! version_output="$("$temp_bin" --version 2>/dev/null)"; then
-    rm -f "$temp_bin"
+    echo "[error] agent binary version check failed: $temp_bin" >&2
+    cleanup_staged_temp
     return 1
   fi
   if [[ -z "${version_output//[[:space:]]/}" ]]; then
-    rm -f "$temp_bin"
+    echo "[error] agent binary version output was empty: $temp_bin" >&2
+    cleanup_staged_temp
     return 1
   fi
   if ! mv -f "$temp_bin" "$destination"; then
-    rm -f "$temp_bin"
+    echo "[error] agent binary move failed: $destination" >&2
+    cleanup_staged_temp
     return 1
   fi
+  STAGED_TEMP_BIN=""
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -117,7 +152,9 @@ install_macos() {
     [[ -e "${legacy_agent_bin}.new" ]] && legacy+=("${legacy_agent_bin}.new")
     [[ -e "${legacy_agent_bin}.sig.new" ]] && legacy+=("${legacy_agent_bin}.sig.new")
     [[ -e "$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist" ]] && legacy+=("$target_home/Library/LaunchAgents/${AGENT_LABEL}.plist")
-    [[ -e "$target_home/Library/Application Support/quilscan-agent" ]] && legacy+=("$target_home/Library/Application Support/quilscan-agent")
+    if agent_support_has_runtime_files "$target_home/Library/Application Support/quilscan-agent"; then
+      legacy+=("$target_home/Library/Application Support/quilscan-agent (Agent runtime files)")
+    fi
     legacy_launch_target="gui/$(id -u "$target_user")/$AGENT_LABEL"
     if launchctl print "$legacy_launch_target" >/dev/null 2>&1; then
       legacy_loaded=1
@@ -156,7 +193,9 @@ install_macos() {
   [[ -e "$agent_bin.new" ]] && existing+=("$agent_bin.new")
   [[ -e "$agent_bin.sig.new" ]] && existing+=("$agent_bin.sig.new")
   [[ -e "$plist_path" ]] && existing+=("$plist_path")
-  [[ -e "$app_support" ]] && existing+=("$app_support")
+  if agent_support_has_runtime_files "$app_support"; then
+    existing+=("$app_support (Agent runtime files)")
+  fi
   if launchctl print "system/$AGENT_LABEL" >/dev/null 2>&1; then
     existing+=("launchd job loaded: $AGENT_LABEL")
   fi
