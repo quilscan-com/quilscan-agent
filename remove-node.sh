@@ -19,6 +19,77 @@
 
 set -euo pipefail
 
+AGENT_RESTORE_ACTIVE=0
+AGENT_RESTORE_DONE=0
+AGENT_RESTORE_KIND=""
+AGENT_BOOTSTRAP_DOMAIN=""
+AGENT_LAUNCH_TARGET=""
+AGENT_PLIST=""
+
+restore_agent_service() {
+  if [[ "$AGENT_RESTORE_DONE" == "1" ]]; then
+    return 0
+  fi
+  AGENT_RESTORE_DONE=1
+  if [[ "$AGENT_RESTORE_ACTIVE" != "1" ]]; then
+    return 0
+  fi
+  if [[ "$AGENT_RESTORE_KIND" == "linux" ]]; then
+    if systemctl start quilscan-agent.service; then
+      echo "[remove-node] Agent service restored."
+    else
+      echo "[remove-node] ERROR: failed to restore quilscan-agent.service." >&2
+    fi
+    return 0
+  fi
+  if [[ "$AGENT_RESTORE_KIND" == "macos" ]]; then
+    if [[ ! -f "$AGENT_PLIST" ]]; then
+      echo "[remove-node] ERROR: Agent plist missing during restore: $AGENT_PLIST" >&2
+      return 0
+    fi
+    if launchctl bootstrap "$AGENT_BOOTSTRAP_DOMAIN" "$AGENT_PLIST" && launchctl kickstart -k "$AGENT_LAUNCH_TARGET"; then
+      echo "[remove-node] Agent service restored."
+    else
+      echo "[remove-node] ERROR: failed to restore Agent service: $AGENT_LAUNCH_TARGET" >&2
+    fi
+  fi
+}
+
+cleanup_remove_node() {
+  local status=$?
+  trap - EXIT HUP INT TERM
+  restore_agent_service
+  exit "$status"
+}
+
+trap cleanup_remove_node EXIT
+trap 'exit 1' HUP INT TERM
+
+pause_agent_linux() {
+  if systemctl is-active --quiet quilscan-agent.service; then
+    if ! systemctl stop quilscan-agent.service; then
+      echo "[remove-node] ERROR: failed to pause quilscan-agent.service; Node files were not changed." >&2
+      return 1
+    fi
+    AGENT_RESTORE_KIND="linux"
+    AGENT_RESTORE_ACTIVE=1
+  fi
+}
+
+pause_agent_macos() {
+  AGENT_BOOTSTRAP_DOMAIN="$1"
+  AGENT_LAUNCH_TARGET="$2"
+  AGENT_PLIST="$3"
+  if launchctl print "$AGENT_LAUNCH_TARGET" >/dev/null 2>&1; then
+    if ! launchctl bootout "$AGENT_LAUNCH_TARGET"; then
+      echo "[remove-node] ERROR: failed to pause Agent service; Node files were not changed." >&2
+      return 1
+    fi
+    AGENT_RESTORE_KIND="macos"
+    AGENT_RESTORE_ACTIVE=1
+  fi
+}
+
 remove_node_macos() {
   local home="$HOME"
   local state="$home/Library/Application Support/quilscan-agent/state.yaml"
@@ -29,6 +100,9 @@ remove_node_macos() {
   local label="com.quilscan.node"
   local launch_target="gui/$(id -u)/$label"
   local service_scope="user"
+  local agent_plist="$home/Library/LaunchAgents/com.quilscan.agent.plist"
+  local agent_target="gui/$(id -u)/com.quilscan.agent"
+  local agent_domain="gui/$(id -u)"
   if [ "${EUID:-$(id -u)}" -eq 0 ]; then
     state="/Library/Application Support/quilscan-agent/state.yaml"
     bin="/usr/local/bin/quilibrium-node"
@@ -37,6 +111,9 @@ remove_node_macos() {
     fresh_cfg="/Library/Application Support/quilibrium/.config"
     launch_target="system/$label"
     service_scope="system"
+    agent_plist="/Library/LaunchDaemons/com.quilscan.agent.plist"
+    agent_target="system/com.quilscan.agent"
+    agent_domain="system"
   elif [ -f "/Library/Application Support/quilscan-agent/state.yaml" ] || launchctl print "system/$label" >/dev/null 2>&1; then
     echo "System-mode node detected. Re-run with sudo:" >&2
     echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash" >&2
@@ -66,6 +143,7 @@ remove_node_macos() {
     fi
   fi
   echo "[remove-node] service_scope=$service_scope install_source=${install_source:-unknown}"
+  pause_agent_macos "$agent_domain" "$agent_target" "$agent_plist"
   mkdir -p "$backup"
 
   # Stop the launchd job if loaded so the node exits cleanly.
@@ -172,6 +250,7 @@ remove_node_linux() {
     QCLIENT_BIN=${QCLIENT_BIN:-/usr/local/bin/qclient}
   fi
   echo "[remove-node] install_source=${INSTALL_SOURCE:-unknown}"
+  pause_agent_linux
   mkdir -p "$BACKUP"
 
   systemctl stop quilibrium-node.service 2>/dev/null || true
