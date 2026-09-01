@@ -179,14 +179,16 @@ install_macos() {
     echo "A legacy user-mode macOS quilscan-agent install was detected:" >&2
     for p in "${legacy[@]}"; do echo "  - $p" >&2; done
     echo "" >&2
-    echo "Run uninstall.sh for the old user Agent, then rerun install.sh with sudo:" >&2
+    echo "For a clean install or system migration, while the old user Agent is still installed run:" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/remove-node.sh | bash" >&2
     echo "  curl -fsSL ${QSA_RELEASE_URL}/uninstall.sh | bash" >&2
     echo "  curl -fsSL ${QSA_RELEASE_URL}/install.sh | sudo bash" >&2
+    echo "Uninstall-only leaves remaining Node/qclient files user-managed." >&2
     exit 1
   fi
 
-  # Pre-flight: refuse to overwrite an existing install. The uninstall path
-  # (uninstall.sh) is the canonical way to back up + remove.
+  # Pre-flight: refuse to overwrite an existing install. remove-node.sh must
+  # run before uninstall.sh when the managed Node runtime needs removal.
   local existing=()
   [[ -e "$agent_bin" ]] && existing+=("$agent_bin")
   [[ -e "$agent_bin.sig" ]] && existing+=("$agent_bin.sig")
@@ -207,8 +209,11 @@ install_macos() {
     echo "An existing quilscan-agent install was detected:" >&2
     for p in "${existing[@]}"; do echo "  - $p" >&2; done
     echo "" >&2
-    echo "Run the macOS uninstall first, then re-run this installer:" >&2
+    echo "For a clean reinstall, run:" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/remove-node.sh | sudo bash" >&2
     echo "  curl -fsSL ${QSA_RELEASE_URL}/uninstall.sh | sudo bash" >&2
+    echo "  curl -fsSL ${QSA_RELEASE_URL}/install.sh | sudo bash" >&2
+    echo "If you keep the Node, uninstall-only leaves it user-managed and this clean installer will still block." >&2
     exit 1
   fi
 
@@ -392,9 +397,11 @@ install_linux() {
     echo "An existing quilscan installation was detected at:" >&2
     for path in "${existing[@]}"; do echo "  - $path" >&2; done
     echo "" >&2
-    echo "Run the agent uninstall script first, then re-run this installer:" >&2
-    echo "The uninstall script does not remove Quilibrium node data." >&2
+    echo "For a clean reinstall, run:" >&2
+    echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/remove-node.sh | sudo bash" >&2
     echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/uninstall.sh | sudo bash" >&2
+    echo "  curl -fsSL https://qstorage.quilibrium.com/quilscan-agent/install.sh | sudo bash" >&2
+    echo "If you keep the Node, uninstall-only leaves it user-managed and this clean installer will still block." >&2
     exit 1
   fi
 
