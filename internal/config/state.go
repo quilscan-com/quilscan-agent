@@ -138,8 +138,13 @@ func SaveState(path string, s *State) error {
 		return ErrStaleState
 	}
 	current, err := loadStateUnlocked(path)
-	if err == nil && current.DevNodeAutoUpdateRevision > s.DevNodeAutoUpdateRevision {
-		preserveDevNodeAutoUpdateState(s, current)
+	if err == nil {
+		if current.DevNodeAutoUpdateRevision > s.DevNodeAutoUpdateRevision {
+			preserveDevNodeAutoUpdateState(s, current)
+		}
+		if current.NodeManifestCheckedAt.After(s.NodeManifestCheckedAt) {
+			preserveNewerNodeManifestState(s, current)
+		}
 	}
 	if err := saveStateUnlocked(path, s); err != nil {
 		return err
@@ -305,6 +310,21 @@ func preserveDevNodeAutoUpdateState(dst, src *State) {
 	dst.DevNodeAutoUpdateLastTargetVersion = src.DevNodeAutoUpdateLastTargetVersion
 	dst.DevNodeAutoUpdateLastCompletedAt = src.DevNodeAutoUpdateLastCompletedAt
 	dst.DevNodeAutoUpdateLastFailedTargetVersion = src.DevNodeAutoUpdateLastFailedTargetVersion
+}
+
+func preserveNewerNodeManifestState(dst, src *State) {
+	dst.NodeSource = src.NodeSource
+	dst.InstalledNodeVersion = src.InstalledNodeVersion
+	dst.NodeBaseVersion = src.NodeBaseVersion
+	dst.NodeBuildNumber = src.NodeBuildNumber
+	dst.NodeBinarySHA256 = src.NodeBinarySHA256
+	dst.NodeManifestURL = src.NodeManifestURL
+	dst.NodeManifestCheckedAt = src.NodeManifestCheckedAt
+	dst.DevNodeSignatureVerified = src.DevNodeSignatureVerified
+	dst.LatestDevNodeVersion = src.LatestDevNodeVersion
+	dst.LatestDevNodeURL = src.LatestDevNodeURL
+	dst.LatestDevNodeSHA256 = src.LatestDevNodeSHA256
+	dst.LatestDevNodeBuildNumber = src.LatestDevNodeBuildNumber
 }
 
 func saveStateUnlocked(path string, s *State) error {
