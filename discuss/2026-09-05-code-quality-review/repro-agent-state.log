@@ -1,0 +1,7 @@
+Source revision: 8fd01701046d70853f11d98cd1a2b6bbd697c051
+--- FAIL: TestAuditStaleSnapshotLosesNodeVersion (0.00s)
+    state_audit_test.go:13: stale reconciliation overwrote installed version: got "old", want new
+FAIL
+FAIL	github.com/quilscan-com/quilscan-agent/internal/config	0.938s
+FAIL
+CONFIRMED: exact-source State stale-save defect reproduced

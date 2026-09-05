@@ -1,0 +1,31 @@
+Source SHA: 8fd01701046d70853f11d98cd1a2b6bbd697c051
+Command: GOWORK=off go test ./...
+# github.com/quilscan-com/quilscan-agent/internal/actions
+internal/actions/install_qclient.go:222:14: sha3.Sum256 requires go1.24 or later (module is go1.22)
+?   	github.com/quilscan-com/quilscan-agent/cmd/agent	[no test files]
+FAIL	github.com/quilscan-com/quilscan-agent/internal/actions [build failed]
+?   	github.com/quilscan-com/quilscan-agent/internal/agentlog	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/audit	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/config	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/devnodeautoupdate	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/download	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/fdlimit	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/launchd	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/logstream	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/metrics	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/netinfo	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/nodeinfo	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/nodeinstall	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/nodemanifest	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/qclient	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/reconcile	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/release	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/rpcconfig	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/svcctl	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/systemd	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/token	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/internal/ws	[no test files]
+?   	github.com/quilscan-com/quilscan-agent/scripts	[no test files]
+FAIL
+
+Exit code: 1
