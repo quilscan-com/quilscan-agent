@@ -440,7 +440,7 @@ make build
 
 The build writes platform binaries to `dist/`.
 
-Requires Go 1.22 or newer.
+Requires Go 1.24 or newer.
 
 ## GitHub Signed Builds
 
