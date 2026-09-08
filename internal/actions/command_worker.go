@@ -75,7 +75,7 @@ func (w *CommandWorker) submitRestart(command Command) error {
 		return w.submitNormalRestart(command)
 	}
 	owner := w.gate.Owner()
-	if blockingCmdID == "" || owner.CmdID == "" || blockingCmdID != owner.CmdID {
+	if blockingCmdID == "" || (owner.CmdID != "" && blockingCmdID != owner.CmdID) {
 		return w.rejectMutation(command, owner)
 	}
 	if !w.reserveRestart() {
