@@ -78,12 +78,27 @@ func (w *CommandWorker) submitRestart(command Command) error {
 	if blockingCmdID == "" || (owner.CmdID != "" && blockingCmdID != owner.CmdID) {
 		return w.rejectMutation(command, owner)
 	}
+	var release func()
+	if owner == (MutationOwner{}) {
+		acquiredRelease, blocker, ok := w.gate.TryAcquire(MutationOwner{Action: command.Action, CmdID: command.ID})
+		if ok {
+			release = acquiredRelease
+		} else if blocker.CmdID != blockingCmdID {
+			return w.rejectMutation(command, blocker)
+		}
+	}
 	if !w.reserveRestart() {
+		if release != nil {
+			release()
+		}
 		return w.rejectRestart(command)
 	}
-	err := w.enqueue(w.recovery, queuedCommand{command: command, restart: true})
+	err := w.enqueue(w.recovery, queuedCommand{command: command, release: release, restart: true})
 	if err != nil {
 		w.clearRestart()
+		if release != nil {
+			release()
+		}
 	}
 	return err
 }
