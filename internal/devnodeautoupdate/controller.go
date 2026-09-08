@@ -28,7 +28,7 @@ const (
 	StateRetrying  = "retrying"
 )
 
-const updateAction = "update_node"
+const updateAction = "automatic_update"
 
 // Deps contains the controller's side effects and time sources.
 type Deps struct {
@@ -36,7 +36,7 @@ type Deps struct {
 	LoadState         func(string) (*config.State, error)
 	PersistState      func(string, func(*config.State) error) (*config.State, error)
 	Update            actions.Handler
-	UpdateOwner       func() string
+	MutationGate      *actions.MutationGate
 	PatchNodeStatus   func(map[string]interface{})
 	EmitCommandStatus func(actions.Status)
 	Tick              time.Duration
@@ -260,10 +260,6 @@ func (c *Controller) Tick() {
 	}
 
 	now := c.now()
-	owner := ""
-	if c.deps.UpdateOwner != nil {
-		owner = c.deps.UpdateOwner()
-	}
 	var launch bool
 	var cancelDue func()
 	var runLifecycle uint64
@@ -275,7 +271,7 @@ func (c *Controller) Tick() {
 			} else {
 				c.state = StateScheduled
 			}
-		} else if owner == "" {
+		} else {
 			cancelDue = c.detachDueUnlocked()
 			c.running = true
 			c.retrying = false
@@ -283,10 +279,6 @@ func (c *Controller) Tick() {
 			c.state = StateUpdating
 			runLifecycle = c.lifecycle
 			launch = true
-		} else if c.retrying {
-			c.state = StateRetrying
-		} else {
-			c.state = StateScheduled
 		}
 	}
 	c.mu.Unlock()
@@ -359,6 +351,12 @@ func (c *Controller) execute(target candidate, runLifecycle uint64) {
 	}
 
 	commandID := c.newEventID()
+	release, ok := c.tryAcquireAutomaticMutation(commandID)
+	if !ok {
+		c.finishContention()
+		return
+	}
+	defer release()
 	command := actions.Command{
 		ID:     commandID,
 		Action: updateAction,
@@ -379,15 +377,32 @@ func (c *Controller) execute(target candidate, runLifecycle uint64) {
 			}
 		})
 	}
-	if errors.Is(updateErr, actions.ErrNodeUpdateInProgress) {
-		c.finishContention()
-		return
-	}
 	if updateErr != nil {
 		c.finishFailure(target, commandID, runLifecycle)
 		return
 	}
 	c.finishSuccess(target, commandID, runLifecycle)
+}
+
+func (c *Controller) tryAcquireAutomaticMutation(commandID string) (func(), bool) {
+	if c.deps.MutationGate == nil {
+		return func() {}, true
+	}
+	release, blocker, ok := c.deps.MutationGate.TryAcquire(actions.MutationOwner{Action: updateAction, CmdID: commandID})
+	if ok {
+		return release, true
+	}
+	if c.deps.EmitCommandStatus != nil {
+		c.deps.EmitCommandStatus(actions.Status{
+			ID:             commandID,
+			Action:         updateAction,
+			Step:           "rejected",
+			Error:          actions.ErrMutationInProgress.Error(),
+			BlockingCmdID:  blocker.CmdID,
+			BlockingAction: blocker.Action,
+		})
+	}
+	return nil, false
 }
 
 func (c *Controller) finishWithoutResult(state *config.State, runLifecycle uint64) {

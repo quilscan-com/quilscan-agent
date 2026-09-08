@@ -4,57 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 )
 
-const (
-	NodeUpdateOwnerManual    = "manual"
-	NodeUpdateOwnerAutomatic = "automatic"
-)
-
 var (
-	ErrNodeUpdateInProgress         = errors.New("node update is already in progress")
-	ErrDevNodeAutoUpdateInProgress  = errors.New("Dev Node auto update is already in progress")
 	ErrDevNodeAutoUpdateRequiresDev = errors.New("Dev Node auto update requires node source dev")
 )
-
-// NodeUpdateGate serializes manual and automatic node update execution.
-type NodeUpdateGate struct {
-	mu    sync.Mutex
-	owner string
-}
-
-// TryAcquire takes the gate for owner. When busy, current reports its owner.
-func (g *NodeUpdateGate) TryAcquire(owner string) (release func(), current string, ok bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if owner != NodeUpdateOwnerManual && owner != NodeUpdateOwnerAutomatic {
-		return nil, g.owner, false
-	}
-	if g.owner != "" {
-		return nil, g.owner, false
-	}
-	g.owner = owner
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			g.mu.Lock()
-			g.owner = ""
-			g.mu.Unlock()
-		})
-	}, "", true
-}
-
-// Owner returns the current gate owner, or an empty string when idle.
-func (g *NodeUpdateGate) Owner() string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.owner
-}
 
 // NodeUpdaterDeps wires the update_node flow:
 //
@@ -75,14 +33,12 @@ type NodeUpdaterDeps struct {
 		Stop(unit string) error
 	}
 
-	Downloader                        Downloader
-	DevInstaller                      DevNodeInstaller
-	NodeManifestURL                   string
-	Gate                              *NodeUpdateGate
-	SuppressAutomaticContentionStatus bool
-	LoadState                         func() (*config.State, error)
-	SaveState                         func(*config.State) error
-	EmitRaw                           func(map[string]interface{})
+	Downloader      Downloader
+	DevInstaller    DevNodeInstaller
+	NodeManifestURL string
+	LoadState       func() (*config.State, error)
+	SaveState       func(*config.State) error
+	EmitRaw         func(map[string]interface{})
 	// PatchNodeStatus folds an authoritative patch into reconcile's cached
 	// node_status snapshot. Used right after a successful update so the
 	// stale `node_update_available: true` doesn't linger for up to an hour
@@ -103,25 +59,6 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			return fmt.Errorf("missing version")
 		}
 		automatic, _ := c.Args["automatic"].(bool)
-		owner := NodeUpdateOwnerManual
-		if automatic {
-			owner = NodeUpdateOwnerAutomatic
-		}
-		if d.Gate != nil {
-			release, current, ok := d.Gate.TryAcquire(owner)
-			if !ok {
-				err := ErrNodeUpdateInProgress
-				if owner == NodeUpdateOwnerManual && current == NodeUpdateOwnerAutomatic {
-					err = ErrDevNodeAutoUpdateInProgress
-				}
-				if !(automatic && d.SuppressAutomaticContentionStatus) {
-					emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-				}
-				return err
-			}
-			defer release()
-		}
-
 		if d.LoadState == nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: "agent state unavailable"})
 			return fmt.Errorf("LoadState dep missing")

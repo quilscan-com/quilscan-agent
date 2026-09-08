@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -35,7 +37,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.1.7"
+var version = "1.1.8"
 
 type startStopCtl interface {
 	Start(string) error
@@ -83,6 +85,10 @@ func bootstrapToken() {
 }
 
 func run() {
+	agentInstanceID, err := newAgentInstanceID()
+	if err != nil {
+		log.Fatalf("agent instance id: %v", err)
+	}
 	defaults := config.DefaultConfig()
 	cfg, err := config.Load(defaults.ConfigPath)
 	if err != nil {
@@ -134,6 +140,7 @@ func run() {
 			HasQClient:      hasExistingQClient(defaults),
 			ServiceMode:     agentServiceMode,
 			NodeServiceMode: nodeServiceMode,
+			AgentInstanceID: agentInstanceID,
 		},
 	}
 
@@ -256,20 +263,18 @@ func run() {
 		OnInstalled:      onInstalled,
 		InstallQClient:   installQClient,
 	})
-	nodeUpdateGate := &actions.NodeUpdateGate{}
+	mutationGate := &actions.MutationGate{}
 	nodeUpdateHandler := actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
-		UnitName:                          defaults.NodeServiceName,
-		BinaryPath:                        defaults.NodeBinaryPath,
-		Platform:                          platform,
-		StartStop:                         sdCtl,
-		Downloader:                        actions.ReleaseDownloader{},
-		DevInstaller:                      actions.ManifestDevNodeInstaller{},
-		NodeManifestURL:                   nodemanifest.DefaultURL,
-		Gate:                              nodeUpdateGate,
-		SuppressAutomaticContentionStatus: true,
-		LoadState:                         func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-		SaveState:                         func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
-		EmitRaw:                           func(m map[string]interface{}) { _ = client.Send(m) },
+		UnitName:        defaults.NodeServiceName,
+		BinaryPath:      defaults.NodeBinaryPath,
+		Platform:        platform,
+		StartStop:       sdCtl,
+		Downloader:      actions.ReleaseDownloader{},
+		DevInstaller:    actions.ManifestDevNodeInstaller{},
+		NodeManifestURL: nodemanifest.DefaultURL,
+		LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+		SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+		EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
 		PatchNodeStatus: func(patch map[string]interface{}) {
 			if rec != nil {
 				rec.PatchNodeStatus(patch)
@@ -277,9 +282,9 @@ func run() {
 		},
 	})
 	devAutoController := devnodeautoupdate.NewController(devnodeautoupdate.Deps{
-		StatePath:   defaults.StatePath,
-		Update:      nodeUpdateHandler,
-		UpdateOwner: nodeUpdateGate.Owner,
+		StatePath:    defaults.StatePath,
+		Update:       nodeUpdateHandler,
+		MutationGate: mutationGate,
 		PatchNodeStatus: func(patch map[string]interface{}) {
 			if rec != nil {
 				rec.PatchNodeStatus(patch)
@@ -413,6 +418,26 @@ func run() {
 		UnitName: defaults.NodeServiceName,
 		LogPath:  defaults.NodeLogPath, // empty on Linux → journalctl path
 	}
+	commandWorker := actions.NewCommandWorker(
+		ctx,
+		d,
+		mutationGate,
+		func(status actions.Status) { _ = client.Send(statusMessage(status)) },
+		func(command actions.Command, commandErr error) {
+			if commandErr != nil {
+				log.Printf("[cmd] finished id=%s action=%s result=failure error=%v", command.ID, command.Action, commandErr)
+			} else {
+				log.Printf("[cmd] finished id=%s action=%s result=success", command.ID, command.Action)
+			}
+			if auditor != nil {
+				result := "success"
+				if commandErr != nil {
+					result = "failure"
+				}
+				_ = auditor.Record(command.Action, result, map[string]string{"id": command.ID})
+			}
+		},
+	)
 	client.OnMessage = func(b []byte) {
 		var env struct {
 			Type   string `json:"type"`
@@ -461,22 +486,8 @@ func run() {
 			return
 		}
 		log.Printf("[cmd] received id=%s action=%s", cmd.ID, cmd.Action)
-		err := d.Dispatch(cmd, func(s actions.Status) {
-			s.ID = cmd.ID
-			s.Action = cmd.Action
-			_ = client.Send(statusMessage(s))
-		})
-		if err != nil {
-			log.Printf("[cmd] finished id=%s action=%s result=failure error=%v", cmd.ID, cmd.Action, err)
-		} else {
-			log.Printf("[cmd] finished id=%s action=%s result=success", cmd.ID, cmd.Action)
-		}
-		if auditor != nil {
-			res := "success"
-			if err != nil {
-				res = "failure"
-			}
-			_ = auditor.Record(cmd.Action, res, map[string]string{"id": cmd.ID})
+		if err := commandWorker.Submit(cmd); err != nil {
+			log.Printf("[cmd] rejected id=%s action=%s error=%v", cmd.ID, cmd.Action, err)
 		}
 	}
 
@@ -806,7 +817,7 @@ func hasExistingNodeAt(binaryPath, stateCfgPath, defaultCfgDir, unitFilePath str
 }
 
 func statusMessage(s actions.Status) map[string]interface{} {
-	return map[string]interface{}{
+	message := map[string]interface{}{
 		"type":     "cmd_status",
 		"id":       s.ID,
 		"action":   s.Action,
@@ -815,4 +826,22 @@ func statusMessage(s actions.Status) map[string]interface{} {
 		"error":    s.Error,
 		"message":  s.Message,
 	}
+	if s.BlockingCmdID != "" {
+		message["blocking_cmd_id"] = s.BlockingCmdID
+	}
+	if s.BlockingAction != "" {
+		message["blocking_action"] = s.BlockingAction
+	}
+	return message
+}
+
+func newAgentInstanceID() (string, error) {
+	var value [16]byte
+	if _, err := cryptorand.Read(value[:]); err != nil {
+		return "", err
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	encoded := hex.EncodeToString(value[:])
+	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
 }

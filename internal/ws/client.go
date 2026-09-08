@@ -29,6 +29,7 @@ type Meta struct {
 	HasQClient      bool   `json:"has_qclient"`
 	ServiceMode     string `json:"service_mode"`
 	NodeServiceMode string `json:"node_service_mode"`
+	AgentInstanceID string `json:"agent_instance_id"`
 }
 
 // Client is a long-running WebSocket client.
@@ -84,17 +85,7 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 	}()
 
 	// auth
-	auth := map[string]interface{}{
-		"type":              "auth",
-		"token":             c.Token,
-		"version":           c.Meta.Version,
-		"os":                c.Meta.OS,
-		"has_node":          c.Meta.HasNode,
-		"has_qclient":       c.Meta.HasQClient,
-		"service_mode":      c.Meta.ServiceMode,
-		"node_service_mode": c.Meta.NodeServiceMode,
-	}
-	if err := c.writeJSON(conn, auth); err != nil {
+	if err := c.writeJSON(conn, c.authMessage()); err != nil {
 		return err
 	}
 
@@ -134,6 +125,20 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 				return err
 			}
 		}
+	}
+}
+
+func (c *Client) authMessage() map[string]interface{} {
+	return map[string]interface{}{
+		"type":              "auth",
+		"token":             c.Token,
+		"version":           c.Meta.Version,
+		"os":                c.Meta.OS,
+		"has_node":          c.Meta.HasNode,
+		"has_qclient":       c.Meta.HasQClient,
+		"service_mode":      c.Meta.ServiceMode,
+		"node_service_mode": c.Meta.NodeServiceMode,
+		"agent_instance_id": c.Meta.AgentInstanceID,
 	}
 }
 
