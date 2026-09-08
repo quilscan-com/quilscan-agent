@@ -1,6 +1,7 @@
 package actions
 
 import (
+	"errors"
 	"time"
 )
 
@@ -15,7 +16,8 @@ type SelfRestarter interface {
 // RestartAgentDeps wires the dependencies for the restart_agent handler.
 type RestartAgentDeps struct {
 	SelfServiceUnit string        // systemd unit name OR launchd label
-	Svc             SelfRestarter // service controller, scheduled out-of-band
+	Svc             SelfRestarter // service controller
+	Sleep           func(time.Duration)
 }
 
 // NewRestartAgentHandler returns a handler that restarts the quilscan-agent
@@ -25,6 +27,10 @@ type RestartAgentDeps struct {
 // frontend will see a brief offline window before the new process
 // reconnects under the same token.
 func NewRestartAgentHandler(d RestartAgentDeps) Handler {
+	sleep := d.Sleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
 	return func(c Command, emit Emitter) error {
 		emit(Status{ID: c.ID, Step: "preparing", Progress: 0.1})
 		emit(Status{ID: c.ID, Step: "restarting", Progress: 0.5})
@@ -32,17 +38,12 @@ func NewRestartAgentHandler(d RestartAgentDeps) Handler {
 		// manager SIGTERMs us.
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 
-		go func(unit string) {
-			// Brief delay so the cmd_status frame above has time to flush
-			// out of the TCP buffer before SIGTERM arrives. svcctl.Ctl.Restart
-			// is non-blocking on both platforms (systemctl --no-block on
-			// Linux, launchctl kickstart -k on macOS).
-			time.Sleep(500 * time.Millisecond)
-			if d.Svc != nil {
-				_ = d.Svc.Restart(unit)
-			}
-		}(d.SelfServiceUnit)
-
-		return nil
+		// Keep the worker occupied through the delay and service-manager
+		// invocation so its mutation gate cannot be released prematurely.
+		sleep(500 * time.Millisecond)
+		if d.Svc == nil {
+			return errors.New("Agent restart service is unavailable")
+		}
+		return d.Svc.Restart(d.SelfServiceUnit)
 	}
 }
