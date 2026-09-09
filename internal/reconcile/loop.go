@@ -106,12 +106,11 @@ type Loop struct {
 	OfficialArtifactsURL        string
 	OfficialArtifactsFetcher    func(string) (*nodemanifest.OfficialArtifacts, error)
 
-	NodeInfoRunner                func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
-	QClientStatusRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
-	QClientManageRunner           func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
-	QClientClaimableRewardsRunner func(context.Context, qclient.RunRequest, time.Duration) (string, error)
-	QClientTokenBalanceRunner     func(context.Context, qclient.RunRequest, time.Duration) (string, error)
-	PeerConnectionsLogReader      func(context.Context, string, string, int, time.Duration) (int, bool)
+	NodeInfoRunner             func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
+	QClientStatusRunner        func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
+	QClientManageRunner        func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
+	QClientTokenBalancesRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.TokenBalances, error)
+	PeerConnectionsLogReader   func(context.Context, string, string, int, time.Duration) (int, bool)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
@@ -275,41 +274,30 @@ func (l *Loop) refreshQClientTokenStatus(ctx context.Context) {
 		WorkDir:    nodeCommandWorkDir(configPath, l.managedConfigDir()),
 	}
 
-	claimableRunner := l.QClientClaimableRewardsRunner
-	if claimableRunner == nil {
-		claimableRunner = qclient.RunClaimableRewards
+	balancesRunner := l.QClientTokenBalancesRunner
+	if balancesRunner == nil {
+		balancesRunner = qclient.RunTokenBalances
 	}
 	if ctx.Err() != nil {
 		return
 	}
-	claimable, claimableErr := claimableRunner(ctx, req, 30*time.Second)
+	balances, balancesErr := balancesRunner(ctx, req, 30*time.Second)
 	if ctx.Err() != nil {
 		return
 	}
-	if claimableErr == nil {
-		l.updateNodeStatus(map[string]interface{}{
-			"qclient_claimable_rewards":              claimable,
-			"qclient_claimable_rewards_refreshed_at": time.Now().UTC().Format(time.RFC3339),
-		})
-	}
-
-	balanceRunner := l.QClientTokenBalanceRunner
-	if balanceRunner == nil {
-		balanceRunner = qclient.RunTokenBalance
-	}
-	if ctx.Err() != nil {
+	if balancesErr != nil {
 		return
 	}
-	balance, balanceErr := balanceRunner(ctx, req, 30*time.Second)
-	if ctx.Err() != nil {
-		return
+	refreshedAt := time.Now().UTC().Format(time.RFC3339)
+	patch := map[string]interface{}{
+		"qclient_token_balance":              balances.TokenBalanceQuil,
+		"qclient_token_balance_refreshed_at": refreshedAt,
 	}
-	if balanceErr == nil {
-		l.updateNodeStatus(map[string]interface{}{
-			"qclient_token_balance":              balance,
-			"qclient_token_balance_refreshed_at": time.Now().UTC().Format(time.RFC3339),
-		})
+	if balances.ClaimableRewardsKnown {
+		patch["qclient_claimable_rewards"] = balances.ClaimableRewardsQuil
+		patch["qclient_claimable_rewards_refreshed_at"] = refreshedAt
 	}
+	l.updateNodeStatus(patch)
 }
 
 // verifyLocked is the mutex-guarded entry point used by both the 60s
