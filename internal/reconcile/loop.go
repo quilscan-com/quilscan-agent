@@ -111,6 +111,7 @@ type Loop struct {
 	QClientManageRunner        func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
 	QClientTokenBalancesRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.TokenBalances, error)
 	PeerConnectionsLogReader   func(context.Context, string, string, int, time.Duration) (int, bool)
+	DirSize                    func(string) (int64, error)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
@@ -335,7 +336,7 @@ func (l *Loop) RunVerifyNow() bool {
 func (l *Loop) runVerify() {
 	state, err := config.LoadState(l.StatePath)
 	if err != nil {
-		state = &config.State{}
+		return
 	}
 	detection := nodeinstall.Detect(nodeinstall.Paths{
 		BinaryPath:        l.BinaryPath,
@@ -348,7 +349,10 @@ func (l *Loop) runVerify() {
 	if !detection.HasNode && removableNodeResidue(detection.Residues, l.managedConfigDir()) {
 		if err := config.RemoveState(l.StatePath); err == nil || os.IsNotExist(err) {
 			_ = os.Remove(l.managedConfigDir())
-			state = &config.State{}
+			state, err = config.LoadState(l.StatePath)
+			if err != nil {
+				return
+			}
 			detection.Residues = []string{}
 		}
 	}
@@ -401,10 +405,7 @@ func (l *Loop) runVerify() {
 			if info.Version != "" {
 				nodePatch["node_info_version"] = info.Version
 				nodePatch["current_node_version"] = info.Version
-				if state.NodeVersion != info.Version {
-					state.NodeVersion = info.Version
-					_ = l.saveState(state)
-				}
+				state.NodeVersion = info.Version
 				if state.NodeSource != nodemanifest.SourceDev {
 					if latest := l.statusString("latest_node_version"); latest != "" {
 						nodePatch["latest_node_version"] = latest
@@ -424,10 +425,7 @@ func (l *Loop) runVerify() {
 				if qstatus.Version != "" {
 					nodePatch["node_info_version"] = qstatus.Version
 					nodePatch["current_node_version"] = qstatus.Version
-					if state.NodeVersion != qstatus.Version {
-						state.NodeVersion = qstatus.Version
-						_ = l.saveState(state)
-					}
+					state.NodeVersion = qstatus.Version
 					if state.NodeSource != nodemanifest.SourceDev {
 						if latest := l.statusString("latest_node_version"); latest != "" {
 							nodePatch["latest_node_version"] = latest
@@ -492,7 +490,16 @@ func (l *Loop) runVerify() {
 		UnitName: l.UnitName,
 	}).NodeStatusPatch())
 	if state.ConfigPath != "" || state.NodeVersion != "" || state.PeerID != "" {
-		_ = l.saveState(state)
+		persisted, applied, err := config.UpdateStateIfCurrent(l.StatePath, state, func(current *config.State) error {
+			applyVerifyState(current, state)
+			return nil
+		})
+		if err != nil || !applied {
+			return
+		}
+		state = persisted
+	} else if !config.StateIsCurrent(l.StatePath, state) {
+		return
 	}
 	l.updateNodeStatus(nodePatch)
 	if l.Sender != nil {
@@ -534,36 +541,23 @@ func (l *Loop) runVerify() {
 	l.broadcastSystemFilesIfChanged(state.ConfigPath)
 }
 
-func (l *Loop) saveState(state *config.State) error {
-	if state == nil {
-		return nil
-	}
-	latest, err := config.LoadState(l.StatePath)
-	if err == nil && latest != nil {
-		l.preserveQClientState(state, latest)
-	}
-	return config.SaveState(l.StatePath, state)
-}
-
-func (l *Loop) preserveQClientState(state, latest *config.State) {
-	if state == nil || latest == nil {
-		return
-	}
-	if !l.qclientInstalled() {
-		state.QClientBinaryPath = ""
-		state.QClientVersion = ""
-		state.QClientInstalledAt = time.Time{}
-		return
-	}
-	if strings.TrimSpace(state.QClientBinaryPath) == "" {
-		state.QClientBinaryPath = latest.QClientBinaryPath
-	}
-	if strings.TrimSpace(state.QClientVersion) == "" {
-		state.QClientVersion = latest.QClientVersion
-	}
-	if state.QClientInstalledAt.IsZero() {
-		state.QClientInstalledAt = latest.QClientInstalledAt
-	}
+func applyVerifyState(dst, observed *config.State) {
+	dst.NodeVersion = observed.NodeVersion
+	dst.NodeSource = observed.NodeSource
+	dst.InstalledNodeVersion = observed.InstalledNodeVersion
+	dst.NodeBaseVersion = observed.NodeBaseVersion
+	dst.NodeBuildNumber = observed.NodeBuildNumber
+	dst.NodeBinarySHA256 = observed.NodeBinarySHA256
+	dst.NodeManifestURL = observed.NodeManifestURL
+	dst.NodeManifestCheckedAt = observed.NodeManifestCheckedAt
+	dst.DevNodeSignatureVerified = observed.DevNodeSignatureVerified
+	dst.LatestDevNodeVersion = observed.LatestDevNodeVersion
+	dst.LatestDevNodeURL = observed.LatestDevNodeURL
+	dst.LatestDevNodeSHA256 = observed.LatestDevNodeSHA256
+	dst.LatestDevNodeBuildNumber = observed.LatestDevNodeBuildNumber
+	dst.LastVerifiedAt = observed.LastVerifiedAt
+	dst.LastStartedAt = observed.LastStartedAt
+	dst.PeerID = observed.PeerID
 }
 
 func (l *Loop) readNodeInfo(state *config.State) *nodeinfo.Info {
@@ -1052,19 +1046,29 @@ func (l *Loop) runDu() {
 	if _, err := os.Stat(target); err != nil {
 		return
 	}
-	size, err := dirSize(target)
+	dirSizer := l.DirSize
+	if dirSizer == nil {
+		dirSizer = dirSize
+	}
+	size, err := dirSizer(target)
 	if err != nil {
 		return
 	}
-	state.WorkerStoreBytes = size
-	state.WorkerStoreMeasuredAt = time.Now().UTC()
-	_ = l.saveState(state)
+	measuredAt := time.Now().UTC()
+	_, applied, err := config.UpdateStateIfCurrent(l.StatePath, state, func(current *config.State) error {
+		current.WorkerStoreBytes = size
+		current.WorkerStoreMeasuredAt = measuredAt
+		return nil
+	})
+	if err != nil || !applied {
+		return
+	}
 
 	l.updateNodeStatus(map[string]interface{}{
 		"worker_store_path": target,
 		"node_disk_bytes":   size,
 		"node_disk_sub":     humanBytes(uint64(size)),
-		"measured_at":       state.WorkerStoreMeasuredAt.Format(time.RFC3339),
+		"measured_at":       measuredAt.Format(time.RFC3339),
 	})
 }
 
@@ -1109,11 +1113,16 @@ func (l *Loop) runVersionPoll() {
 				patch["node_update_source"] = nodemanifest.SourceDev
 				patch["node_update_available"] = available
 				patch["version_polled_at"] = now
-				state.LatestDevNodeVersion = latest.Version
-				state.LatestDevNodeURL = artifact.URL
-				state.LatestDevNodeSHA256 = artifact.SHA256
-				state.LatestDevNodeBuildNumber = latest.BuildNumber
-				_ = l.saveState(state)
+				_, applied, err := config.UpdateStateIfCurrent(l.StatePath, state, func(current *config.State) error {
+					current.LatestDevNodeVersion = latest.Version
+					current.LatestDevNodeURL = artifact.URL
+					current.LatestDevNodeSHA256 = artifact.SHA256
+					current.LatestDevNodeBuildNumber = latest.BuildNumber
+					return nil
+				})
+				if err != nil || !applied {
+					return
+				}
 			}
 		}
 		if len(patch) > 0 {
@@ -1126,7 +1135,9 @@ func (l *Loop) runVersionPoll() {
 		patch["node_update_source"] = nodemanifest.SourceUnknown
 		patch["node_update_available"] = false
 		patch["version_polled_at"] = now
-		l.updateNodeStatus(patch)
+		if config.StateIsCurrent(l.StatePath, state) {
+			l.updateNodeStatus(patch)
+		}
 		return
 	}
 
@@ -1147,7 +1158,7 @@ func (l *Loop) runVersionPoll() {
 		patch["version_polled_at"] = now
 	}
 
-	if len(patch) > 0 {
+	if len(patch) > 0 && config.StateIsCurrent(l.StatePath, state) {
 		l.updateNodeStatus(patch)
 	}
 }
