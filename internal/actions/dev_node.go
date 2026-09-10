@@ -29,86 +29,122 @@ type DevNodeInstaller interface {
 	InstallLatest(platform, binaryPath, manifestURL string) (DevNodeInstallResult, error)
 }
 
+type DevNodePreparer interface {
+	PrepareLatest(platform, binaryPath, manifestURL string) (*PreparedDevNode, error)
+}
+
+type PreparedDevNode struct {
+	Result     DevNodeInstallResult
+	BinaryPath string
+	cleanup    func()
+}
+
+func (p *PreparedDevNode) Cleanup() {
+	if p != nil && p.cleanup != nil {
+		p.cleanup()
+		p.cleanup = nil
+	}
+}
+
 type ManifestDevNodeInstaller struct {
 	publicKeyBase64 string
 	progress        func(step string, progress float64)
 }
 
 func (i ManifestDevNodeInstaller) InstallLatest(platform, binaryPath, manifestURL string) (DevNodeInstallResult, error) {
+	prepared, err := i.PrepareLatest(platform, binaryPath, manifestURL)
+	if err != nil {
+		return DevNodeInstallResult{}, err
+	}
+	defer prepared.Cleanup()
+	i.emitProgress("installing_binary", 0.65)
+	if err := installDevNodeBinary(prepared.BinaryPath, binaryPath); err != nil {
+		return DevNodeInstallResult{}, err
+	}
+	return prepared.Result, nil
+}
+
+func (i ManifestDevNodeInstaller) PrepareLatest(platform, binaryPath, manifestURL string) (*PreparedDevNode, error) {
 	platform = strings.TrimSpace(platform)
 	if strings.TrimSpace(platform) == "" {
-		return DevNodeInstallResult{}, fmt.Errorf("missing platform")
+		return nil, fmt.Errorf("missing platform")
 	}
 	if platform == "linux-arm64" {
-		return DevNodeInstallResult{}, fmt.Errorf("Dev node is not available for Linux ARM64 yet. Please use the official release node on this server.")
+		return nil, fmt.Errorf("Dev node is not available for Linux ARM64 yet. Please use the official release node on this server.")
 	}
 	if strings.TrimSpace(binaryPath) == "" {
-		return DevNodeInstallResult{}, fmt.Errorf("missing binary path")
+		return nil, fmt.Errorf("missing binary path")
 	}
 	if strings.TrimSpace(manifestURL) == "" {
 		manifestURL = nodemanifest.DefaultURL
 	}
 	manifest, err := nodemanifest.Fetch(manifestURL)
 	if err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("fetch node manifest: %w", err)
+		return nil, fmt.Errorf("fetch node manifest: %w", err)
 	}
 	latest, artifact, ok := manifest.LatestDev(platform)
 	if !ok {
-		return DevNodeInstallResult{}, fmt.Errorf("node manifest missing latest dev artifact for %s", platform)
+		return nil, fmt.Errorf("node manifest missing latest dev artifact for %s", platform)
 	}
 	if strings.TrimSpace(artifact.URL) == "" {
-		return DevNodeInstallResult{}, fmt.Errorf("latest dev artifact missing url for %s", platform)
+		return nil, fmt.Errorf("latest dev artifact missing url for %s", platform)
 	}
 	if strings.TrimSpace(artifact.SignatureURL) == "" {
-		return DevNodeInstallResult{}, fmt.Errorf("latest dev artifact missing signature_url for %s", platform)
+		return nil, fmt.Errorf("latest dev artifact missing signature_url for %s", platform)
 	}
 
 	releaseDir, cleanupReleaseDir, err := makeNodeReleaseTempDir(binaryPath)
 	if err != nil {
-		return DevNodeInstallResult{}, err
+		return nil, err
 	}
-	defer cleanupReleaseDir()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			cleanupReleaseDir()
+		}
+	}()
 
 	tmpBinary := filepath.Join(releaseDir, "dev-node-"+platform)
 	if err := nodemanifest.DownloadFile(artifact.URL, tmpBinary); err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("download dev node: %w", err)
+		return nil, fmt.Errorf("download dev node: %w", err)
 	}
 	binary, err := os.ReadFile(tmpBinary)
 	if err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("read dev node: %w", err)
+		return nil, fmt.Errorf("read dev node: %w", err)
 	}
 	tmpSignature := filepath.Join(releaseDir, "dev-node-"+platform+".sig")
 	if err := nodemanifest.DownloadFile(artifact.SignatureURL, tmpSignature); err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("download dev node signature: %w", err)
+		return nil, fmt.Errorf("download dev node signature: %w", err)
 	}
 	signatureRaw, err := os.ReadFile(tmpSignature)
 	if err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("read dev node signature: %w", err)
+		return nil, fmt.Errorf("read dev node signature: %w", err)
 	}
 	i.emitProgress("verifying_signature", 0.50)
 	if err := i.verifySignature(binary, signatureRaw); err != nil {
-		return DevNodeInstallResult{}, err
+		return nil, err
 	}
 	gotSHA, err := nodemanifest.HashFile(tmpBinary)
 	if err != nil {
-		return DevNodeInstallResult{}, fmt.Errorf("hash dev node: %w", err)
+		return nil, fmt.Errorf("hash dev node: %w", err)
 	}
 	if !strings.EqualFold(gotSHA, artifact.SHA256) {
-		return DevNodeInstallResult{}, fmt.Errorf("dev node sha mismatch: got %s want %s", gotSHA, artifact.SHA256)
+		return nil, fmt.Errorf("dev node sha mismatch: got %s want %s", gotSHA, artifact.SHA256)
 	}
-	i.emitProgress("installing_binary", 0.65)
-	if err := installDevNodeBinary(tmpBinary, binaryPath); err != nil {
-		return DevNodeInstallResult{}, err
-	}
-	return DevNodeInstallResult{
-		Version:           latest.Version,
-		BaseVersion:       latest.BaseVersion,
-		BuildNumber:       latest.BuildNumber,
-		SHA256:            gotSHA,
-		URL:               artifact.URL,
-		ManifestURL:       manifestURL,
-		SignatureVerified: true,
-		CheckedAt:         time.Now().UTC(),
+	cleanup = false
+	return &PreparedDevNode{
+		BinaryPath: tmpBinary,
+		cleanup:    cleanupReleaseDir,
+		Result: DevNodeInstallResult{
+			Version:           latest.Version,
+			BaseVersion:       latest.BaseVersion,
+			BuildNumber:       latest.BuildNumber,
+			SHA256:            gotSHA,
+			URL:               artifact.URL,
+			ManifestURL:       manifestURL,
+			SignatureVerified: true,
+			CheckedAt:         time.Now().UTC(),
+		},
 	}, nil
 }
 
