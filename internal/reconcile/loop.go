@@ -384,6 +384,9 @@ func (l *Loop) runVerify() {
 		"qclient_binary_path": l.qclientBinaryPath(),
 	}
 	if !qclientInstalled {
+		state.QClientBinaryPath = ""
+		state.QClientVersion = ""
+		state.QClientInstalledAt = time.Time{}
 		nodePatch["qclient_status"] = "not_installed"
 		nodePatch["qclient_allocations"] = []qclient.Allocation{}
 	}
@@ -543,6 +546,9 @@ func (l *Loop) runVerify() {
 
 func applyVerifyState(dst, observed *config.State) {
 	dst.NodeVersion = observed.NodeVersion
+	dst.QClientBinaryPath = observed.QClientBinaryPath
+	dst.QClientVersion = observed.QClientVersion
+	dst.QClientInstalledAt = observed.QClientInstalledAt
 	dst.NodeSource = observed.NodeSource
 	dst.InstalledNodeVersion = observed.InstalledNodeVersion
 	dst.NodeBaseVersion = observed.NodeBaseVersion
