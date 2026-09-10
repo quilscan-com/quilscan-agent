@@ -29,6 +29,7 @@ type QClientInstallDeps struct {
 	UpdateState            func(func(*config.State) error) (*config.State, error)
 	EmitRaw                func(map[string]interface{})
 	PatchNodeStatus        func(map[string]interface{})
+	transactionOps         fileTransactionOps
 }
 
 func NewInstallQClientHandler(d QClientInstallDeps) Handler {
@@ -124,8 +125,13 @@ func installQClient(d QClientInstallDeps, progress func(step string, progress fl
 	if progress != nil {
 		progress("installing_binary", 0.75)
 	}
-	if err := installQClientBinary(versionedBinary, d.BinaryPath); err != nil {
+	tx, err := prepareQClientTransaction(versionedBinary, d.BinaryPath, d.transactionOps)
+	if err != nil {
 		return "", err
+	}
+	defer func() { _ = tx.Finalize() }()
+	if err := tx.Commit(); err != nil {
+		return "", withRollbackOutcome(err, tx.Rollback)
 	}
 
 	installedAt := time.Now().UTC()
@@ -136,7 +142,7 @@ func installQClient(d QClientInstallDeps, progress func(step string, progress fl
 			state.QClientInstalledAt = installedAt
 			return nil
 		}); err != nil {
-			return "", err
+			return "", withRollbackOutcome(err, tx.Rollback)
 		}
 	}
 
@@ -219,47 +225,6 @@ func verifyQClientReleaseDigest(versionedBinary string) error {
 		return fmt.Errorf("qclient digest mismatch")
 	}
 	return nil
-}
-
-func installQClientBinary(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fmt.Errorf("mkdir bin dir: %w", err)
-	}
-	removeQClientSidecars(dst)
-	if err := moveFile(src, dst, 0o755); err != nil {
-		return err
-	}
-	for _, source := range qclientSidecarSources(src) {
-		final := dst + strings.TrimPrefix(source, src)
-		if err := moveFile(source, final, 0o644); err != nil {
-			return fmt.Errorf("install qclient sidecar %s: %w", filepath.Base(source), err)
-		}
-	}
-	return nil
-}
-
-func qclientSidecarSources(src string) []string {
-	var sources []string
-	for _, suffix := range []string{".dgst", ".sig"} {
-		path := src + suffix
-		if _, err := os.Stat(path); err == nil {
-			sources = append(sources, path)
-		}
-	}
-	if sigs, err := filepath.Glob(src + ".dgst.sig.*"); err == nil {
-		sources = append(sources, sigs...)
-	}
-	return sources
-}
-
-func removeQClientSidecars(binaryPath string) {
-	_ = os.Remove(binaryPath + ".dgst")
-	_ = os.Remove(binaryPath + ".sig")
-	if sigs, err := filepath.Glob(binaryPath + ".dgst.sig.*"); err == nil {
-		for _, sig := range sigs {
-			_ = os.Remove(sig)
-		}
-	}
 }
 
 func qclientFileExists(path string) bool {
