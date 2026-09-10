@@ -387,7 +387,7 @@ func run() {
 				StartStop:       sdCtl,
 				Reload:          sdCtl.Reload,
 				Downloader:      actions.ReleaseDownloader{},
-				DevInstaller:    actions.ManifestDevNodeInstaller{},
+				DevPreparer:     actions.ManifestDevNodeInstaller{},
 				NodeManifestURL: nodemanifest.DefaultURL,
 				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
 				UpdateState:     updateState,

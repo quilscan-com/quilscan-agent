@@ -3,6 +3,7 @@ package actions
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
@@ -10,33 +11,45 @@ import (
 
 const nodeSignatureCheckDisabledArg = "--signature-check=false"
 
-func (d NodeSourceSwitcherDeps) setNodeSignatureCheckDisabled(disabled bool) error {
+func (d NodeSourceSwitcherDeps) prepareNodeServiceTransaction(disabled bool) (*fileTransaction, error) {
 	if strings.TrimSpace(d.UnitDir) == "" {
-		return nil
+		return nil, nil
 	}
 	path := svcctl.UnitFilePath(d.UnitDir, d.UnitName)
 	st, err := os.Stat(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	patched, changed, err := patchNodeServiceSignatureCheck(string(raw), disabled)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !changed {
-		return nil
+		return nil, nil
 	}
-	if err := os.WriteFile(path, []byte(patched), st.Mode().Perm()); err != nil {
-		return err
+	candidate, err := os.CreateTemp(filepath.Dir(path), ".quilscan-service-candidate-*")
+	if err != nil {
+		return nil, err
 	}
-	if d.Reload != nil {
-		return d.Reload()
+	candidatePath := candidate.Name()
+	if err := candidate.Close(); err != nil {
+		_ = os.Remove(candidatePath)
+		return nil, err
 	}
-	return nil
+	defer os.Remove(candidatePath)
+	if err := os.WriteFile(candidatePath, []byte(patched), st.Mode().Perm()); err != nil {
+		return nil, err
+	}
+	return prepareFileTransaction([]fileTransactionCandidate{{
+		source:      candidatePath,
+		destination: path,
+		mode:        st.Mode().Perm(),
+		binary:      true,
+	}}, []string{path}, d.transactionOps)
 }
 
 func patchNodeServiceSignatureCheck(raw string, disabled bool) (string, bool, error) {
