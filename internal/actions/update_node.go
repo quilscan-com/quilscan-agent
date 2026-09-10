@@ -14,6 +14,12 @@ var (
 	ErrDevNodeAutoUpdateRequiresDev = errors.New("Dev Node auto update requires node source dev")
 )
 
+type NodeUpdateService interface {
+	Start(unit string) error
+	Stop(unit string) error
+	IsActive(unit string) bool
+}
+
 // NodeUpdaterDeps wires the update_node flow:
 //
 //	stop → download → install binary → start
@@ -27,14 +33,10 @@ type NodeUpdaterDeps struct {
 	BinaryPath string
 	Platform   string
 
-	// Service control: Start/Stop the unit.
-	StartStop interface {
-		Start(unit string) error
-		Stop(unit string) error
-	}
+	StartStop NodeUpdateService
 
 	Downloader      Downloader
-	DevInstaller    DevNodeInstaller
+	DevPreparer     DevNodePreparer
 	NodeManifestURL string
 	LoadState       func() (*config.State, error)
 	UpdateState     func(func(*config.State) error) (*config.State, error)
@@ -44,6 +46,7 @@ type NodeUpdaterDeps struct {
 	// stale `node_update_available: true` doesn't linger for up to an hour
 	// (until the next runVersionPoll tick).
 	PatchNodeStatus func(patch map[string]interface{})
+	transactionOps  fileTransactionOps
 }
 
 // NewUpdateNodeHandler returns a Handler for the update_node action.
@@ -77,16 +80,9 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			return updateDevNode(c, emit, d, state)
 		}
 
-		emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
-		if err := d.StartStop.Stop(d.UnitName); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
-		}
-
 		releaseDir, cleanupReleaseDir, err := makeNodeReleaseTempDir(d.BinaryPath)
 		if err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			_ = d.StartStop.Start(d.UnitName)
 			return err
 		}
 		defer cleanupReleaseDir()
@@ -94,37 +90,45 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		emit(Status{ID: c.ID, Step: "downloading", Progress: 0.35})
 		if err := d.Downloader.Download(version, d.Platform, releaseDir); err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			_ = d.StartStop.Start(d.UnitName)
+			return err
+		}
+
+		versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
+		tx, err := prepareNodeReleaseTransaction(versionedBinary, d.BinaryPath, d.transactionOps)
+		if err != nil {
+			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+			return err
+		}
+		defer func() { _ = tx.Finalize() }()
+
+		wasActive := d.StartStop.IsActive(d.UnitName)
+		emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
+		if err := d.StartStop.Stop(d.UnitName); err != nil {
+			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
 
 		emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.65})
-		versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
-		if err := installNodeBinary(versionedBinary, d.BinaryPath); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			_ = d.StartStop.Start(d.UnitName)
-			return err
+		if err := tx.Commit(); err != nil {
+			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
 
 		emit(Status{ID: c.ID, Step: "starting", Progress: 0.92})
 		if err := d.StartStop.Start(d.UnitName); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
+			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
 
 		startedAt := time.Now().UTC()
 		if d.UpdateState == nil {
 			err := fmt.Errorf("UpdateState dep missing")
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
+			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
 		if _, err := d.UpdateState(func(latest *config.State) error {
 			latest.NodeVersion = version
 			latest.LastStartedAt = startedAt
 			return nil
 		}); err != nil {
-			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-			return err
+			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
 
 		// Refresh reconcile's cached node_status so the frontend sees the
@@ -170,63 +174,95 @@ func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.Sta
 	if manifestURL == "" {
 		manifestURL = nodemanifest.DefaultURL
 	}
-	installer := d.DevInstaller
-	if installer == nil {
-		installer = ManifestDevNodeInstaller{
+	preparer := d.DevPreparer
+	if preparer == nil {
+		preparer = ManifestDevNodeInstaller{
 			progress: func(step string, progress float64) {
 				emit(Status{ID: c.ID, Step: step, Progress: progress})
 			},
 		}
 	}
 
+	emit(Status{ID: c.ID, Step: "downloading", Progress: 0.35})
+	prepared, err := preparer.PrepareLatest(d.Platform, d.BinaryPath, manifestURL)
+	if err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+	defer prepared.Cleanup()
+	tx, err := prepareDevNodeTransaction(prepared.BinaryPath, d.BinaryPath, d.transactionOps)
+	if err != nil {
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+	defer func() { _ = tx.Finalize() }()
+
+	wasActive := d.StartStop.IsActive(d.UnitName)
 	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
 	if err := d.StartStop.Stop(d.UnitName); err != nil {
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}
-
-	emit(Status{ID: c.ID, Step: "downloading", Progress: 0.35})
-	result, err := installer.InstallLatest(d.Platform, d.BinaryPath, manifestURL)
-	if err != nil {
-		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-		_ = d.StartStop.Start(d.UnitName)
-		return err
+	emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.65})
+	if err := tx.Commit(); err != nil {
+		return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 	}
 
 	emit(Status{ID: c.ID, Step: "starting", Progress: 0.92})
 	if err := d.StartStop.Start(d.UnitName); err != nil {
-		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-		return err
+		return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 	}
 
 	startedAt := time.Now().UTC()
 	if d.UpdateState == nil {
 		err := fmt.Errorf("UpdateState dep missing")
-		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-		return err
+		return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 	}
 	if _, err := d.UpdateState(func(latest *config.State) error {
-		applyDevInstallResult(latest, result)
+		applyDevInstallResult(latest, prepared.Result)
 		latest.LastStartedAt = startedAt
 		return nil
 	}); err != nil {
-		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
-		return err
+		return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 	}
 
 	if d.PatchNodeStatus != nil {
-		d.PatchNodeStatus(nodeStatusPatchForDevResult(result, false))
+		d.PatchNodeStatus(nodeStatusPatchForDevResult(prepared.Result, false))
 	}
 	if d.EmitRaw != nil {
 		d.EmitRaw(map[string]interface{}{
 			"type":         "node_updated",
 			"from_version": fromVersion,
-			"to_version":   result.Version,
+			"to_version":   prepared.Result.Version,
 			"node_source":  nodemanifest.SourceDev,
 		})
 	}
 	emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 	return nil
+}
+
+func failNodeUpdate(c Command, emit Emitter, operation error, tx *fileTransaction, service NodeUpdateService, unit string, wasActive bool) error {
+	err := withRollbackOutcome(operation, func() error {
+		return rollbackNodeUpdate(tx, service, unit, wasActive)
+	})
+	emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+	return err
+}
+
+func rollbackNodeUpdate(tx *fileTransaction, service NodeUpdateService, unit string, wasActive bool) error {
+	var rollbackErrors []error
+	if err := service.Stop(unit); err != nil {
+		rollbackErrors = append(rollbackErrors, fmt.Errorf("stop replacement service: %w", err))
+	}
+	if err := tx.Rollback(); err != nil {
+		rollbackErrors = append(rollbackErrors, err)
+	}
+	if len(rollbackErrors) == 0 && wasActive {
+		if err := service.Start(unit); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restart previous service: %w", err))
+		}
+	}
+	return errors.Join(rollbackErrors...)
 }
 
 func applyDevInstallResult(state *config.State, result DevNodeInstallResult) {
