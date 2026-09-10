@@ -133,24 +133,23 @@ func SaveState(path string, s *State) error {
 	if s == nil {
 		return errNilState
 	}
+	_, statErr := os.Stat(path)
+	exists := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
 	currentGeneration := stateGenerationUnlocked(path)
-	if s.stateGenerationSet && s.stateGeneration < currentGeneration {
+	if exists && (!s.stateGenerationSet || s.stateGeneration != currentGeneration) {
 		return ErrStaleState
 	}
-	current, err := loadStateUnlocked(path)
-	if err == nil {
-		if current.DevNodeAutoUpdateRevision > s.DevNodeAutoUpdateRevision {
-			preserveDevNodeAutoUpdateState(s, current)
-		}
-		if current.NodeManifestCheckedAt.After(s.NodeManifestCheckedAt) {
-			preserveNewerNodeManifestState(s, current)
-		}
+	if s.stateGenerationSet && s.stateGeneration != currentGeneration {
+		return ErrStaleState
 	}
 	if err := saveStateUnlocked(path, s); err != nil {
 		return err
 	}
-	s.stateGeneration = currentGeneration
-	s.stateGenerationSet = true
+	incrementStateGenerationUnlocked(path)
+	setStateGenerationUnlocked(path, s)
 	return nil
 }
 
@@ -175,10 +174,47 @@ func UpdateState(path string, mutate func(*State) error) (*State, error) {
 	if err := saveStateUnlocked(path, state); err != nil {
 		return nil, err
 	}
-	state.stateGeneration = stateGenerationUnlocked(path)
-	state.stateGenerationSet = true
+	incrementStateGenerationUnlocked(path)
+	setStateGenerationUnlocked(path, state)
 	copy := *state
 	return &copy, nil
+}
+
+// UpdateStateIfCurrent mutates and saves the latest State only when snapshot
+// still represents the current generation. A stale snapshot returns
+// applied=false without reading, mutating, or writing the state file.
+func UpdateStateIfCurrent(path string, snapshot *State, mutate func(*State) error) (*State, bool, error) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	if snapshot == nil || !snapshot.stateGenerationSet || snapshot.stateGeneration != stateGenerationUnlocked(path) {
+		return nil, false, nil
+	}
+	if mutate == nil {
+		return nil, false, errors.New("state mutation is required")
+	}
+	state, err := loadStateUnlocked(path)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := mutate(state); err != nil {
+		return nil, false, err
+	}
+	if err := saveStateUnlocked(path, state); err != nil {
+		return nil, false, err
+	}
+	incrementStateGenerationUnlocked(path)
+	setStateGenerationUnlocked(path, state)
+	copy := *state
+	return &copy, true, nil
+}
+
+// StateIsCurrent reports whether snapshot still represents the current
+// in-process generation for path.
+func StateIsCurrent(path string, snapshot *State) bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return snapshot != nil && snapshot.stateGenerationSet && snapshot.stateGeneration == stateGenerationUnlocked(path)
 }
 
 // RemoveState removes a state file while coordinating with state reads,
@@ -292,6 +328,11 @@ func incrementStateGenerationUnlocked(path string) {
 	stateGenerations[stateGenerationKey(path)]++
 }
 
+func setStateGenerationUnlocked(path string, state *State) {
+	state.stateGeneration = stateGenerationUnlocked(path)
+	state.stateGenerationSet = true
+}
+
 func stateGenerationKey(path string) string {
 	clean := filepath.Clean(path)
 	abs, err := filepath.Abs(clean)
@@ -299,32 +340,6 @@ func stateGenerationKey(path string) string {
 		return clean
 	}
 	return abs
-}
-
-func preserveDevNodeAutoUpdateState(dst, src *State) {
-	dst.DevNodeAutoUpdateRevision = src.DevNodeAutoUpdateRevision
-	dst.DevNodeAutoUpdateEnabled = src.DevNodeAutoUpdateEnabled
-	dst.DevNodeAutoUpdateLastEventID = src.DevNodeAutoUpdateLastEventID
-	dst.DevNodeAutoUpdateLastResult = src.DevNodeAutoUpdateLastResult
-	dst.DevNodeAutoUpdateLastFromVersion = src.DevNodeAutoUpdateLastFromVersion
-	dst.DevNodeAutoUpdateLastTargetVersion = src.DevNodeAutoUpdateLastTargetVersion
-	dst.DevNodeAutoUpdateLastCompletedAt = src.DevNodeAutoUpdateLastCompletedAt
-	dst.DevNodeAutoUpdateLastFailedTargetVersion = src.DevNodeAutoUpdateLastFailedTargetVersion
-}
-
-func preserveNewerNodeManifestState(dst, src *State) {
-	dst.NodeSource = src.NodeSource
-	dst.InstalledNodeVersion = src.InstalledNodeVersion
-	dst.NodeBaseVersion = src.NodeBaseVersion
-	dst.NodeBuildNumber = src.NodeBuildNumber
-	dst.NodeBinarySHA256 = src.NodeBinarySHA256
-	dst.NodeManifestURL = src.NodeManifestURL
-	dst.NodeManifestCheckedAt = src.NodeManifestCheckedAt
-	dst.DevNodeSignatureVerified = src.DevNodeSignatureVerified
-	dst.LatestDevNodeVersion = src.LatestDevNodeVersion
-	dst.LatestDevNodeURL = src.LatestDevNodeURL
-	dst.LatestDevNodeSHA256 = src.LatestDevNodeSHA256
-	dst.LatestDevNodeBuildNumber = src.LatestDevNodeBuildNumber
 }
 
 func saveStateUnlocked(path string, s *State) error {
