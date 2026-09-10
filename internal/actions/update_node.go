@@ -37,7 +37,7 @@ type NodeUpdaterDeps struct {
 	DevInstaller    DevNodeInstaller
 	NodeManifestURL string
 	LoadState       func() (*config.State, error)
-	SaveState       func(*config.State) error
+	UpdateState     func(func(*config.State) error) (*config.State, error)
 	EmitRaw         func(map[string]interface{})
 	// PatchNodeStatus folds an authoritative patch into reconcile's cached
 	// node_status snapshot. Used right after a successful update so the
@@ -112,14 +112,17 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			return err
 		}
 
-		state.NodeVersion = version
-		state.LastStartedAt = time.Now().UTC()
-		if d.SaveState == nil {
-			err := fmt.Errorf("SaveState dep missing")
+		startedAt := time.Now().UTC()
+		if d.UpdateState == nil {
+			err := fmt.Errorf("UpdateState dep missing")
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
-		if err := d.SaveState(state); err != nil {
+		if _, err := d.UpdateState(func(latest *config.State) error {
+			latest.NodeVersion = version
+			latest.LastStartedAt = startedAt
+			return nil
+		}); err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
@@ -196,14 +199,17 @@ func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.Sta
 		return err
 	}
 
-	applyDevInstallResult(state, result)
-	state.LastStartedAt = time.Now().UTC()
-	if d.SaveState == nil {
-		err := fmt.Errorf("SaveState dep missing")
+	startedAt := time.Now().UTC()
+	if d.UpdateState == nil {
+		err := fmt.Errorf("UpdateState dep missing")
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}
-	if err := d.SaveState(state); err != nil {
+	if _, err := d.UpdateState(func(latest *config.State) error {
+		applyDevInstallResult(latest, result)
+		latest.LastStartedAt = startedAt
+		return nil
+	}); err != nil {
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}

@@ -51,10 +51,10 @@ type InstallDeps struct {
 	// Linux ignores it (journalctl handles logging).
 	NodeLogPath string
 
-	// State persistence — symmetric load/save so the handler can read whatever
-	// previous run wrote, mutate selected fields, and write the full record back.
-	LoadState func() (*config.State, error)
-	SaveState func(*config.State) error
+	// State persistence. Slow install work stays outside UpdateState; the final
+	// callback merges only install-owned fields into the latest record.
+	LoadState   func() (*config.State, error)
+	UpdateState func(func(*config.State) error) (*config.State, error)
 
 	// Optional: emit arbitrary backend event (used for meta_update after success).
 	EmitRaw func(map[string]interface{})
@@ -356,36 +356,39 @@ func NewInstallHandler(d InstallDeps) Handler {
 			return err
 		}
 
-		// === Persist full state ===
+		// Persist only install-owned fields into the latest state.
 		var savedState *config.State
-		if d.SaveState != nil {
+		if d.UpdateState != nil {
 			now := time.Now().UTC()
-			ns := &config.State{
-				ConfigPath:    cfgDir,
-				BinaryPath:    d.BinaryPath,
-				ServiceUnit:   d.UnitName,
-				NodeVersion:   stateNodeVersion,
-				InstallSource: source,
-				InstalledAt:   now,
-			}
-			if nodeSource == nodemanifest.SourceDev {
-				applyDevInstallResult(ns, devResult)
-			} else {
-				ns.NodeSource = nodemanifest.SourceReleases
-				ns.InstalledNodeVersion = version
-				ns.NodeBaseVersion = version
-				ns.NodeBuildNumber = 0
-				ns.NodeManifestURL = nodeManifestURL(d.NodeManifestURL)
-				ns.NodeManifestCheckedAt = now
-			}
+			migratedFrom := ""
 			if source == "migrated" {
-				ns.MigratedFrom, _ = c.Args["config_path"].(string)
+				migratedFrom, _ = c.Args["config_path"].(string)
 			}
-			if err := d.SaveState(ns); err != nil {
+			var err error
+			savedState, err = d.UpdateState(func(state *config.State) error {
+				state.ConfigPath = cfgDir
+				state.BinaryPath = d.BinaryPath
+				state.ServiceUnit = d.UnitName
+				state.NodeVersion = stateNodeVersion
+				state.InstallSource = source
+				state.InstalledAt = now
+				state.MigratedFrom = migratedFrom
+				if nodeSource == nodemanifest.SourceDev {
+					applyDevInstallResult(state, devResult)
+				} else {
+					state.NodeSource = nodemanifest.SourceReleases
+					state.InstalledNodeVersion = version
+					state.NodeBaseVersion = version
+					state.NodeBuildNumber = 0
+					state.NodeManifestURL = nodeManifestURL(d.NodeManifestURL)
+					state.NodeManifestCheckedAt = now
+				}
+				return nil
+			})
+			if err != nil {
 				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 				return err
 			}
-			savedState = ns
 		}
 
 		if d.EmitRaw != nil {

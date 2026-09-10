@@ -92,6 +92,16 @@ func NewDeleteNodeStoreHandler(d DeleteNodeStoreDeps) Handler {
 			}
 			item = &StoreBackupItem{Label: target, From: src, To: dst}
 		}
+		if target == "worker-store" {
+			if _, err := config.UpdateState(d.StatePath, func(current *config.State) error {
+				current.WorkerStoreBytes = 0
+				current.WorkerStoreMeasuredAt = time.Time{}
+				return nil
+			}); err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: fmt.Sprintf("save state: %v", err)})
+				return err
+			}
+		}
 
 		if d.PatchNodeStatus != nil {
 			patch := map[string]interface{}{
@@ -104,19 +114,12 @@ func NewDeleteNodeStoreHandler(d DeleteNodeStoreDeps) Handler {
 				"node_store_backup_status": "moved",
 			}
 			if target == "worker-store" {
-				state.WorkerStoreBytes = 0
-				state.WorkerStoreMeasuredAt = time.Time{}
-				_ = config.SaveState(d.StatePath, state)
 				patch["node_disk_bytes"] = int64(0)
 				patch["node_disk_sub"] = ""
 				patch["worker_store_bytes"] = int64(0)
 				patch["worker_store_measured_at"] = ""
 			}
 			d.PatchNodeStatus(patch)
-		} else if target == "worker-store" {
-			state.WorkerStoreBytes = 0
-			state.WorkerStoreMeasuredAt = time.Time{}
-			_ = config.SaveState(d.StatePath, state)
 		}
 
 		if d.EmitRaw != nil {

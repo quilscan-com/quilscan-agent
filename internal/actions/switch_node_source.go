@@ -26,7 +26,7 @@ type NodeSourceSwitcherDeps struct {
 	NodeManifestURL       string
 	LatestOfficialVersion func(platform string) (string, error)
 	LoadState             func() (*config.State, error)
-	SaveState             func(*config.State) error
+	UpdateState           func(func(*config.State) error) (*config.State, error)
 	EmitRaw               func(map[string]interface{})
 	PatchNodeStatus       func(patch map[string]interface{})
 }
@@ -99,9 +99,17 @@ func switchToDevNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, state *c
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}
-	applyDevInstallResult(state, result)
-	state.LastStartedAt = time.Now().UTC()
-	if err := d.SaveState(state); err != nil {
+	startedAt := time.Now().UTC()
+	if d.UpdateState == nil {
+		err := fmt.Errorf("UpdateState dep missing")
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+	if _, err := d.UpdateState(func(latest *config.State) error {
+		applyDevInstallResult(latest, result)
+		latest.LastStartedAt = startedAt
+		return nil
+	}); err != nil {
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}
@@ -178,16 +186,27 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 		return err
 	}
 
-	state.NodeSource = nodemanifest.SourceReleases
-	state.InstalledNodeVersion = latest
-	state.NodeBaseVersion = latest
-	state.NodeBuildNumber = 0
-	state.NodeBinarySHA256 = sha
-	state.NodeManifestURL = nodeManifestURL(d.NodeManifestURL)
-	state.NodeManifestCheckedAt = time.Now().UTC()
-	state.NodeVersion = latest
-	state.LastStartedAt = time.Now().UTC()
-	if err := d.SaveState(state); err != nil {
+	checkedAt := time.Now().UTC()
+	manifestURL := nodeManifestURL(d.NodeManifestURL)
+	if d.UpdateState == nil {
+		err := fmt.Errorf("UpdateState dep missing")
+		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+		return err
+	}
+	persisted, err := d.UpdateState(func(current *config.State) error {
+		current.NodeSource = nodemanifest.SourceReleases
+		current.InstalledNodeVersion = latest
+		current.NodeBaseVersion = latest
+		current.NodeBuildNumber = 0
+		current.NodeBinarySHA256 = sha
+		current.NodeManifestURL = manifestURL
+		current.NodeManifestCheckedAt = checkedAt
+		current.DevNodeSignatureVerified = false
+		current.NodeVersion = latest
+		current.LastStartedAt = checkedAt
+		return nil
+	})
+	if err != nil {
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
 	}
@@ -198,8 +217,8 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 			"node_base_version":        latest,
 			"node_build_number":        0,
 			"node_binary_sha256":       sha,
-			"node_manifest_url":        state.NodeManifestURL,
-			"node_manifest_checked_at": state.NodeManifestCheckedAt.Format(time.RFC3339),
+			"node_manifest_url":        persisted.NodeManifestURL,
+			"node_manifest_checked_at": persisted.NodeManifestCheckedAt.Format(time.RFC3339),
 			"current_node_version":     latest,
 			"node_info_version":        latest,
 			"node_version":             latest,

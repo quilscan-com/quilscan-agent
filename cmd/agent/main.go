@@ -167,6 +167,9 @@ func run() {
 			})
 		}
 	}
+	updateState := func(mutate func(*config.State) error) (*config.State, error) {
+		return config.UpdateState(defaults.StatePath, mutate)
+	}
 	// Post-install hook: wait for node's auto-generated config.yml, set
 	// loopback listen multiaddrs (without overriding user values), restart
 	// the service so the agent can talk to RPC. Persists rpc_patched flag.
@@ -183,15 +186,7 @@ func run() {
 		}
 		log.Printf("[rpcconfig] grpc=%s rest=%s restarted=%v",
 			res.GRPCFinalValue, res.RESTFinalValue, res.Restarted)
-		// Persist patched ports
-		s, _ := config.LoadState(defaults.StatePath)
-		if s != nil {
-			s.RPCPatched = true
-			s.RPCGRPCPort = rpcconfig.GRPCPort
-			s.RPCRESTPort = rpcconfig.RESTPort
-			s.RPCPatchedAt = time.Now().UTC()
-			_ = config.SaveState(defaults.StatePath, s)
-		}
+		_ = persistRPCPatch(defaults.StatePath, time.Now().UTC())
 		_ = client.Send(map[string]interface{}{
 			"type":           "rpc_patched",
 			"grpc_multiaddr": res.GRPCFinalValue,
@@ -220,12 +215,12 @@ func run() {
 	}
 	qclientInstallDeps := func() actions.QClientInstallDeps {
 		return actions.QClientInstallDeps{
-			BinaryPath: defaults.QClientBinaryPath,
-			Platform:   platform,
-			Downloader: actions.QClientReleaseDownloader{BaseURL: qclientReleaseURL},
-			LoadState:  func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-			SaveState:  func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
-			EmitRaw:    func(m map[string]interface{}) { _ = client.Send(m) },
+			BinaryPath:  defaults.QClientBinaryPath,
+			Platform:    platform,
+			Downloader:  actions.QClientReleaseDownloader{BaseURL: qclientReleaseURL},
+			LoadState:   func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
+			UpdateState: updateState,
+			EmitRaw:     func(m map[string]interface{}) { _ = client.Send(m) },
 			PatchNodeStatus: func(patch map[string]interface{}) {
 				if rec != nil {
 					rec.PatchNodeStatus(patch)
@@ -258,7 +253,7 @@ func run() {
 		User:             installUser,
 		NodeLogPath:      defaults.NodeLogPath,
 		LoadState:        func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-		SaveState:        func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+		UpdateState:      updateState,
 		EmitRaw:          func(m map[string]interface{}) { _ = client.Send(m) },
 		OnInstalled:      onInstalled,
 		InstallQClient:   installQClient,
@@ -273,7 +268,7 @@ func run() {
 		DevInstaller:    actions.ManifestDevNodeInstaller{},
 		NodeManifestURL: nodemanifest.DefaultURL,
 		LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-		SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+		UpdateState:     updateState,
 		EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
 		PatchNodeStatus: func(patch map[string]interface{}) {
 			if rec != nil {
@@ -395,7 +390,7 @@ func run() {
 				DevInstaller:    actions.ManifestDevNodeInstaller{},
 				NodeManifestURL: nodemanifest.DefaultURL,
 				LoadState:       func() (*config.State, error) { return config.LoadState(defaults.StatePath) },
-				SaveState:       func(s *config.State) error { return config.SaveState(defaults.StatePath, s) },
+				UpdateState:     updateState,
 				EmitRaw:         func(m map[string]interface{}) { _ = client.Send(m) },
 				PatchNodeStatus: func(patch map[string]interface{}) {
 					if rec != nil {
@@ -589,6 +584,17 @@ func run() {
 
 	log.Printf("quilscan-agent %s: connecting to %s", version, cfg.BackendURL)
 	client.Run(ctx)
+}
+
+func persistRPCPatch(statePath string, patchedAt time.Time) error {
+	_, err := config.UpdateState(statePath, func(state *config.State) error {
+		state.RPCPatched = true
+		state.RPCGRPCPort = rpcconfig.GRPCPort
+		state.RPCRESTPort = rpcconfig.RESTPort
+		state.RPCPatchedAt = patchedAt
+		return nil
+	})
+	return err
 }
 
 // hasExistingNode reports whether the agent should consider a node installed

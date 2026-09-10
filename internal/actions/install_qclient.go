@@ -26,7 +26,7 @@ type QClientInstallDeps struct {
 	Downloader             QClientDownloader
 	SigningPublicKeyBase64 string
 	LoadState              func() (*config.State, error)
-	SaveState              func(*config.State) error
+	UpdateState            func(func(*config.State) error) (*config.State, error)
 	EmitRaw                func(map[string]interface{})
 	PatchNodeStatus        func(map[string]interface{})
 }
@@ -128,19 +128,14 @@ func installQClient(d QClientInstallDeps, progress func(step string, progress fl
 		return "", err
 	}
 
-	var state *config.State
-	if d.LoadState != nil {
-		state, _ = d.LoadState()
-	}
-	if state == nil {
-		state = &config.State{}
-	}
 	installedAt := time.Now().UTC()
-	state.QClientBinaryPath = d.BinaryPath
-	state.QClientVersion = version
-	state.QClientInstalledAt = installedAt
-	if d.SaveState != nil {
-		if err := d.SaveState(state); err != nil {
+	if d.UpdateState != nil {
+		if _, err := d.UpdateState(func(state *config.State) error {
+			state.QClientBinaryPath = d.BinaryPath
+			state.QClientVersion = version
+			state.QClientInstalledAt = installedAt
+			return nil
+		}); err != nil {
 			return "", err
 		}
 	}
