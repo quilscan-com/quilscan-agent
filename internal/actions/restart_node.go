@@ -7,7 +7,7 @@ var ErrNodeNotRunning = errors.New("node is not running")
 
 // NodeRestarter is the service-manager seam used by restart_node.
 type NodeRestarter interface {
-	Restart(name string) error
+	RestartAndWait(name string) error
 	IsActive(name string) bool
 }
 
@@ -18,8 +18,8 @@ type RestartNodeDeps struct {
 }
 
 // NewRestartNodeHandler asks the platform service manager to restart a
-// currently running Node. A done status means the manager accepted the request;
-// normal reconciliation observes the resulting Node state asynchronously.
+// currently running Node. A done status means the blocking service-manager
+// restart job returned successfully; application health remains asynchronous.
 func NewRestartNodeHandler(deps RestartNodeDeps) Handler {
 	return func(command Command, emit Emitter) error {
 		if deps.Svc == nil || !deps.Svc.IsActive(deps.UnitName) {
@@ -27,7 +27,7 @@ func NewRestartNodeHandler(deps RestartNodeDeps) Handler {
 			return ErrNodeNotRunning
 		}
 		emit(Status{ID: command.ID, Step: "restarting", Progress: 0.5})
-		if err := deps.Svc.Restart(deps.UnitName); err != nil {
+		if err := deps.Svc.RestartAndWait(deps.UnitName); err != nil {
 			emit(Status{ID: command.ID, Step: "failed", Error: err.Error()})
 			return err
 		}

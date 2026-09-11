@@ -33,6 +33,10 @@ func (systemdCtl) Restart(name string) error {
 	return run("restart", "--no-block", name)
 }
 
+func (systemdCtl) RestartAndWait(name string) error {
+	return run("restart", name)
+}
+
 func (systemdCtl) IsActive(name string) bool {
 	return exec.Command("systemctl", "is-active", "--quiet", name).Run() == nil
 }

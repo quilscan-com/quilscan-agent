@@ -86,6 +86,9 @@ type Ctl interface {
 	// --no-block so a self-restart from inside the service does not
 	// deadlock; on macOS uses launchctl kickstart -k for the same reason.
 	Restart(name string) error
+	// RestartAndWait bounces a different service and waits for the service
+	// manager's restart job to finish. It must not be used for self-restart.
+	RestartAndWait(name string) error
 	// Enable marks the service to start at boot/login. On Linux:
 	// systemctl enable. On macOS this is a no-op because the launchd
 	// plist's RunAtLoad attribute already encodes that behaviour.

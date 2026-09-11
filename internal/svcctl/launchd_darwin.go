@@ -79,6 +79,10 @@ func (l launchdCtl) Restart(label string) error {
 	return launchctl("kickstart", "-k", l.domainTarget(label))
 }
 
+func (l launchdCtl) RestartAndWait(label string) error {
+	return l.Restart(label)
+}
+
 // Enable is a no-op on macOS: the plist's RunAtLoad / KeepAlive attributes
 // already control whether the job runs at user-login time.
 func (launchdCtl) Enable(string) error { return nil }
