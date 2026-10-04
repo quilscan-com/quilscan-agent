@@ -3,12 +3,19 @@
 package svcctl
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+)
+
+const (
+	launchdStopTimeout      = 30 * time.Second
+	launchdStopPollInterval = 100 * time.Millisecond
 )
 
 // launchdCtl wraps launchctl invocations for both legacy user LaunchAgents
@@ -63,10 +70,21 @@ func (l launchdCtl) Start(label string) error {
 // We picked bootout over `launchctl stop` because stop is deprecated and
 // only sends a hint; bootout reliably terminates the process.
 func (l launchdCtl) Stop(label string) error {
-	if !l.isLoaded(label) {
+	out, err := exec.Command("launchctl", "print", l.domainTarget(label)).Output()
+	if err != nil {
 		return nil
 	}
-	return launchctl("bootout", l.domainTarget(label))
+	pid := parsePid(string(out))
+	if err := launchctl("bootout", l.domainTarget(label)); err != nil {
+		return err
+	}
+	if pid <= 0 {
+		return nil
+	}
+	if err := waitForPIDExit(pid, launchdStopTimeout, launchdStopPollInterval, processAlive); err != nil {
+		return fmt.Errorf("wait for %s to stop: %w", label, err)
+	}
+	return nil
 }
 
 // Restart uses kickstart -k which kills the existing process and starts
@@ -196,6 +214,28 @@ func parsePid(out string) int {
 		}
 	}
 	return 0
+}
+
+func waitForPIDExit(pid int, timeout, pollInterval time.Duration, alive func(int) bool) error {
+	if pid <= 0 || alive == nil {
+		return nil
+	}
+	if pollInterval <= 0 {
+		pollInterval = launchdStopPollInterval
+	}
+	deadline := time.Now().Add(timeout)
+	for alive(pid) {
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("process %d did not exit within %s", pid, timeout)
+		}
+		time.Sleep(pollInterval)
+	}
+	return nil
+}
+
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func launchctl(args ...string) error {
