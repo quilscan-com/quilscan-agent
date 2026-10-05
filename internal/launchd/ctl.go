@@ -1,8 +1,18 @@
 package launchd
 
 import (
+	"errors"
+	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
+)
+
+const (
+	stopTimeout      = 30 * time.Second
+	stopPollInterval = 100 * time.Millisecond
 )
 
 // Ctl is the macOS counterpart to systemd.Ctl. It satisfies the small
@@ -27,10 +37,22 @@ func (c Ctl) Start(name string) error {
 // succeed.
 func (c Ctl) Stop(name string) error {
 	domain := c.domain()
-	if !isLoaded(domain, name) {
+	target := launchTarget(domain, name)
+	out, err := launchctlOutput("print", target)
+	if err != nil {
 		return nil
 	}
-	return launchctl("bootout", launchTarget(domain, name))
+	pid := parseLaunchdPID(out)
+	if err := launchctl("bootout", target); err != nil {
+		return err
+	}
+	if pid <= 0 {
+		return nil
+	}
+	if err := waitForPIDExit(pid, stopTimeout, stopPollInterval, processAlive); err != nil {
+		return fmt.Errorf("wait for %s to stop: %w", name, err)
+	}
+	return nil
 }
 
 // Disable on macOS is the same as Stop — bootout removes the job and
@@ -67,6 +89,42 @@ func (c Ctl) IsActive(name string) bool {
 func launchctlOutput(args ...string) (string, error) {
 	out, err := exec.Command("launchctl", args...).CombinedOutput()
 	return string(out), err
+}
+
+func parseLaunchdPID(out string) int {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "pid = ") {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "pid = ")))
+		if err == nil {
+			return pid
+		}
+	}
+	return 0
+}
+
+func waitForPIDExit(pid int, timeout, pollInterval time.Duration, alive func(int) bool) error {
+	if pid <= 0 || alive == nil {
+		return nil
+	}
+	if pollInterval <= 0 {
+		pollInterval = stopPollInterval
+	}
+	deadline := time.Now().Add(timeout)
+	for alive(pid) {
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("process %d did not exit within %s", pid, timeout)
+		}
+		time.Sleep(pollInterval)
+	}
+	return nil
+}
+
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func (c Ctl) unitDirOrDefault() string {
