@@ -16,7 +16,7 @@ type QClientManageActionDeps struct {
 	ManagedConfigDir  string
 	LoadState         func() (*config.State, error)
 	Runner            func(context.Context, qclient.ManageActionRequest, time.Duration) (*qclient.ManageActionResult, error)
-	AllocationsRunner func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
+	AllocationsRunner func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
 	PatchNodeStatus   func(map[string]interface{})
 }
 
@@ -81,10 +81,12 @@ func NewQClientManageActionHandler(d QClientManageActionDeps) Handler {
 		}
 
 		if d.PatchNodeStatus != nil {
-			if rows := refreshAllocationsAfterManageAction(d, baseReq); rows != nil {
+			if snapshot := refreshAllocationsAfterManageAction(d, baseReq); snapshot != nil {
 				d.PatchNodeStatus(map[string]interface{}{
-					"qclient_allocations":              rows,
-					"qclient_allocations_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+					"qclient_manage_snapshot":              snapshot,
+					"qclient_allocations":                  snapshot.Allocations,
+					"qclient_available_shards":             snapshot.AvailableShards,
+					"qclient_manage_snapshot_refreshed_at": time.Now().UTC().Format(time.RFC3339),
 				})
 			}
 		}
@@ -97,16 +99,16 @@ func NewQClientManageActionHandler(d QClientManageActionDeps) Handler {
 	}
 }
 
-func refreshAllocationsAfterManageAction(d QClientManageActionDeps, req qclient.RunRequest) []qclient.Allocation {
+func refreshAllocationsAfterManageAction(d QClientManageActionDeps, req qclient.RunRequest) *qclient.ManageSnapshot {
 	runner := d.AllocationsRunner
 	if runner == nil {
 		runner = qclient.RunManageOnce
 	}
-	rows, err := runner(context.Background(), req, 60*time.Second)
+	snapshot, err := runner(context.Background(), req, 60*time.Second)
 	if err != nil {
 		return nil
 	}
-	return rows
+	return snapshot
 }
 
 func manageActionArg(args map[string]interface{}) (string, error) {

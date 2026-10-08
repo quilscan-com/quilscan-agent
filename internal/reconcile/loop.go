@@ -108,7 +108,7 @@ type Loop struct {
 
 	NodeInfoRunner             func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
 	QClientStatusRunner        func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
-	QClientManageRunner        func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
+	QClientManageRunner        func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
 	QClientTokenBalancesRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.TokenBalances, error)
 	PeerConnectionsLogReader   func(context.Context, string, string, int, time.Duration) (int, bool)
 	DirSize                    func(string) (int64, error)
@@ -388,7 +388,9 @@ func (l *Loop) runVerify() {
 		state.QClientVersion = ""
 		state.QClientInstalledAt = time.Time{}
 		nodePatch["qclient_status"] = "not_installed"
-		nodePatch["qclient_allocations"] = []qclient.Allocation{}
+		nodePatch["qclient_allocations"] = []qclient.SnapshotAllocation{}
+		nodePatch["qclient_available_shards"] = []qclient.AvailableShard{}
+		nodePatch["qclient_manage_snapshot"] = nil
 	}
 	if detection.HasNode {
 		mergePatch(nodePatch, l.refreshNodeManifestState(state, now))
@@ -442,8 +444,11 @@ func (l *Loop) runVerify() {
 			} else {
 				nodePatch["qclient_status"] = "unavailable"
 			}
-			if allocations := l.readQClientAllocations(state); allocations != nil {
-				nodePatch["qclient_allocations"] = allocations
+			if snapshot := l.readQClientManageSnapshot(state); snapshot != nil {
+				nodePatch["qclient_manage_snapshot"] = snapshot
+				nodePatch["qclient_allocations"] = snapshot.Allocations
+				nodePatch["qclient_available_shards"] = snapshot.AvailableShards
+				nodePatch["qclient_manage_snapshot_refreshed_at"] = now.Format(time.RFC3339)
 			}
 		}
 		if foundPeerID == "" {
@@ -479,7 +484,9 @@ func (l *Loop) runVerify() {
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
 		nodePatch["node_connections"] = nil
-		nodePatch["qclient_allocations"] = []qclient.Allocation{}
+		nodePatch["qclient_allocations"] = []qclient.SnapshotAllocation{}
+		nodePatch["qclient_available_shards"] = []qclient.AvailableShard{}
+		nodePatch["qclient_manage_snapshot"] = nil
 	}
 	// Surface the node service start timestamp so the UI can show how long the
 	// managed quilibrium-node has been running, separate from the agent-process
@@ -826,7 +833,7 @@ func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatu
 	return status
 }
 
-func (l *Loop) readQClientAllocations(state *config.State) []qclient.Allocation {
+func (l *Loop) readQClientManageSnapshot(state *config.State) *qclient.ManageSnapshot {
 	runner := l.QClientManageRunner
 	if runner == nil {
 		runner = qclient.RunManageOnce
@@ -837,11 +844,11 @@ func (l *Loop) readQClientAllocations(state *config.State) []qclient.Allocation 
 		ConfigPath: cfg,
 		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
 	}
-	allocations, err := runner(context.Background(), req, 30*time.Second)
+	snapshot, err := runner(context.Background(), req, 30*time.Second)
 	if err != nil {
 		return nil
 	}
-	return allocations
+	return snapshot
 }
 
 func applyQClientStatus(patch map[string]interface{}, status *qclient.ProverStatus) {

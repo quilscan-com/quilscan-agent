@@ -1,30 +1,95 @@
 package qclient
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
 
-type Allocation struct {
-	Filter               string `json:"filter"`
-	Provers              int64  `json:"provers"`
-	Ring                 int64  `json:"ring"`
-	SizeMB               string `json:"sizeMb"`
-	Shards               int64  `json:"shards"`
-	MaterializedFrame    string `json:"materializedFrame"`
-	Lag                  string `json:"lag"`
-	MaterializationState string `json:"materializationState"`
-	Reward               string `json:"reward"`
-	Worker               string `json:"worker"`
-	Status               string `json:"status"`
-	Mode                 string `json:"mode"`
-	NextAction           string `json:"nextAction"`
-	DefaultAction        string `json:"defaultAction"`
+type ManageSnapshot struct {
+	SchemaVersion       int                  `json:"schema_version"`
+	PeerID              string               `json:"peer_id"`
+	FrameNumber         uint64               `json:"frame_number"`
+	LastReceivedFrame   uint64               `json:"last_received_frame"`
+	LastGlobalHead      uint64               `json:"last_global_head"`
+	CurrentEpoch        uint64               `json:"current_epoch"`
+	EpochLengthFrames   uint64               `json:"epoch_length_frames"`
+	RunningWorkers      uint64               `json:"running_workers"`
+	AllocatedWorkers    uint64               `json:"allocated_workers"`
+	WorkerInfoAvailable bool                 `json:"worker_info_available"`
+	Reachable           bool                 `json:"reachable"`
+	Allocations         []SnapshotAllocation `json:"allocations"`
+	AvailableShards     []AvailableShard     `json:"available_shards"`
+}
+
+type GlobalHead struct {
+	Frame       uint64 `json:"frame"`
+	GlobalFrame uint64 `json:"global_frame"`
+	Generation  uint64 `json:"generation"`
+}
+
+type WorkerExecution struct {
+	State                 string  `json:"state"`
+	Blocker               string  `json:"blocker"`
+	MaterializedFrame     *uint64 `json:"materialized_frame"`
+	LastAdvanceUnixMillis uint64  `json:"last_advance_unix_ms"`
+	ObservedUnixMillis    uint64  `json:"observed_unix_ms"`
+}
+
+type SnapshotAllocation struct {
+	Filter                string           `json:"filter"`
+	Worker                *int64           `json:"worker"`
+	Status                string           `json:"status"`
+	Mode                  *string          `json:"mode"`
+	ActiveProvers         *uint64          `json:"active_provers"`
+	Ring                  *int64           `json:"ring"`
+	SizeBytes             *string          `json:"size_bytes"`
+	DataShards            *uint64          `json:"data_shards"`
+	PeerMaterializedFrame *uint64          `json:"peer_materialized_frame"`
+	PeerHead              *uint64          `json:"peer_head"`
+	PeerState             string           `json:"peer_state"`
+	GlobalHead            *GlobalHead      `json:"global_head"`
+	Execution             *WorkerExecution `json:"execution"`
+	LocalExecutionState   string           `json:"local_execution_state"`
+	ExecutionDetail       string           `json:"execution_detail"`
+	ExecutionSeverity     string           `json:"execution_severity"`
+	RewardUnitsPerFrame   *string          `json:"reward_units_per_frame"`
+	RewardQuilPerDay      *string          `json:"reward_quil_per_day"`
+	NextAction            string           `json:"next_action"`
+	DefaultAction         string           `json:"default_action"`
+}
+
+type AvailableShard struct {
+	Filter                string      `json:"filter"`
+	ActiveProvers         uint64      `json:"active_provers"`
+	Ring                  *int64      `json:"ring"`
+	SizeBytes             string      `json:"size_bytes"`
+	DataShards            uint64      `json:"data_shards"`
+	PeerMaterializedFrame uint64      `json:"peer_materialized_frame"`
+	PeerHead              *uint64     `json:"peer_head"`
+	PeerState             string      `json:"peer_state"`
+	GlobalHead            *GlobalHead `json:"global_head"`
+	RewardUnitsPerFrame   *string     `json:"reward_units_per_frame"`
+	RewardQuilPerDay      *string     `json:"reward_quil_per_day"`
+}
+
+func ParseManageSnapshot(raw string) (*ManageSnapshot, error) {
+	var snapshot ManageSnapshot
+	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
+		return nil, fmt.Errorf("parse qclient manage snapshot JSON: %w", err)
+	}
+	if snapshot.SchemaVersion != 1 {
+		return nil, fmt.Errorf("unsupported qclient manage snapshot schema_version %d", snapshot.SchemaVersion)
+	}
+	if snapshot.Allocations == nil {
+		snapshot.Allocations = []SnapshotAllocation{}
+	}
+	if snapshot.AvailableShards == nil {
+		snapshot.AvailableShards = []AvailableShard{}
+	}
+	return &snapshot, nil
 }
 
 type ManageActionRequest struct {
@@ -38,7 +103,7 @@ type ManageActionResult struct {
 	Output string `json:"output"`
 }
 
-func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) ([]Allocation, error) {
+func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (*ManageSnapshot, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
@@ -54,7 +119,7 @@ func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (
 	if err != nil {
 		return nil, fmt.Errorf("run %s %s: %w", req.BinaryPath, strings.Join(args, " "), err)
 	}
-	return ParseManageAllocations(string(out))
+	return ParseManageSnapshot(string(out))
 }
 
 func RunManageAction(ctx context.Context, req ManageActionRequest, timeout time.Duration) (*ManageActionResult, error) {
@@ -115,203 +180,6 @@ func directProverActionArgs(action string, filters []string, workers []uint32) (
 		return args, nil
 	default:
 		return nil, fmt.Errorf("unsupported qclient prover action %q", action)
-	}
-}
-
-func ParseManageAllocations(raw string) ([]Allocation, error) {
-	var rows []Allocation
-	inAllocations := false
-	sc := bufio.NewScanner(strings.NewReader(raw))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "Allocations") {
-			inAllocations = true
-			continue
-		}
-		if inAllocations && strings.HasPrefix(line, "Available Shards") {
-			break
-		}
-		if !inAllocations || strings.HasPrefix(line, "Select ") || !strings.HasPrefix(line, "[") {
-			continue
-		}
-		row, ok := parseAllocationRow(line)
-		if ok {
-			rows = append(rows, row)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return rows, err
-	}
-	return rows, nil
-}
-
-func parseAllocationRow(line string) (Allocation, bool) {
-	fields := strings.Fields(line)
-	markerOffset := 0
-	if len(fields) >= 2 && fields[0] == "[" && fields[1] == "]" {
-		markerOffset = 2
-	} else if len(fields) >= 1 && strings.HasPrefix(fields[0], "[") {
-		markerOffset = 1
-	}
-
-	for _, candidate := range []int{markerOffset, markerOffset + 1} {
-		allocation, ok := parseLatestAllocation(fields, candidate)
-		if !ok {
-			continue
-		}
-		if candidate == markerOffset+1 {
-			allocation.Filter = fields[markerOffset]
-		}
-		return allocation, true
-	}
-	return Allocation{}, false
-}
-
-var signedIntegerPattern = regexp.MustCompile(`^[+-]?[0-9]+$`)
-var unsignedIntegerPattern = regexp.MustCompile(`^[0-9]+$`)
-var decimalPattern = regexp.MustCompile(`^[+-]?[0-9]+(?:\.[0-9]+)?$`)
-var manageSizePattern = regexp.MustCompile(`^(?:[0-9]+(?:\.[0-9]+)?|<0\.1)$`)
-var frameActionHintPattern = regexp.MustCompile(`^f[0-9]+$`)
-var renewActionHintPattern = regexp.MustCompile(`^renew<f[0-9]+$`)
-var activeEpochActionHintPattern = regexp.MustCompile(`^(?:active|departs)@e[0-9]+$`)
-
-func parseLatestAllocation(fields []string, valueOffset int) (Allocation, bool) {
-	const fixedValues = 10
-	if len(fields) < valueOffset+fixedValues {
-		return Allocation{}, false
-	}
-	values := fields[valueOffset : valueOffset+fixedValues]
-	provers, ok := parseManageSignedInteger(values[0])
-	if !ok {
-		return Allocation{}, false
-	}
-	ring, ok := parseManageSignedInteger(values[1])
-	if !ok {
-		return Allocation{}, false
-	}
-	shards, ok := parseManageSignedInteger(values[3])
-	if !ok ||
-		!isManageSize(values[2]) ||
-		!isManageUnsignedInteger(values[4]) ||
-		(values[5] != "-" && !isManageUnsignedInteger(values[5])) ||
-		!isMaterializationState(values[6]) ||
-		!isManageReward(values[7]) ||
-		(values[8] != "-" && !isManageSigned(values[8])) ||
-		!isManageStatus(values[9]) {
-		return Allocation{}, false
-	}
-
-	rest := append([]string(nil), fields[valueOffset+fixedValues:]...)
-	mode := ""
-	if len(rest) > 0 && isManageMode(rest[0]) {
-		mode = rest[0]
-		rest = rest[1:]
-	}
-	nextAction, defaultAction := splitManageActionHints(rest)
-
-	return Allocation{
-		Provers:              provers,
-		Ring:                 ring,
-		SizeMB:               values[2],
-		Shards:               shards,
-		MaterializedFrame:    values[4],
-		Lag:                  values[5],
-		MaterializationState: values[6],
-		Reward:               values[7],
-		Worker:               values[8],
-		Status:               values[9],
-		Mode:                 mode,
-		NextAction:           nextAction,
-		DefaultAction:        defaultAction,
-	}, true
-}
-
-func parseManageSignedInteger(value string) (int64, bool) {
-	if !signedIntegerPattern.MatchString(value) {
-		return 0, false
-	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	return parsed, err == nil
-}
-
-func isManageSigned(value string) bool {
-	_, ok := parseManageSignedInteger(value)
-	return ok
-}
-
-func isManageUnsignedInteger(value string) bool {
-	if !unsignedIntegerPattern.MatchString(value) {
-		return false
-	}
-	_, err := strconv.ParseUint(value, 10, 64)
-	return err == nil
-}
-
-func isManageSize(value string) bool {
-	return manageSizePattern.MatchString(value)
-}
-
-func isMaterializationState(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "unknown", "unmat", "lag", "current":
-		return true
-	default:
-		return false
-	}
-}
-
-func isManageReward(value string) bool {
-	return strings.HasPrefix(value, "~") && decimalPattern.MatchString(strings.TrimPrefix(value, "~"))
-}
-
-func isManageStatus(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "idle", "joining", "active", "paused", "leaving", "expiredjoin", "expiredleave", "re-confirm!", "rejected", "kicked", "unknown":
-		return true
-	default:
-		return false
-	}
-}
-
-func isManageMode(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "a", "auto", "m", "manual":
-		return true
-	default:
-		return false
-	}
-}
-
-func splitManageActionHints(actions []string) (nextAction, defaultAction string) {
-	defaultStart := len(actions)
-	if len(actions) >= 2 &&
-		((actions[len(actions)-2] == "thru" && frameActionHintPattern.MatchString(actions[len(actions)-1])) ||
-			(actions[len(actions)-2] == "epoch" && isManageUnsignedInteger(actions[len(actions)-1]))) {
-		defaultStart -= 2
-	} else if len(actions) > 0 && isSingleManageActionHint(actions[len(actions)-1]) {
-		defaultStart--
-	}
-
-	nextAction = strings.Join(actions[:defaultStart], " ")
-	defaultAction = strings.Join(actions[defaultStart:], " ")
-	if nextAction == "-" {
-		nextAction = ""
-	}
-	if defaultAction == "-" {
-		defaultAction = ""
-	}
-	return nextAction, defaultAction
-}
-
-func isSingleManageActionHint(value string) bool {
-	switch value {
-	case "expired", "re-confirm!", "-":
-		return true
-	default:
-		return renewActionHintPattern.MatchString(value) || activeEpochActionHintPattern.MatchString(value)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 const defaultTokenStatusTimeout = 30 * time.Second
 
 var (
+	decimalPattern        = regexp.MustCompile(`^[+-]?[0-9]+(?:\.[0-9]+)?$`)
 	totalBalancePattern   = regexp.MustCompile(`(?m)^Total balance:\s+([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL(?:\s|$)`)
 	claimableLinePattern  = regexp.MustCompile(`(?m)^Claimable prover rewards:\s+(.+?)\s*$`)
 	claimableValuePattern = regexp.MustCompile(`^([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL(?:\s+\(proven at global frame [0-9]+\))?$`)

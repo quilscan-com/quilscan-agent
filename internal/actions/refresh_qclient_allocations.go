@@ -16,7 +16,7 @@ type RefreshQClientAllocationsDeps struct {
 	QClientBinaryPath string
 	ManagedConfigDir  string
 	LoadState         func() (*config.State, error)
-	Runner            func(context.Context, qclient.RunRequest, time.Duration) ([]qclient.Allocation, error)
+	Runner            func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
 	PatchNodeStatus   func(map[string]interface{})
 }
 
@@ -40,15 +40,17 @@ func NewRefreshQClientAllocationsHandler(d RefreshQClientAllocationsDeps) Handle
 		if runner == nil {
 			runner = qclient.RunManageOnce
 		}
-		rows, err := runner(context.Background(), req, 60*time.Second)
+		snapshot, err := runner(context.Background(), req, 60*time.Second)
 		if err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
 		}
 		if d.PatchNodeStatus != nil {
 			d.PatchNodeStatus(map[string]interface{}{
-				"qclient_allocations":              rows,
-				"qclient_allocations_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+				"qclient_manage_snapshot":              snapshot,
+				"qclient_allocations":                  snapshot.Allocations,
+				"qclient_available_shards":             snapshot.AvailableShards,
+				"qclient_manage_snapshot_refreshed_at": time.Now().UTC().Format(time.RFC3339),
 			})
 		}
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
