@@ -106,12 +106,13 @@ type Loop struct {
 	OfficialArtifactsURL        string
 	OfficialArtifactsFetcher    func(string) (*nodemanifest.OfficialArtifacts, error)
 
-	NodeInfoRunner             func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
-	QClientStatusRunner        func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
-	QClientManageRunner        func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
-	QClientTokenBalancesRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.TokenBalances, error)
-	PeerConnectionsLogReader   func(context.Context, string, string, int, time.Duration) (int, bool)
-	DirSize                    func(string) (int64, error)
+	NodeInfoRunner                func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
+	QClientStatusRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
+	QClientManageRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
+	QClientClaimableRewardsRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.ClaimableRewards, error)
+	QClientTokenBalanceRunner     func(context.Context, qclient.RunRequest, time.Duration) (string, error)
+	PeerConnectionsLogReader      func(context.Context, string, string, int, time.Duration) (int, bool)
+	DirSize                       func(string) (int64, error)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
@@ -275,30 +276,41 @@ func (l *Loop) refreshQClientTokenStatus(ctx context.Context) {
 		WorkDir:    nodeCommandWorkDir(configPath, l.managedConfigDir()),
 	}
 
-	balancesRunner := l.QClientTokenBalancesRunner
-	if balancesRunner == nil {
-		balancesRunner = qclient.RunTokenBalances
+	rewardsRunner := l.QClientClaimableRewardsRunner
+	if rewardsRunner == nil {
+		rewardsRunner = qclient.RunClaimableRewards
 	}
 	if ctx.Err() != nil {
 		return
 	}
-	balances, balancesErr := balancesRunner(ctx, req, 30*time.Second)
+	rewards, rewardsErr := rewardsRunner(ctx, req, 35*time.Second)
 	if ctx.Err() != nil {
 		return
 	}
-	if balancesErr != nil {
+	if rewardsErr == nil && rewards.Known {
+		l.updateNodeStatus(map[string]interface{}{
+			"qclient_claimable_rewards":              rewards.BalanceQuil,
+			"qclient_claimable_rewards_global_frame": rewards.GlobalFrame,
+			"qclient_claimable_rewards_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+	if ctx.Err() != nil {
 		return
 	}
-	refreshedAt := time.Now().UTC().Format(time.RFC3339)
-	patch := map[string]interface{}{
-		"qclient_token_balance":              balances.TokenBalanceQuil,
-		"qclient_token_balance_refreshed_at": refreshedAt,
+	balanceRunner := l.QClientTokenBalanceRunner
+	if balanceRunner == nil {
+		balanceRunner = qclient.RunTokenBalance
 	}
-	if balances.ClaimableRewardsKnown {
-		patch["qclient_claimable_rewards"] = balances.ClaimableRewardsQuil
-		patch["qclient_claimable_rewards_refreshed_at"] = refreshedAt
+	balance, balanceErr := balanceRunner(ctx, req, 90*time.Second)
+	if ctx.Err() != nil {
+		return
 	}
-	l.updateNodeStatus(patch)
+	if balanceErr == nil {
+		l.updateNodeStatus(map[string]interface{}{
+			"qclient_token_balance":              balance,
+			"qclient_token_balance_refreshed_at": time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 }
 
 // verifyLocked is the mutex-guarded entry point used by both the 60s

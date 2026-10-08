@@ -3,7 +3,9 @@ package qclient
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -11,57 +13,76 @@ import (
 const defaultTokenStatusTimeout = 30 * time.Second
 
 var (
-	decimalPattern        = regexp.MustCompile(`^[+-]?[0-9]+(?:\.[0-9]+)?$`)
-	totalBalancePattern   = regexp.MustCompile(`(?m)^Total balance:\s+([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL(?:\s|$)`)
-	claimableLinePattern  = regexp.MustCompile(`(?m)^Claimable prover rewards:\s+(.+?)\s*$`)
-	claimableValuePattern = regexp.MustCompile(`^([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL(?:\s+\(proven at global frame [0-9]+\))?$`)
+	decimalPattern         = regexp.MustCompile(`^[+-]?[0-9]+(?:\.[0-9]+)?$`)
+	totalBalancePattern    = regexp.MustCompile(`(?m)^Total balance:\s+([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL(?:\s|$)`)
+	baseUnitBalancePattern = regexp.MustCompile(`(?m)^([0-9]+) base units across [0-9]+ coins reported unspent by the configured node \(not a finalized balance\)\s*$`)
+	claimableLinePattern   = regexp.MustCompile(`(?m)^Claimable prover rewards:\s+(.+?)\s*$`)
+	claimableValuePattern  = regexp.MustCompile(`^([+-]?[0-9]+(?:\.[0-9]+)?)\s+QUIL \(witness cites global frame ([0-9]+); requires minting\)$`)
 )
 
-const noRewardRecord = "unavailable (no reward record found)"
-
-type TokenBalances struct {
-	TokenBalanceQuil      string
-	ClaimableRewardsQuil  string
-	ClaimableRewardsKnown bool
+type ClaimableRewards struct {
+	BalanceQuil string
+	GlobalFrame uint64
+	Known       bool
 }
 
-// RunTokenBalances runs the official balance command once and extracts both
-// the wallet balance and, when available, the claimable prover reward.
-func RunTokenBalances(ctx context.Context, req RunRequest, timeout time.Duration) (TokenBalances, error) {
-	output, err := runTokenStatusCommand(ctx, req, []string{"token", "balance"}, timeout)
+func RunClaimableRewards(ctx context.Context, req RunRequest, timeout time.Duration) (ClaimableRewards, error) {
+	output, err := runTokenStatusCommand(ctx, req, []string{"token", "claimable-rewards"}, timeout)
 	if err != nil {
-		return TokenBalances{}, err
+		return ClaimableRewards{}, err
 	}
-	return parseTokenBalances(output)
+	return parseClaimableRewards(output)
 }
 
-func parseTokenBalances(output string) (TokenBalances, error) {
-	total := totalBalancePattern.FindStringSubmatch(output)
-	if len(total) != 2 {
-		return TokenBalances{}, fmt.Errorf("qclient token balance output did not contain a Total balance line")
+func parseClaimableRewards(output string) (ClaimableRewards, error) {
+	line := claimableLinePattern.FindStringSubmatch(output)
+	if len(line) != 2 {
+		return ClaimableRewards{}, fmt.Errorf("qclient claimable-rewards output did not contain a Claimable prover rewards line")
 	}
-	balances := TokenBalances{TokenBalanceQuil: total[1]}
-
-	claimableLine := claimableLinePattern.FindStringSubmatch(output)
-	if len(claimableLine) != 2 {
-		return balances, nil
-	}
-	payload := strings.TrimSpace(claimableLine[1])
-	if payload == noRewardRecord {
-		balances.ClaimableRewardsQuil = "0.000000000000"
-		balances.ClaimableRewardsKnown = true
-		return balances, nil
-	}
+	payload := strings.TrimSpace(line[1])
 	if strings.HasPrefix(payload, "unavailable (") {
-		return balances, nil
+		return ClaimableRewards{}, nil
 	}
 	claimable := claimableValuePattern.FindStringSubmatch(payload)
-	if len(claimable) != 2 || !decimalPattern.MatchString(claimable[1]) {
-		return TokenBalances{}, fmt.Errorf("qclient token balance output contained malformed claimable rewards")
+	if len(claimable) != 3 || !decimalPattern.MatchString(claimable[1]) {
+		return ClaimableRewards{}, fmt.Errorf("qclient claimable-rewards output contained a malformed reward")
 	}
-	balances.ClaimableRewardsQuil = claimable[1]
-	balances.ClaimableRewardsKnown = true
-	return balances, nil
+	frame, err := strconv.ParseUint(claimable[2], 10, 64)
+	if err != nil {
+		return ClaimableRewards{}, fmt.Errorf("parse qclient claimable reward global frame: %w", err)
+	}
+	return ClaimableRewards{BalanceQuil: claimable[1], GlobalFrame: frame, Known: true}, nil
+}
+
+func RunTokenBalance(ctx context.Context, req RunRequest, timeout time.Duration) (string, error) {
+	output, err := runTokenStatusCommand(ctx, req, []string{"token", "balance"}, timeout)
+	if err != nil {
+		return "", err
+	}
+	return parseTokenBalance(output)
+}
+
+func parseTokenBalance(output string) (string, error) {
+	if baseUnits := baseUnitBalancePattern.FindStringSubmatch(output); len(baseUnits) == 2 {
+		return tokenBaseUnitsToQuil(baseUnits[1])
+	}
+	if total := totalBalancePattern.FindStringSubmatch(output); len(total) == 2 {
+		return total[1], nil
+	}
+	return "", fmt.Errorf("qclient token balance output did not contain a wallet balance line")
+}
+
+func tokenBaseUnitsToQuil(raw string) (string, error) {
+	value, ok := new(big.Int).SetString(raw, 10)
+	if !ok || value.Sign() < 0 {
+		return "", fmt.Errorf("invalid token base-unit balance %q", raw)
+	}
+	scaled := new(big.Int).Mul(value, big.NewInt(125))
+	unit := new(big.Int).Exp(big.NewInt(10), big.NewInt(12), nil)
+	whole, fraction := new(big.Int), new(big.Int)
+	whole.QuoRem(scaled, unit, fraction)
+	fractionText := fraction.String()
+	return whole.String() + "." + strings.Repeat("0", 12-len(fractionText)) + fractionText, nil
 }
 
 func runTokenStatusCommand(ctx context.Context, req RunRequest, args []string, timeout time.Duration) (string, error) {
