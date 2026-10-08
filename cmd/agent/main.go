@@ -37,7 +37,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.1.9"
+var version = "1.2.0"
 
 type startStopCtl interface {
 	Start(string) error
