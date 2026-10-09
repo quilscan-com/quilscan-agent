@@ -20,6 +20,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/audit"
 	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/devnodeautoupdate"
+	"github.com/quilscan-com/quilscan-agent/internal/diskselection"
 	"github.com/quilscan-com/quilscan-agent/internal/download"
 	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
 	"github.com/quilscan-com/quilscan-agent/internal/launchd"
@@ -141,6 +142,7 @@ func run() {
 			ServiceMode:     agentServiceMode,
 			NodeServiceMode: nodeServiceMode,
 			AgentInstanceID: agentInstanceID,
+			DiskSelect:      true,
 		},
 	}
 
@@ -433,6 +435,13 @@ func run() {
 			}
 		},
 	)
+	diskManager := diskselection.New(ctx, diskselection.Deps{
+		ConfigPath: defaults.ConfigPath, InitialMount: defaults.SelectedDiskMount,
+		InstanceID: agentInstanceID,
+		Emit:       func(selection diskselection.Selection) { _ = client.Send(diskSelectionMessage(selection)) },
+	})
+	diskManager.LoadAndVerify()
+	diskDispatcher := newDiskSelectDispatcher(ctx, diskManager, client.Send)
 	client.OnMessage = func(b []byte) {
 		var env struct {
 			Type   string `json:"type"`
@@ -471,6 +480,10 @@ func run() {
 			logStreamer.Stop()
 			return
 		}
+		if env.Type == "disk_select" {
+			diskDispatcher.Handle(b)
+			return
+		}
 		if env.Type != "cmd" {
 			log.Printf("[control] ignored type=%s", env.Type)
 			return
@@ -489,13 +502,14 @@ func run() {
 	// Background workers — independent of WS connection lifecycle, so they
 	// keep producing data even during reconnect storms.
 	collector = &metrics.Collector{
-		Sender:   client,
-		Tick:     3 * time.Second,
-		IdleTick: 60 * time.Second,
-		Started:  startedAt,
-		DiskPath: "/",
-		UnitName: defaults.NodeServiceName,
-		Svc:      svcctl.New(),
+		Sender:        client,
+		Tick:          3 * time.Second,
+		IdleTick:      60 * time.Second,
+		Started:       startedAt,
+		DiskPath:      "/",
+		DiskSelection: diskManager,
+		UnitName:      defaults.NodeServiceName,
+		Svc:           svcctl.New(),
 	}
 	go collector.Run(ctx)
 
@@ -554,7 +568,10 @@ func run() {
 			"country_code": info.CountryCode,
 		})
 	}
-	client.OnConnected = sendNetinfo
+	client.OnConnected = func() {
+		sendNetinfo()
+		_ = client.Send(diskSelectionMessage(diskManager.Snapshot()))
+	}
 	go func() {
 		t := time.NewTicker(24 * time.Hour)
 		defer t.Stop()

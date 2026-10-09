@@ -1,4 +1,5 @@
-// Package config loads the agent's config.yaml (read-only settings).
+// Package config loads the agent's config.yaml. Disk selection is the only
+// runtime-managed setting; its writer preserves all other YAML content.
 package config
 
 import (
@@ -35,6 +36,7 @@ type Config struct {
 	ServiceMode       string `yaml:"service_mode"`       // user OR system, primarily for macOS migration gating
 	NodeServiceMode   string `yaml:"node_service_mode"`  // user OR system, mirrors the managed node service scope
 	TokenPath         string `yaml:"token_path"`
+	SelectedDiskMount string `yaml:"selected_disk_mount"`
 	StatePath         string `yaml:"state_path"`
 	AuditLogPath      string `yaml:"audit_log_path"`
 	UnitDir           string `yaml:"unit_dir"`           // where the service def file lives
@@ -70,6 +72,7 @@ func DefaultConfig() Config {
 				ServiceMode:       "system",
 				NodeServiceMode:   "system",
 				TokenPath:         filepath.Join(appSupport, "token"),
+				SelectedDiskMount: "/",
 				StatePath:         filepath.Join(appSupport, "state.yaml"),
 				AuditLogPath:      "/Library/Logs/quilscan-agent.log",
 				UnitDir:           "/Library/LaunchDaemons",
@@ -92,6 +95,7 @@ func DefaultConfig() Config {
 			ServiceMode:       "user",
 			NodeServiceMode:   "user",
 			TokenPath:         filepath.Join(appSupport, "token"),
+			SelectedDiskMount: "/",
 			StatePath:         filepath.Join(appSupport, "state.yaml"),
 			AuditLogPath:      filepath.Join(home, "Library/Logs/quilscan-agent.log"),
 			UnitDir:           filepath.Join(home, "Library/LaunchAgents"),
@@ -112,6 +116,7 @@ func DefaultConfig() Config {
 		ServiceMode:       "system",
 		NodeServiceMode:   "system",
 		TokenPath:         "/etc/quilscan-agent/token",
+		SelectedDiskMount: "/",
 		StatePath:         "/etc/quilscan-agent/state.yaml",
 		AuditLogPath:      "/var/log/quilscan-agent.log",
 		UnitDir:           "/etc/systemd/system",
@@ -125,6 +130,7 @@ func DefaultConfig() Config {
 // error. Malformed YAML is surfaced.
 func Load(path string) (Config, error) {
 	cfg := DefaultConfig()
+	cfg.ConfigPath = path
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return cfg, nil
@@ -134,6 +140,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		return cfg, err
+	}
+	if cfg.SelectedDiskMount == "" {
+		cfg.SelectedDiskMount = "/"
 	}
 	return cfg, nil
 }

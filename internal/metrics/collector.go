@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quilscan-com/quilscan-agent/internal/diskinspect"
+	"github.com/quilscan-com/quilscan-agent/internal/diskselection"
+
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/host"
@@ -44,6 +47,9 @@ type Collector struct {
 
 	// DiskPath is the partition whose usage we report (default "/").
 	DiskPath string
+	// DiskSelection supplies the one Agent-owned mount shown in every browser.
+	// Root disk fields above remain unchanged for existing consumers.
+	DiskSelection *diskselection.Manager
 
 	// HostUptime returns the host OS uptime in seconds. nil uses the platform
 	// collector from gopsutil.
@@ -225,14 +231,44 @@ func (c *Collector) sample() map[string]interface{} {
 		frame["mem_points"] = pts
 	}
 
+	var rootSelected *diskselection.SelectedUsage
+	if c.DiskSelection != nil {
+		selection := c.DiskSelection.Snapshot()
+		if selection.State == "ready" && selection.Mountpoint == "/" {
+			rootSelected = &diskselection.SelectedUsage{
+				Usage:           diskinspect.Usage{Mountpoint: "/"},
+				AgentInstanceID: selection.AgentInstanceID,
+				Generation:      selection.Generation,
+			}
+		}
+	}
 	if du, err := disk.Usage(c.DiskPath); err == nil {
 		v := round1(du.UsedPercent)
 		frame["disk"] = v
 		frame["disk_sub"] = fmt.Sprintf("%s / %s", humanBytes(du.Used), humanBytes(du.Total))
 		c.appendPoint(&c.diskPoints, v)
+		if rootSelected != nil {
+			rootSelected.Usage = diskinspect.Usage{
+				Mountpoint: "/", FilesystemType: du.Fstype,
+				UsedBytes: du.Used, FreeBytes: du.Free, TotalBytes: du.Total, UsedPercent: v,
+			}
+		}
 	}
 	if pts := c.snapshotPoints(c.diskPoints); pts != nil {
 		frame["disk_points"] = pts
+		if rootSelected != nil {
+			rootSelected.Points = pts
+		}
+	}
+	if c.DiskSelection != nil {
+		if rootSelected != nil {
+			frame["selected_disk"] = *rootSelected
+		} else {
+			c.DiskSelection.Sample()
+			if latest, ok := c.DiskSelection.Latest(); ok {
+				frame["selected_disk"] = latest
+			}
+		}
 	}
 
 	if uptime, ok := c.systemUptime(); ok {

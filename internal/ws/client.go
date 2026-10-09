@@ -30,6 +30,7 @@ type Meta struct {
 	ServiceMode     string `json:"service_mode"`
 	NodeServiceMode string `json:"node_service_mode"`
 	AgentInstanceID string `json:"agent_instance_id"`
+	DiskSelect      bool   `json:"disk_select"`
 }
 
 // Client is a long-running WebSocket client.
@@ -139,6 +140,7 @@ func (c *Client) authMessage() map[string]interface{} {
 		"service_mode":      c.Meta.ServiceMode,
 		"node_service_mode": c.Meta.NodeServiceMode,
 		"agent_instance_id": c.Meta.AgentInstanceID,
+		"disk_select":       c.Meta.DiskSelect,
 	}
 }
 
