@@ -77,7 +77,7 @@ func EnsureQClientCurrent(d QClientInstallDeps) (string, error) {
 	if err != nil {
 		return current, err
 	}
-	if release.VersionNewerThan(latest, current) {
+	if release.QClientVersionNewerThan(latest, current) {
 		return installQClient(d, nil)
 	}
 	return current, nil

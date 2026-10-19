@@ -40,7 +40,7 @@ func NewRefreshQClientAllocationsHandler(d RefreshQClientAllocationsDeps) Handle
 		if runner == nil {
 			runner = qclient.RunManageOnce
 		}
-		snapshot, err := runner(context.Background(), req, 60*time.Second)
+		snapshot, err := runner(context.Background(), req, qclient.DefaultManageSnapshotTimeout)
 		if err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err

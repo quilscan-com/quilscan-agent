@@ -104,7 +104,7 @@ func refreshAllocationsAfterManageAction(d QClientManageActionDeps, req qclient.
 	if runner == nil {
 		runner = qclient.RunManageOnce
 	}
-	snapshot, err := runner(context.Background(), req, 60*time.Second)
+	snapshot, err := runner(context.Background(), req, qclient.DefaultManageSnapshotTimeout)
 	if err != nil {
 		return nil
 	}

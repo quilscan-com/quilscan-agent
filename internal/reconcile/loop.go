@@ -395,6 +395,15 @@ func (l *Loop) runVerify() {
 		"has_qclient":         qclientInstalled,
 		"qclient_binary_path": l.qclientBinaryPath(),
 	}
+	if strings.HasPrefix(l.Platform, "darwin-") {
+		// The macOS launchd plist writes Node output to this configured file.
+		// Report its size, never its contents; clear a stale size if it disappears.
+		nodePatch["node_log_path"] = l.NodeLogPath
+		nodePatch["node_log_size_bytes"] = nil
+		if info, err := os.Lstat(l.NodeLogPath); err == nil && info.Mode().IsRegular() {
+			nodePatch["node_log_size_bytes"] = info.Size()
+		}
+	}
 	if !qclientInstalled {
 		state.QClientBinaryPath = ""
 		state.QClientVersion = ""
@@ -460,7 +469,7 @@ func (l *Loop) runVerify() {
 				nodePatch["qclient_manage_snapshot"] = snapshot
 				nodePatch["qclient_allocations"] = snapshot.Allocations
 				nodePatch["qclient_available_shards"] = snapshot.AvailableShards
-				nodePatch["qclient_manage_snapshot_refreshed_at"] = now.Format(time.RFC3339)
+				nodePatch["qclient_manage_snapshot_refreshed_at"] = time.Now().UTC().Format(time.RFC3339)
 			}
 		}
 		if foundPeerID == "" {
@@ -856,7 +865,7 @@ func (l *Loop) readQClientManageSnapshot(state *config.State) *qclient.ManageSna
 		ConfigPath: cfg,
 		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
 	}
-	snapshot, err := runner(context.Background(), req, 30*time.Second)
+	snapshot, err := runner(context.Background(), req, qclient.DefaultManageSnapshotTimeout)
 	if err != nil {
 		return nil
 	}
@@ -1225,7 +1234,7 @@ func (l *Loop) patchQClientVersionStatus(state *config.State, patch map[string]i
 	latestQClient, err := qclientFetcher(l.LatestQClientVersionURL, l.Platform)
 	if err == nil && latestQClient != "" {
 		patch["latest_qclient_version"] = latestQClient
-		patch["qclient_update_available"] = !managed || releaseVersionNewerThan(latestQClient, qclientCurrent)
+		patch["qclient_update_available"] = !managed || release.QClientVersionNewerThan(latestQClient, qclientCurrent)
 	}
 }
 

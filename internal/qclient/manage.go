@@ -3,7 +3,9 @@ package qclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -22,6 +24,9 @@ type ManageSnapshot struct {
 	Reachable           bool                 `json:"reachable"`
 	Allocations         []SnapshotAllocation `json:"allocations"`
 	AvailableShards     []AvailableShard     `json:"available_shards"`
+
+	FrameCadence              *FrameCadence `json:"frame_cadence"`
+	AllocationScoringStrategy *string       `json:"allocation_scoring_strategy"`
 }
 
 type GlobalHead struct {
@@ -36,6 +41,9 @@ type WorkerExecution struct {
 	MaterializedFrame     *uint64 `json:"materialized_frame"`
 	LastAdvanceUnixMillis uint64  `json:"last_advance_unix_ms"`
 	ObservedUnixMillis    uint64  `json:"observed_unix_ms"`
+
+	Recovery *ShardRecovery `json:"recovery"`
+	Seal     *SessionSeal   `json:"seal"`
 }
 
 type SnapshotAllocation struct {
@@ -59,6 +67,12 @@ type SnapshotAllocation struct {
 	RewardQuilPerDay      *string          `json:"reward_quil_per_day"`
 	NextAction            string           `json:"next_action"`
 	DefaultAction         string           `json:"default_action"`
+
+	AllocationReason      *string                `json:"allocation_reason"`
+	FrameCadence          *FrameCadence          `json:"frame_cadence"`
+	ProverCounts          *ShardProverCounts     `json:"prover_counts"`
+	RewardQuilPerDayBasis *string                `json:"reward_quil_per_day_basis"`
+	ObservedRewardWindows *ObservedRewardWindows `json:"observed_reward_windows"`
 }
 
 type AvailableShard struct {
@@ -73,6 +87,11 @@ type AvailableShard struct {
 	GlobalHead            *GlobalHead `json:"global_head"`
 	RewardUnitsPerFrame   *string     `json:"reward_units_per_frame"`
 	RewardQuilPerDay      *string     `json:"reward_quil_per_day"`
+
+	FrameCadence          *FrameCadence          `json:"frame_cadence"`
+	ProverCounts          *ShardProverCounts     `json:"prover_counts"`
+	RewardQuilPerDayBasis *string                `json:"reward_quil_per_day_basis"`
+	ObservedRewardWindows *ObservedRewardWindows `json:"observed_reward_windows"`
 }
 
 func ParseManageSnapshot(raw string) (*ManageSnapshot, error) {
@@ -103,11 +122,19 @@ type ManageActionResult struct {
 	Output string `json:"output"`
 }
 
-func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (*ManageSnapshot, error) {
+// DefaultManageSnapshotTimeout allows the client's 20-second connection and
+// 60-second shard RPC deadlines plus time for the remaining reads and JSON.
+const DefaultManageSnapshotTimeout = 120 * time.Second
+
+func manageSnapshotContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
-		timeout = 15 * time.Second
+		timeout = DefaultManageSnapshotTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	return context.WithTimeout(ctx, timeout)
+}
+
+func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (*ManageSnapshot, error) {
+	ctx, cancel := manageSnapshotContext(ctx, timeout)
 	defer cancel()
 
 	args := []string{"node", "prover", "manage", "--once"}
@@ -115,8 +142,27 @@ func RunManageOnce(ctx context.Context, req RunRequest, timeout time.Duration) (
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
-	out, err := cmd.CombinedOutput()
+	// stdout is the snapshot contract. Successful stderr diagnostics must not
+	// enter the JSON parser; Output also bounds captured stderr on exit errors.
+	out, err := cmd.Output()
 	if err != nil {
+		var exitError *exec.ExitError
+		diagnostic := ""
+		if errors.As(err, &exitError) {
+			const maxDiagnosticBytes = 4096
+			stderr := exitError.Stderr
+			if len(stderr) > maxDiagnosticBytes {
+				diagnostic = strings.TrimSpace(string(stderr[:maxDiagnosticBytes])) + " [truncated]"
+			} else {
+				diagnostic = strings.TrimSpace(string(stderr))
+			}
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if diagnostic != "" {
+			return nil, fmt.Errorf("run %s %s: %w: %s", req.BinaryPath, strings.Join(args, " "), err, diagnostic)
+		}
 		return nil, fmt.Errorf("run %s %s: %w", req.BinaryPath, strings.Join(args, " "), err)
 	}
 	return ParseManageSnapshot(string(out))
