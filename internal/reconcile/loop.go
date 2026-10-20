@@ -41,6 +41,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
 	"github.com/quilscan-com/quilscan-agent/internal/qclient"
 	"github.com/quilscan-com/quilscan-agent/internal/release"
+	"github.com/quilscan-com/quilscan-agent/internal/rpcconfig"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 	"gopkg.in/yaml.v3"
 )
@@ -1025,6 +1026,7 @@ func (l *Loop) broadcastConfigYAMLIfChanged(cfgDir string) {
 		"rpc_configured":     rpcState.Configured,
 		"rpc_grpc_multiaddr": rpcState.GRPC,
 		"rpc_rest_multiaddr": rpcState.REST,
+		"node_diagnostics":   rpcconfig.DiagnosticsStatus(b),
 	}
 	if !rpcState.Configured {
 		patch["rpc_config_hint"] = "Enable local gRPC/REST in config.yml to improve node information accuracy."

@@ -279,6 +279,10 @@ user-facing actions include:
 - `delete_node_store`
 - `delete_node_store_backup`
 - `install_qclient`
+- `set_node_diagnostics`: turn the node's `diagnostics.healthReport` or
+  `diagnostics.logRequests` on or off in `config.yml` and set its allowed
+  peers (by preset label or peer ID; the given list replaces the old one).
+  It backs up `config.yml` first; the node applies it on its next restart.
 
 The complete whitelist is wired in `cmd/agent/main.go`. Everything else is
 rejected by `internal/actions/dispatcher.go`.

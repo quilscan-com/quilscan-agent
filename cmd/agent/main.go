@@ -405,6 +405,13 @@ func run() {
 				return rec.RunVerifyNow()
 			}),
 			"install_qclient": actions.NewInstallQClientHandler(qclientInstallDeps()),
+			"set_node_diagnostics": actions.NewSetNodeDiagnosticsHandler(actions.SetNodeDiagnosticsDeps{
+				StatePath:        defaults.StatePath,
+				ManagedConfigDir: defaults.ManagedConfigDir,
+				BackupRootDir:    defaults.BackupRootDir,
+				UnitName:         defaults.NodeServiceName,
+				Svc:              svcctl.New(),
+			}),
 		},
 	}
 
