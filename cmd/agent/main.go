@@ -202,6 +202,18 @@ func run() {
 	// without a circular construction (handler is built before the loop value
 	// is assigned, but only invoked once the loop is already running).
 	var rec *reconcile.Loop
+	logRequestState := &actions.LogRequestState{}
+	invalidateLogRequests := func() {
+		logRequestState.Invalidate()
+		if rec != nil {
+			rec.PatchNodeStatus(actions.LogRequestsInvalidationPatch("Node restart invalidated log requests; refresh required"))
+		}
+	}
+	logHandler := actions.NewQClientLogHandler(actions.QClientLogDeps{StatePath: defaults.StatePath, QClientBinaryPath: defaults.QClientBinaryPath, ManagedConfigDir: defaults.ManagedConfigDir, State: logRequestState, PatchNodeStatus: func(patch map[string]interface{}) {
+		if rec != nil {
+			rec.PatchNodeStatus(patch)
+		}
+	}})
 
 	installUser := "root"
 	if runtime.GOOS == "darwin" {
@@ -294,13 +306,19 @@ func run() {
 
 	d := &actions.Dispatcher{
 		Handlers: map[string]actions.Handler{
-			"install": installHandler,
-			"migrate": actions.NewMigrateHandler(actions.MigrateDeps{Install: installHandler}),
-			"start":   actions.NewStartHandler(sdCtl, defaults.NodeServiceName),
-			"stop":    actions.NewStopHandler(sdCtl, defaults.NodeServiceName),
+			"qclient_log_requests": logHandler,
+			"qclient_log_preview":  logHandler,
+			"qclient_log_approve":  logHandler,
+			"qclient_log_deny":     logHandler,
+			"qclient_log_discard":  logHandler,
+			"install":              installHandler,
+			"migrate":              actions.NewMigrateHandler(actions.MigrateDeps{Install: installHandler}),
+			"start":                actions.NewStartHandler(sdCtl, defaults.NodeServiceName),
+			"stop":                 actions.NewStopHandler(sdCtl, defaults.NodeServiceName),
 			"restart_node": actions.NewRestartNodeHandler(actions.RestartNodeDeps{
-				UnitName: defaults.NodeServiceName,
-				Svc:      svcctl.New(),
+				InvalidateLogRequests: invalidateLogRequests,
+				UnitName:              defaults.NodeServiceName,
+				Svc:                   svcctl.New(),
 			}),
 			"rescan": actions.NewRescanHandler(func() bool {
 				if rec == nil {
@@ -407,6 +425,19 @@ func run() {
 				return rec.RunVerifyNow()
 			}),
 			"install_qclient": actions.NewInstallQClientHandler(qclientInstallDeps()),
+			"set_node_diagnostics": actions.NewSetNodeDiagnosticsHandler(actions.SetNodeDiagnosticsDeps{
+				InvalidateLogRequests: invalidateLogRequests,
+				StatePath:             defaults.StatePath,
+				ManagedConfigDir:      defaults.ManagedConfigDir,
+				BackupRootDir:         defaults.BackupRootDir,
+				UnitName:              defaults.NodeServiceName,
+				Svc:                   svcctl.New(),
+				PatchNodeStatus: func(patch map[string]interface{}) {
+					if rec != nil {
+						rec.PatchNodeStatus(patch)
+					}
+				},
+			}),
 		},
 	}
 
@@ -523,6 +554,7 @@ func run() {
 		reconcileSvc = svcctl.New()
 	}
 	rec = &reconcile.Loop{
+		OnNodeRestart:        logRequestState.Invalidate,
 		StatePath:            defaults.StatePath,
 		UnitName:             defaults.NodeServiceName,
 		BinaryPath:           defaults.NodeBinaryPath,

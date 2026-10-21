@@ -24,6 +24,7 @@ type ManageSnapshot struct {
 	Reachable           bool                 `json:"reachable"`
 	Allocations         []SnapshotAllocation `json:"allocations"`
 	AvailableShards     []AvailableShard     `json:"available_shards"`
+	TUI                 ManageTUI            `json:"tui"`
 
 	FrameCadence              *FrameCadence `json:"frame_cadence"`
 	AllocationScoringStrategy *string       `json:"allocation_scoring_strategy"`
@@ -67,6 +68,7 @@ type SnapshotAllocation struct {
 	RewardQuilPerDay      *string          `json:"reward_quil_per_day"`
 	NextAction            string           `json:"next_action"`
 	DefaultAction         string           `json:"default_action"`
+	TUI                   ManageRowTUI     `json:"tui"`
 
 	AllocationReason      *string                `json:"allocation_reason"`
 	FrameCadence          *FrameCadence          `json:"frame_cadence"`
@@ -76,17 +78,18 @@ type SnapshotAllocation struct {
 }
 
 type AvailableShard struct {
-	Filter                string      `json:"filter"`
-	ActiveProvers         uint64      `json:"active_provers"`
-	Ring                  *int64      `json:"ring"`
-	SizeBytes             string      `json:"size_bytes"`
-	DataShards            uint64      `json:"data_shards"`
-	PeerMaterializedFrame uint64      `json:"peer_materialized_frame"`
-	PeerHead              *uint64     `json:"peer_head"`
-	PeerState             string      `json:"peer_state"`
-	GlobalHead            *GlobalHead `json:"global_head"`
-	RewardUnitsPerFrame   *string     `json:"reward_units_per_frame"`
-	RewardQuilPerDay      *string     `json:"reward_quil_per_day"`
+	Filter                string       `json:"filter"`
+	ActiveProvers         uint64       `json:"active_provers"`
+	Ring                  *int64       `json:"ring"`
+	SizeBytes             string       `json:"size_bytes"`
+	DataShards            uint64       `json:"data_shards"`
+	PeerMaterializedFrame uint64       `json:"peer_materialized_frame"`
+	PeerHead              *uint64      `json:"peer_head"`
+	PeerState             string       `json:"peer_state"`
+	GlobalHead            *GlobalHead  `json:"global_head"`
+	RewardUnitsPerFrame   *string      `json:"reward_units_per_frame"`
+	RewardQuilPerDay      *string      `json:"reward_quil_per_day"`
+	TUI                   ManageRowTUI `json:"tui"`
 
 	FrameCadence          *FrameCadence          `json:"frame_cadence"`
 	ProverCounts          *ShardProverCounts     `json:"prover_counts"`

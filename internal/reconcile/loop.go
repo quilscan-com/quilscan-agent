@@ -62,6 +62,8 @@ type ServiceCtl interface {
 
 // Loop holds the dependencies for the reconcile goroutines.
 type Loop struct {
+	// OnNodeRestart invalidates process-local log preview token bindings.
+	OnNodeRestart     func()
 	StatePath         string
 	UnitName          string // node service identifier (systemd unit / launchd label)
 	BinaryPath        string // node binary path
@@ -116,10 +118,12 @@ type Loop struct {
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
 	// its slice of keys and triggers a send.
-	mu             sync.Mutex
-	nodeStatus     map[string]interface{}
-	lastConfigHash string // hash of last broadcast config.yml — gates re-emit
-	lastFilesHash  string // hash of last broadcast system files — gates re-emit
+	mu sync.Mutex
+	// nodeStatusSendMu orders merge/snapshot/send without holding mu over I/O.
+	nodeStatusSendMu sync.Mutex
+	nodeStatus       map[string]interface{}
+	lastConfigHash   string // hash of last broadcast config.yml — gates re-emit
+	lastFilesHash    string // hash of last broadcast system files — gates re-emit
 
 	// verifyMu serialises calls to runVerify so the 60s ticker and manual
 	// RunVerifyNow triggers cannot race on state.yaml writes / detection
@@ -346,6 +350,7 @@ func (l *Loop) RunVerifyNow() bool {
 // stamp last_verified_at; if the platform service manager reports the unit
 // running we also pull last_started_at.
 func (l *Loop) runVerify() {
+	l.refreshNodeDiagnostics()
 	state, err := config.LoadState(l.StatePath)
 	if err != nil {
 		return
@@ -1277,12 +1282,39 @@ func (l *Loop) PatchNodeStatus(patch map[string]interface{}) {
 // snapshot.node_status as a single object regardless of which loop just
 // fired.
 func (l *Loop) updateNodeStatus(patch map[string]interface{}) {
+	l.nodeStatusSendMu.Lock()
+	defer l.nodeStatusSendMu.Unlock()
 	l.mu.Lock()
 	if l.nodeStatus == nil {
 		// Defensive: PatchNodeStatus can be called by a command handler
 		// before Run() has executed line 103 (goroutine scheduling race).
 		// Without this guard, writing to a nil map panics.
 		l.nodeStatus = map[string]interface{}{}
+	}
+	restarted := false
+	if next, ok := patch["node_started_at"].(string); ok {
+		previous, _ := l.nodeStatus["node_started_at"].(string)
+		oldTime, oldErr := time.Parse(time.RFC3339, previous)
+		newTime, newErr := time.Parse(time.RFC3339, next)
+		if oldErr == nil && newErr == nil && newTime.Sub(oldTime) > 3*time.Second {
+			restarted = true
+		}
+	}
+	if restarted && l.OnNodeRestart != nil {
+		// Actions publish in token-state -> send -> cache lock order. Release
+		// both status locks before invalidating bindings, then serialize the final
+		// cache clear and frame so an older blocked Send cannot arrive afterwards.
+		l.mu.Unlock()
+		l.nodeStatusSendMu.Unlock()
+		l.OnNodeRestart()
+		l.nodeStatusSendMu.Lock()
+		l.mu.Lock()
+	}
+	if restarted {
+		now := time.Now().UTC().Format(time.RFC3339)
+		for _, key := range []string{"qclient_log_requests", "qclient_log_preview"} {
+			l.nodeStatus[key] = map[string]interface{}{"command_id": "", "read_state": "unavailable", "error": "Node restarted; refresh log requests", "refreshed_at": now, "data": nil}
+		}
 	}
 	for k, v := range patch {
 		l.nodeStatus[k] = v

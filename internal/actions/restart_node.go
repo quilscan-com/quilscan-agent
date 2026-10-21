@@ -13,8 +13,9 @@ type NodeRestarter interface {
 
 // RestartNodeDeps configures the managed Node service restart.
 type RestartNodeDeps struct {
-	UnitName string
-	Svc      NodeRestarter
+	UnitName              string
+	Svc                   NodeRestarter
+	InvalidateLogRequests func()
 }
 
 // NewRestartNodeHandler asks the platform service manager to restart a
@@ -25,6 +26,10 @@ func NewRestartNodeHandler(deps RestartNodeDeps) Handler {
 		if deps.Svc == nil || !deps.Svc.IsActive(deps.UnitName) {
 			emit(Status{ID: command.ID, Step: "rejected", Error: ErrNodeNotRunning.Error()})
 			return ErrNodeNotRunning
+		}
+		if deps.InvalidateLogRequests != nil {
+			deps.InvalidateLogRequests()
+			defer deps.InvalidateLogRequests()
 		}
 		emit(Status{ID: command.ID, Step: "restarting", Progress: 0.5})
 		if err := deps.Svc.RestartAndWait(deps.UnitName); err != nil {

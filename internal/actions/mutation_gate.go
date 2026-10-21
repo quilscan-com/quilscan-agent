@@ -45,7 +45,8 @@ func IsMutatingAction(action string) bool {
 	case "install", "migrate", "start", "stop", "restart_node", "update_node",
 		"set_dev_node_auto_update", "switch_node_source", "cleanup_residue",
 		"delete_node_store", "delete_node_store_backup", "qclient_manage_action",
-		"repair_fd_limit", "install_qclient", "update_agent":
+		"repair_fd_limit", "install_qclient", "update_agent", "set_node_diagnostics",
+		"qclient_log_preview", "qclient_log_approve", "qclient_log_deny", "qclient_log_discard":
 		return true
 	default:
 		return false
