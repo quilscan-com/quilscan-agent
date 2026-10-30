@@ -1,10 +1,10 @@
 package qclient
 
-// ManageTUI forwards qclient's display contract without reformatting its text.
+// ManageTUI retains compact display metadata without reformatting its text.
+// Expanded presentation is ignored on input and omitted from all reports.
 type ManageTUI struct {
 	SchemaVersion int           `json:"schema_version"`
 	Compact       ManageTUIView `json:"compact"`
-	Expanded      ManageTUIView `json:"expanded"`
 }
 
 type ManageTUIView struct {
@@ -24,8 +24,7 @@ type ManageTUIColumn struct {
 }
 
 type ManageRowTUI struct {
-	Compact  ManageRowTUIView `json:"compact"`
-	Expanded ManageRowTUIView `json:"expanded"`
+	Compact ManageRowTUIView `json:"compact"`
 }
 
 type ManageRowTUIView struct {

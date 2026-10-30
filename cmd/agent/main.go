@@ -38,7 +38,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.2.1"
+var version = "1.2.2"
 
 type startStopCtl interface {
 	Start(string) error
@@ -325,6 +325,12 @@ func run() {
 					return false
 				}
 				return rec.RunVerifyNow()
+			}),
+			"refresh_qclient_status": actions.NewRefreshQClientStatusHandler(func(commandID string) error {
+				if rec == nil {
+					return fmt.Errorf("status sampler unavailable")
+				}
+				return rec.RefreshQClientStatus(commandID)
 			}),
 			"refresh_qclient_allocations": actions.NewRefreshQClientAllocationsHandler(actions.RefreshQClientAllocationsDeps{
 				StatePath:         defaults.StatePath,

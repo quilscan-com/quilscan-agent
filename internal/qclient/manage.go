@@ -19,6 +19,8 @@ type ManageSnapshot struct {
 	CurrentEpoch        uint64               `json:"current_epoch"`
 	EpochLengthFrames   uint64               `json:"epoch_length_frames"`
 	RunningWorkers      uint64               `json:"running_workers"`
+	WorkerCapacity      *uint64              `json:"worker_capacity"`
+	DrainingWorkers     *uint64              `json:"draining_workers"`
 	AllocatedWorkers    uint64               `json:"allocated_workers"`
 	WorkerInfoAvailable bool                 `json:"worker_info_available"`
 	Reachable           bool                 `json:"reachable"`
@@ -49,6 +51,7 @@ type WorkerExecution struct {
 
 type SnapshotAllocation struct {
 	Filter                string           `json:"filter"`
+	WorkerDraining        *bool            `json:"worker_draining"`
 	Worker                *int64           `json:"worker"`
 	Status                string           `json:"status"`
 	Mode                  *string          `json:"mode"`

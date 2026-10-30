@@ -113,7 +113,7 @@ type Loop struct {
 	QClientManageRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ManageSnapshot, error)
 	QClientClaimableRewardsRunner func(context.Context, qclient.RunRequest, time.Duration) (qclient.ClaimableRewards, error)
 	QClientTokenBalanceRunner     func(context.Context, qclient.RunRequest, time.Duration) (string, error)
-	PeerConnectionsLogReader      func(context.Context, string, string, int, time.Duration) (int, bool)
+	QClientTokenStatusRunner      func(context.Context, qclient.RunRequest, time.Duration, func(qclient.TokenSectionResult)) error
 	DirSize                       func(string) (int64, error)
 
 	// nodeStatus is the cumulative snapshot we publish. Each loop updates
@@ -130,6 +130,7 @@ type Loop struct {
 	// reads. lastManualVerify enforces a small debounce so a user that
 	// mashes the rescan button doesn't spawn back-to-back node-info
 	// subprocesses.
+	qclientStatusMu  sync.Mutex // orders status query and publication across manual/background reads
 	verifyMu         sync.Mutex
 	lastManualVerify time.Time
 }
@@ -142,6 +143,7 @@ const defaultLatestVersionURL = "https://releases.quilibrium.com/release"
 const defaultNodeManifestURL = nodemanifest.DefaultURL
 const defaultOfficialArtifactsURL = nodemanifest.DefaultOfficialArtifactsURL
 const unknownPeerID = "--"
+const nodeRestartTolerance = 3 * time.Second
 
 var nodeVersionPattern = regexp.MustCompile(`\b(?:node-)?([0-9]+(?:\.[0-9]+){3})(?:-[A-Za-z0-9_-]+)?\b`)
 
@@ -280,41 +282,110 @@ func (l *Loop) refreshQClientTokenStatus(ctx context.Context) {
 		WorkDir:    nodeCommandWorkDir(configPath, l.managedConfigDir()),
 	}
 
-	rewardsRunner := l.QClientClaimableRewardsRunner
-	if rewardsRunner == nil {
-		rewardsRunner = qclient.RunClaimableRewards
+	runner := l.QClientTokenStatusRunner
+	if runner == nil {
+		runner = qclient.RunTokenStatus
 	}
-	if ctx.Err() != nil {
+	current := func() bool {
+		return ctx.Err() == nil && config.StateSourceIsCurrent(l.StatePath, state) &&
+			l.qclientBinaryPath() == req.BinaryPath && l.qclientInstalled() &&
+			l.nodeInfoConfigPath(state) == req.ConfigPath
+	}
+	if !current() {
 		return
 	}
-	rewards, rewardsErr := rewardsRunner(ctx, req, 35*time.Second)
-	if ctx.Err() != nil {
+	// Validate the source before querying while retaining last successful amounts.
+	l.updateNodeStatusFromToken(nil, state, req)
+
+	// Callbacks publish each completed section while the command may still be
+	// reading the others. Keep completion and duplicate callbacks ordered, even
+	// when a custom runner invokes callbacks from another goroutine.
+	var resultsMu sync.Mutex
+	seen := map[qclient.TokenSection]bool{}
+	finished := false
+	publish := func(result qclient.TokenSectionResult) {
+		prefix := tokenSectionPrefix(result.Section)
+		if prefix == "" || !current() {
+			return
+		}
+		// A parser may discover a duplicate line after publishing a valid one.
+		// Forward that section's error without replacing its last known value.
+		if seen[result.Section] && (result.Known || result.ReadState != "error") {
+			return
+		}
+		seen[result.Section] = true
+		now := time.Now().UTC().Format(time.RFC3339)
+		patch := map[string]interface{}{
+			prefix + "_read_state":   result.ReadState,
+			prefix + "_error":        result.Error,
+			prefix + "_attempted_at": now,
+		}
+		if result.Known {
+			patch[prefix] = result.BalanceQuil
+			patch[prefix+"_refreshed_at"] = now
+			if result.Section == qclient.TokenRewards {
+				patch[prefix+"_global_frame"] = result.GlobalFrame
+			}
+		}
+		l.updateNodeStatusFromToken(patch, state, req)
+	}
+	runErr := runner(ctx, req, qclient.DefaultTokenStatusTimeout, func(result qclient.TokenSectionResult) {
+		resultsMu.Lock()
+		defer resultsMu.Unlock()
+		if !finished {
+			publish(result)
+		}
+	})
+	resultsMu.Lock()
+	defer resultsMu.Unlock()
+	finished = true
+	if !current() {
 		return
 	}
-	if rewardsErr == nil && rewards.Known {
-		l.updateNodeStatus(map[string]interface{}{
-			"qclient_claimable_rewards":              rewards.BalanceQuil,
-			"qclient_claimable_rewards_global_frame": rewards.GlobalFrame,
-			"qclient_claimable_rewards_refreshed_at": time.Now().UTC().Format(time.RFC3339),
-		})
+	// Production runners report every section. Cover omitted callbacks from
+	// custom runners without changing any section that already reported.
+	for _, section := range []qclient.TokenSection{qclient.TokenRewards, qclient.TokenLegacy, qclient.TokenConfidential} {
+		if seen[section] {
+			continue
+		}
+		result := qclient.TokenSectionResult{Section: section, ReadState: "unsupported", Error: "qclient output did not include this token section"}
+		if runErr != nil {
+			result.ReadState = "error"
+			result.Error = runErr.Error()
+		}
+		publish(result)
 	}
-	if ctx.Err() != nil {
-		return
+	processError := ""
+	if runErr != nil {
+		processError = runErr.Error()
 	}
-	balanceRunner := l.QClientTokenBalanceRunner
-	if balanceRunner == nil {
-		balanceRunner = qclient.RunTokenBalance
+	if current() {
+		l.updateNodeStatusFromToken(map[string]interface{}{"qclient_token_status_error": processError}, state, req)
 	}
-	balance, balanceErr := balanceRunner(ctx, req, 90*time.Second)
-	if ctx.Err() != nil {
-		return
+}
+
+func tokenSectionPrefix(section qclient.TokenSection) string {
+	switch section {
+	case qclient.TokenRewards:
+		return "qclient_claimable_rewards"
+	case qclient.TokenLegacy:
+		return "qclient_legacy_balance"
+	case qclient.TokenConfidential:
+		return "qclient_token_balance"
+	default:
+		return ""
 	}
-	if balanceErr == nil {
-		l.updateNodeStatus(map[string]interface{}{
-			"qclient_token_balance":              balance,
-			"qclient_token_balance_refreshed_at": time.Now().UTC().Format(time.RFC3339),
-		})
+}
+
+func clearQClientTokenStatus(patch map[string]interface{}) {
+	for _, section := range []qclient.TokenSection{qclient.TokenRewards, qclient.TokenLegacy, qclient.TokenConfidential} {
+		prefix := tokenSectionPrefix(section)
+		for _, suffix := range []string{"", "_read_state", "_error", "_refreshed_at", "_attempted_at"} {
+			patch[prefix+suffix] = ""
+		}
 	}
+	patch["qclient_claimable_rewards_global_frame"] = nil
+	patch["qclient_token_status_error"] = ""
 }
 
 // verifyLocked is the mutex-guarded entry point used by both the 60s
@@ -374,6 +445,9 @@ func (l *Loop) runVerify() {
 		}
 	}
 
+	// Keep the loaded query identity before inventory probes update fields such
+	// as NodeSource or LastStartedAt on the working state copy.
+	proverStatusSource := *state
 	signals := 0
 	if detection.HasNode {
 		signals++
@@ -390,7 +464,13 @@ func (l *Loop) runVerify() {
 		state.LastVerifiedAt = now
 	}
 	if started := l.serviceStartedAt(l.UnitName); !started.IsZero() {
-		state.LastStartedAt = started.UTC()
+		// launchd estimates start time from whole-second process uptime. Keep
+		// the accepted timestamp anchored so polling jitter cannot change the
+		// lifecycle identity or discard an in-flight token reading.
+		delta := started.Sub(state.LastStartedAt)
+		if state.LastStartedAt.IsZero() || delta > nodeRestartTolerance || delta < -nodeRestartTolerance {
+			state.LastStartedAt = started.UTC()
+		}
 	}
 	qclientInstalled := l.qclientInstalled()
 	nodePatch := map[string]interface{}{
@@ -410,6 +490,7 @@ func (l *Loop) runVerify() {
 		}
 	}
 	if !qclientInstalled {
+		clearQClientTokenStatus(nodePatch)
 		state.QClientBinaryPath = ""
 		state.QClientVersion = ""
 		state.QClientInstalledAt = time.Time{}
@@ -422,7 +503,6 @@ func (l *Loop) runVerify() {
 		mergePatch(nodePatch, l.refreshNodeManifestState(state, now))
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
-		nodePatch["node_connections"] = nil
 		nodePatch["prover_address"] = ""
 		foundPeerID := ""
 		info := l.readNodeInfo(state)
@@ -448,8 +528,11 @@ func (l *Loop) runVerify() {
 			nodePatch["node_active_workers"] = info.ActiveWorkers
 		}
 		if qclientInstalled {
-			if qstatus := l.readQClientProverStatus(state); qstatus != nil {
-				applyQClientStatus(nodePatch, qstatus)
+			qstatus := l.readQClientProverStatus(&proverStatusSource)
+			if !l.proverStatusSourceCurrent(&proverStatusSource) {
+				return
+			}
+			if qstatus != nil {
 				if qstatus.PeerID != "" && isLegacyPeerID(qstatus.PeerID) {
 					foundPeerID = qstatus.PeerID
 				}
@@ -467,8 +550,6 @@ func (l *Loop) runVerify() {
 				if qstatus.RunningWorkers > 0 {
 					nodePatch["node_running_workers"] = qstatus.RunningWorkers
 				}
-			} else {
-				nodePatch["qclient_status"] = "unavailable"
 			}
 			if snapshot := l.readQClientManageSnapshot(state); snapshot != nil {
 				nodePatch["qclient_manage_snapshot"] = snapshot
@@ -499,17 +580,12 @@ func (l *Loop) runVerify() {
 		} else {
 			nodePatch["peer_id"] = unknownPeerID
 		}
-		if connections, ok := l.readPeerConnectionCountFromLogs(); ok {
-			nodePatch["node_connections"] = connections
-		} else if nodePatch["node_connections"] == nil {
-			nodePatch["node_connections"] = nil
-		}
 	} else {
+		clearQClientTokenStatus(nodePatch)
 		nodePatch["peer_id"] = unknownPeerID
 		nodePatch["prover_address"] = ""
 		nodePatch["node_running_workers"] = int64(0)
 		nodePatch["node_active_workers"] = int64(0)
-		nodePatch["node_connections"] = nil
 		nodePatch["qclient_allocations"] = []qclient.SnapshotAllocation{}
 		nodePatch["qclient_available_shards"] = []qclient.AvailableShard{}
 		nodePatch["qclient_manage_snapshot"] = nil
@@ -807,16 +883,6 @@ func isLegacyPeerID(peerID string) bool {
 	return strings.HasPrefix(peerID, "Qm")
 }
 
-func (l *Loop) readPeerConnectionCountFromLogs() (int, bool) {
-	if l.PeerConnectionsLogReader != nil {
-		return l.PeerConnectionsLogReader(context.Background(), l.UnitName, l.NodeLogPath, 1000, 5*time.Second)
-	}
-	if l.NodeLogPath != "" {
-		return nodeinfo.PeerConnectionsFromLogFile(context.Background(), l.NodeLogPath, 1000, 5*time.Second)
-	}
-	return nodeinfo.PeerConnectionsFromJournal(context.Background(), l.UnitName, 1000, 5*time.Second)
-}
-
 func (l *Loop) qclientBinaryPath() string {
 	if l.QClientBinaryPath != "" {
 		return l.QClientBinaryPath
@@ -842,17 +908,9 @@ func (l *Loop) qclientManaged(state *config.State) bool {
 }
 
 func (l *Loop) readQClientProverStatus(state *config.State) *qclient.ProverStatus {
-	runner := l.QClientStatusRunner
-	if runner == nil {
-		runner = qclient.Run
-	}
-	cfg := l.nodeInfoConfigPath(state)
-	req := qclient.RunRequest{
-		BinaryPath: l.qclientBinaryPath(),
-		ConfigPath: cfg,
-		WorkDir:    nodeCommandWorkDir(cfg, l.managedConfigDir()),
-	}
-	status, err := runner(context.Background(), req, 30*time.Second)
+	l.qclientStatusMu.Lock()
+	defer l.qclientStatusMu.Unlock()
+	status, err := l.refreshQClientStatusLocked(state, "")
 	if err != nil {
 		return nil
 	}
@@ -878,21 +936,9 @@ func (l *Loop) readQClientManageSnapshot(state *config.State) *qclient.ManageSna
 }
 
 func applyQClientStatus(patch map[string]interface{}, status *qclient.ProverStatus) {
-	if status == nil {
-		return
+	if status != nil {
+		mergePatch(patch, qclient.StatusPatch(status, nil, time.Now()))
 	}
-	patch["qclient_status"] = "reachable"
-	if !status.Reachable {
-		patch["qclient_status"] = "unreachable"
-	}
-	patch["qclient_reachable"] = status.Reachable
-	patch["qclient_peer_id"] = status.PeerID
-	patch["qclient_node_version"] = status.Version
-	patch["qclient_seniority"] = status.Seniority
-	patch["qclient_peer_score"] = status.PeerScore
-	patch["qclient_running_workers"] = status.RunningWorkers
-	patch["qclient_allocated_workers"] = status.AllocatedWorkers
-	patch["qclient_last_received"] = status.LastReceived
 }
 
 func nodeCommandWorkDir(configPath, managedConfigDir string) string {
@@ -1282,6 +1328,10 @@ func (l *Loop) PatchNodeStatus(patch map[string]interface{}) {
 // snapshot.node_status as a single object regardless of which loop just
 // fired.
 func (l *Loop) updateNodeStatus(patch map[string]interface{}) {
+	l.updateNodeStatusFromToken(patch, nil, qclient.RunRequest{})
+}
+
+func (l *Loop) updateNodeStatusFromToken(patch map[string]interface{}, source *config.State, req qclient.RunRequest) {
 	l.nodeStatusSendMu.Lock()
 	defer l.nodeStatusSendMu.Unlock()
 	l.mu.Lock()
@@ -1291,12 +1341,17 @@ func (l *Loop) updateNodeStatus(patch map[string]interface{}) {
 		// Without this guard, writing to a nil map panics.
 		l.nodeStatus = map[string]interface{}{}
 	}
+	if source != nil && (!config.StateSourceIsCurrent(l.StatePath, source) ||
+		l.qclientBinaryPath() != req.BinaryPath || !l.qclientInstalled() || l.nodeInfoConfigPath(source) != req.ConfigPath) {
+		l.mu.Unlock()
+		return
+	}
 	restarted := false
 	if next, ok := patch["node_started_at"].(string); ok {
 		previous, _ := l.nodeStatus["node_started_at"].(string)
 		oldTime, oldErr := time.Parse(time.RFC3339, previous)
 		newTime, newErr := time.Parse(time.RFC3339, next)
-		if oldErr == nil && newErr == nil && newTime.Sub(oldTime) > 3*time.Second {
+		if oldErr == nil && newErr == nil && newTime.Sub(oldTime) > nodeRestartTolerance {
 			restarted = true
 		}
 	}

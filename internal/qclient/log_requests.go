@@ -39,6 +39,7 @@ type LogRequest struct {
 }
 type LogRequestsList struct {
 	SchemaVersion  int          `json:"schema_version"`
+	Automatic      bool         `json:"automatic"`
 	Requests       []LogRequest `json:"requests"`
 	MaxBundleBytes uint64       `json:"max_bundle_bytes"`
 }

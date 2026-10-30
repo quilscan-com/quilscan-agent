@@ -186,7 +186,6 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 				"peer_id":                     "",
 				"node_running_workers":        int64(0),
 				"node_active_workers":         int64(0),
-				"node_connections":            nil,
 				"install_source":              "",
 				"node_managed":                false,
 				"node_disk_bytes":             int64(0),

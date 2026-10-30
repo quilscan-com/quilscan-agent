@@ -84,6 +84,8 @@ type State struct {
 
 	stateGeneration    uint64 `yaml:"-"`
 	stateGenerationSet bool   `yaml:"-"`
+	sourceRevision     uint64 `yaml:"-"`
+	sourceRevisionSet  bool   `yaml:"-"`
 }
 
 // CurrentSchemaVersion is bumped whenever State adds breaking field changes.
@@ -113,6 +115,7 @@ func loadStateUnlocked(path string) (*State, error) {
 	}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		observeStateSourceUnlocked(path, s, false)
 		return s, nil
 	}
 	if err != nil {
@@ -121,6 +124,7 @@ func loadStateUnlocked(path string) (*State, error) {
 	if err := yaml.Unmarshal(b, s); err != nil {
 		return s, err
 	}
+	observeStateSourceUnlocked(path, s, true)
 	return s, nil
 }
 
@@ -226,6 +230,7 @@ func RemoveState(path string) error {
 		return err
 	}
 	incrementStateGenerationUnlocked(path)
+	invalidateStateSourceUnlocked(path)
 	return nil
 }
 
@@ -251,6 +256,8 @@ func MoveState(path, dst string) error {
 	if err := os.Rename(path, dst); err == nil {
 		incrementStateGenerationUnlocked(path)
 		incrementStateGenerationUnlocked(dst)
+		invalidateStateSourceUnlocked(path)
+		invalidateStateSourceUnlocked(dst)
 		return nil
 	}
 	if err := copyAndRemoveState(path, dst, info); err != nil {
@@ -258,6 +265,8 @@ func MoveState(path, dst string) error {
 	}
 	incrementStateGenerationUnlocked(path)
 	incrementStateGenerationUnlocked(dst)
+	invalidateStateSourceUnlocked(path)
+	invalidateStateSourceUnlocked(dst)
 	return nil
 }
 
@@ -354,5 +363,9 @@ func saveStateUnlocked(path string, s *State) error {
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	observeStateSourceUnlocked(path, s, true)
+	return nil
 }

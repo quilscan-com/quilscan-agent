@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -232,102 +231,4 @@ func base58BTCEncode(raw []byte) string {
 		out[i], out[j] = out[j], out[i]
 	}
 	return string(out)
-}
-
-// ParsePeerConnectionsFromLogs extracts the latest Rust node status `peers`
-// value from the node's status logs.
-func ParsePeerConnectionsFromLogs(raw string) (int, bool) {
-	sc := bufio.NewScanner(strings.NewReader(raw))
-	latest := 0
-	ok := false
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.Contains(line, "node status") {
-			continue
-		}
-		payload := trailingJSON(line)
-		if payload == "" {
-			continue
-		}
-		var entry map[string]interface{}
-		if err := json.Unmarshal([]byte(payload), &entry); err != nil {
-			continue
-		}
-		peers, hasPeers := jsonInt(entry, "peers")
-		if !hasPeers || peers < 0 {
-			continue
-		}
-		latest = int(peers)
-		ok = true
-	}
-	return latest, ok
-}
-
-func PeerConnectionsFromJournal(ctx context.Context, unitName string, lines int, timeout time.Duration) (int, bool) {
-	if unitName == "" {
-		unitName = "quilibrium-node.service"
-	}
-	if lines <= 0 {
-		lines = 1000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "journalctl", "-u", unitName, "-n", strconv.Itoa(lines), "--no-pager", "-o", "short-iso").Output()
-	if err != nil {
-		return 0, false
-	}
-	return ParsePeerConnectionsFromLogs(string(out))
-}
-
-func PeerConnectionsFromLogFile(ctx context.Context, logPath string, lines int, timeout time.Duration) (int, bool) {
-	if logPath == "" {
-		return 0, false
-	}
-	if lines <= 0 {
-		lines = 1000
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "tail", "-n", strconv.Itoa(lines), logPath).Output()
-	if err != nil {
-		return 0, false
-	}
-	return ParsePeerConnectionsFromLogs(string(out))
-}
-
-func trailingJSON(line string) string {
-	idx := strings.LastIndexByte(line, '{')
-	if idx < 0 {
-		return ""
-	}
-	return strings.TrimSpace(line[idx:])
-}
-
-func jsonInt(entry map[string]interface{}, key string) (int64, bool) {
-	v, ok := entry[key]
-	if !ok {
-		return 0, false
-	}
-	switch x := v.(type) {
-	case float64:
-		return int64(x), true
-	case int64:
-		return x, true
-	case int:
-		return int64(x), true
-	case json.Number:
-		n, err := x.Int64()
-		return n, err == nil
-	case string:
-		n, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
-		return n, err == nil
-	default:
-		return 0, false
-	}
 }

@@ -3,6 +3,7 @@ package qclient
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,6 +22,7 @@ type ProverStatus struct {
 	AllocatedWorkers int64
 	LastReceived     int64
 	Reachable        bool
+	Snapshot         *StatusSnapshot
 }
 
 type RunRequest struct {
@@ -36,16 +38,60 @@ func Run(ctx context.Context, req RunRequest, timeout time.Duration) (*ProverSta
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{"node", "prover", "status"}
-	cmd := newCommand(ctx, req.BinaryPath, args...)
-	if req.WorkDir != "" {
-		cmd.Dir = req.WorkDir
+	args := []string{"node", "prover", "status", "--json"}
+	run := func(args []string) ([]byte, string, error) {
+		cmd := newCommand(ctx, req.BinaryPath, args...)
+		if req.WorkDir != "" {
+			cmd.Dir = req.WorkDir
+		}
+		cmd.WaitDelay = 100 * time.Millisecond
+		out, err := cmd.Output()
+		var exitErr *exec.ExitError
+		diagnostic := ""
+		if errors.As(err, &exitErr) {
+			diagnostic = string(exitErr.Stderr)
+			if len(diagnostic) > 4096 {
+				diagnostic = diagnostic[:4096] + " [truncated]"
+			}
+		}
+		return out, strings.TrimSpace(diagnostic), err
 	}
-	out, err := cmd.CombinedOutput()
+	out, diagnostic, err := run(args)
+	if err == nil {
+		return ParseProverStatusJSON(string(out))
+	}
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("qclient prover status: %w", ctx.Err())
+	}
+	if !unsupportedStatusJSON(string(out) + "\n" + diagnostic) {
+		return nil, fmt.Errorf("run %s %s: %w: %s", req.BinaryPath, strings.Join(args, " "), err, diagnostic)
+	}
+	out, diagnostic, err = run(args[:3])
 	if err != nil {
-		return nil, fmt.Errorf("run %s %s: %w", req.BinaryPath, strings.Join(args, " "), err)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return nil, fmt.Errorf("qclient prover status legacy fallback: %w: %s", err, diagnostic)
 	}
 	return ParseProverStatus(string(out))
+}
+
+func unsupportedStatusJSON(output string) bool {
+	lower := strings.ToLower(output)
+	for _, marker := range []string{"unexpected argument", "unrecognized option", "unknown flag", "unknown option", "flag provided but not defined"} {
+		_, after, found := strings.Cut(lower, marker)
+		if !found {
+			continue
+		}
+		token := strings.TrimLeft(after, " :\t\r\n\"'`")
+		if strings.HasPrefix(token, "--json") {
+			suffix := strings.TrimPrefix(token, "--json")
+			if suffix == "" || strings.ContainsRune(" \t\r\n\"'`,:", rune(suffix[0])) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func newCommand(ctx context.Context, binaryPath string, args ...string) *exec.Cmd {
@@ -120,6 +166,10 @@ func ParseProverStatus(raw string) (*ProverStatus, error) {
 }
 
 func atoi64(s string) int64 {
-	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return 0
+	}
+	n, _ := strconv.ParseInt(fields[0], 10, 64)
 	return n
 }

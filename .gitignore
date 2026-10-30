@@ -21,3 +21,21 @@ keys.yml
 *.log
 *_test.go
 /docs/
+
+# Keep independent tests, fixtures and benchmarks local.
+**/test/
+**/tests/
+**/testdata/
+**/fixtures/
+**/bench/
+**/benches/
+*_tests.rs
+*_test.rs
+test_*.rs
+test.rs
+tests.rs
+testing.rs
+*.test.js
+*.test.mjs
+*.spec.js
+*.spec.ts
