@@ -94,8 +94,15 @@ func unsupportedStatusJSON(output string) bool {
 	return false
 }
 
+const qclientSourceBuildSignatureArg = "--signature-check=false"
+
 func newCommand(ctx context.Context, binaryPath string, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, binaryPath, args...)
+	// QuilScan verifies its release bundle during installation. Its source-built
+	// clients use the native opt-out of official release self-checks per command.
+	commandArgs := make([]string, len(args)+1)
+	copy(commandArgs, args)
+	commandArgs[len(args)] = qclientSourceBuildSignatureArg
+	cmd := exec.CommandContext(ctx, binaryPath, commandArgs...)
 	if env := commandEnv(os.Environ(), runtime.GOOS); env != nil {
 		cmd.Env = env
 	}
