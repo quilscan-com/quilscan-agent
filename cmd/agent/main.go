@@ -38,7 +38,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.2.3"
+var version = "1.2.4"
 
 type startStopCtl interface {
 	Start(string) error
@@ -108,7 +108,8 @@ func run() {
 		log.Fatalf("read token (run `quilscan-agent init-token` first): %v", err)
 	}
 
-	if _, err := config.LoadState(defaults.StatePath); err != nil {
+	state, err := config.LoadState(defaults.StatePath)
+	if err != nil {
 		log.Fatalf("state: %v", err)
 	}
 
@@ -151,7 +152,10 @@ func run() {
 	// (systemd unit / launchd plist) and lifecycle commands. defaults is
 	// already platform-aware (DefaultConfig branches on runtime.GOOS).
 	var sdOps actions.SystemdOps
-	var sdCtl startStopCtl
+	var sdCtl interface {
+		startStopCtl
+		actions.LegacyReleaseRecoveryService
+	}
 	var renderNodeDef func(svcctl.NodeServiceInput) string
 	if runtime.GOOS == "darwin" {
 		sdOps = launchd.FSOps{UnitDir: defaults.UnitDir}
@@ -169,6 +173,16 @@ func run() {
 			})
 		}
 	}
+	tryLegacyRecovery := func(current *config.State) bool {
+		repaired, err := actions.RecoverLegacyNodeRelease(current, defaults.NodeBinaryPath, defaults.NodeServiceName, platform, sdCtl)
+		if err != nil {
+			log.Printf("[release recovery] legacy node repair failed: %v", err)
+		} else if repaired {
+			log.Printf("[release recovery] restored the published node filename and restarted %s", defaults.NodeServiceName)
+		}
+		return repaired || err != nil
+	}
+	legacyRecoveryFinished := tryLegacyRecovery(state)
 	updateState := func(mutate func(*config.State) error) (*config.State, error) {
 		return config.UpdateState(defaults.StatePath, mutate)
 	}
@@ -273,6 +287,20 @@ func run() {
 		InstallQClient:   installQClient,
 	})
 	mutationGate := &actions.MutationGate{}
+	if !legacyRecoveryFinished && state != nil && state.NodeSource == nodemanifest.SourceReleases {
+		// On boot the node may still be launching when the agent first checks it.
+		go retryLegacyReleaseRecovery(ctx, mutationGate, []time.Duration{12 * time.Second, 20 * time.Second}, func() bool {
+			current, err := config.LoadState(defaults.StatePath)
+			if err != nil {
+				log.Printf("[release recovery] read state: %v", err)
+				return true
+			}
+			if current == nil || current.NodeSource != nodemanifest.SourceReleases {
+				return true
+			}
+			return tryLegacyRecovery(current)
+		})
+	}
 	nodeUpdateHandler := actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
 		UnitName:        defaults.NodeServiceName,
 		BinaryPath:      defaults.NodeBinaryPath,
@@ -639,6 +667,30 @@ func run() {
 
 	log.Printf("quilscan-agent %s: connecting to %s", version, cfg.BackendURL)
 	client.Run(ctx)
+}
+
+func retryLegacyReleaseRecovery(ctx context.Context, gate *actions.MutationGate, delays []time.Duration, recover func() bool) {
+	for _, delay := range delays {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		release, _, ok := gate.TryAcquire(actions.MutationOwner{Action: "legacy_release_recovery"})
+		if !ok {
+			continue
+		}
+		finished := recover()
+		release()
+		if finished {
+			return
+		}
+	}
 }
 
 func persistRPCPatch(statePath string, patchedAt time.Time) error {

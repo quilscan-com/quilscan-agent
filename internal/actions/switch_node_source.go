@@ -97,7 +97,7 @@ func switchToDevNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, state *c
 	if serviceTx != nil {
 		defer func() { _ = serviceTx.Finalize() }()
 	}
-	if err := applyNodeSourceSwitch(c, emit, d, bundleTx, serviceTx, func() error {
+	if err := applyNodeSourceSwitch(c, emit, d, bundleTx, serviceTx, false, func() error {
 		if d.UpdateState == nil {
 			return fmt.Errorf("UpdateState dep missing")
 		}
@@ -175,7 +175,7 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 
 	manifestURL := nodeManifestURL(d.NodeManifestURL)
 	var persisted *config.State
-	if err := applyNodeSourceSwitch(c, emit, d, bundleTx, serviceTx, func() error {
+	if err := applyNodeSourceSwitch(c, emit, d, bundleTx, serviceTx, true, func() error {
 		if d.UpdateState == nil {
 			return fmt.Errorf("UpdateState dep missing")
 		}
@@ -228,7 +228,7 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 	return nil
 }
 
-func applyNodeSourceSwitch(c Command, emit Emitter, d NodeSourceSwitcherDeps, bundleTx, serviceTx *fileTransaction, persist func() error) error {
+func applyNodeSourceSwitch(c Command, emit Emitter, d NodeSourceSwitcherDeps, bundleTx, serviceTx *fileTransaction, releases bool, persist func() error) error {
 	wasActive := d.StartStop.IsActive(d.UnitName)
 	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
 	if err := d.StartStop.Stop(d.UnitName); err != nil {
@@ -258,6 +258,11 @@ func applyNodeSourceSwitch(c Command, emit Emitter, d NodeSourceSwitcherDeps, bu
 	emit(Status{ID: c.ID, Step: "starting", Progress: 0.92})
 	if err := d.StartStop.Start(d.UnitName); err != nil {
 		return failNodeSourceSwitch(c, emit, err, d, bundleTx, bundleChanged, serviceTx, serviceChanged, wasActive)
+	}
+	if releases {
+		if err := d.StartStop.CheckReleaseStartup(d.UnitName); err != nil {
+			return failNodeSourceSwitch(c, emit, err, d, bundleTx, bundleChanged, serviceTx, serviceChanged, wasActive)
+		}
 	}
 	if err := persist(); err != nil {
 		return failNodeSourceSwitch(c, emit, err, d, bundleTx, bundleChanged, serviceTx, serviceChanged, wasActive)

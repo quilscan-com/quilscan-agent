@@ -1,6 +1,7 @@
 package launchd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -8,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 )
 
 const (
@@ -81,6 +84,62 @@ func (c Ctl) IsActive(name string) bool {
 		}
 	}
 	return false
+}
+
+func (c Ctl) CheckReleaseStartup(name string) error {
+	target := launchTarget(c.domain(), name)
+	return svcctl.CheckReleaseStartup(name, func() (int, error) {
+		out, err := readReleaseJob(target)
+		if err != nil {
+			return 0, fmt.Errorf("launchctl print: %w: %s", err, strings.TrimSpace(out))
+		}
+		return releaseStartupPID(out)
+	})
+}
+
+func (c Ctl) FailedReleaseStart(name string) (bool, error) {
+	out, err := readReleaseJob(launchTarget(c.domain(), name))
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 113 {
+			return false, nil // A booted-out job was stopped intentionally.
+		}
+		return false, fmt.Errorf("launchctl print: %w: %s", err, strings.TrimSpace(out))
+	}
+	pid, runs, exitCode := releaseJobStatus(out)
+	return pid == 0 && runs > 0 && exitCode == "1", nil
+}
+
+func readReleaseJob(target string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "launchctl", "print", target).CombinedOutput()
+	return string(out), err
+}
+
+func releaseStartupPID(output string) (int, error) {
+	pid, runs, exitCode := releaseJobStatus(output)
+	if runs > 1 || (pid == 0 && exitCode != "" && exitCode != "(never exited)" && runs > 0) {
+		return 0, fmt.Errorf("launchd runs=%d last exit code=%q", runs, exitCode)
+	}
+	return pid, nil
+}
+
+func releaseJobStatus(output string) (pid, runs int, exitCode string) {
+	pid = parseLaunchdPID(output)
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " = ")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "runs":
+			runs, _ = strconv.Atoi(value)
+		case "last exit code":
+			exitCode = value
+		}
+	}
+	return pid, runs, exitCode
 }
 
 // launchctlOutput runs launchctl with the given args and returns stdout

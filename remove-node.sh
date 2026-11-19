@@ -150,9 +150,22 @@ remove_binary_bundle() {
   return 0
 }
 
+remove_node_binary_bundle() {
+  local binary="$1"
+  local release_dir="$binary.releases"
+  local artifact
+  remove_binary_bundle "$binary"
+  if [[ -d "$release_dir" && ! -L "$release_dir" ]]; then
+    for artifact in "$release_dir"/node-*; do
+      remove_file_if_exists "$artifact"
+    done
+    rmdir "$release_dir" 2>/dev/null || true
+  fi
+}
+
 remove_file_if_exists() {
   local path="$1"
-  [[ -e "$path" ]] || return 0
+  [[ -e "$path" || -L "$path" ]] || return 0
   if ! rm -f "$path"; then
     echo "[remove-node] ERROR: failed to remove runtime artifact: $path" >&2
     return 1
@@ -261,10 +274,10 @@ remove_node_macos() {
   if [ "$install_source" = "fresh" ]; then
     backup_default_config "$fresh_cfg" "$backup"
   fi
-  remove_binary_bundle "$bin"
+  remove_node_binary_bundle "$bin"
   remove_binary_bundle "$qclient_bin"
   if [ "$service_scope" = "system" ]; then
-    remove_binary_bundle "/var/root/.local/bin/quilibrium-node"
+    remove_node_binary_bundle "/var/root/.local/bin/quilibrium-node"
     remove_binary_bundle "/var/root/.local/bin/qclient"
   fi
   remove_file_if_exists "$plist"
@@ -320,7 +333,7 @@ remove_node_linux() {
   if [ "$INSTALL_SOURCE" = "fresh" ]; then
     backup_default_config "$FRESH_CFG" "$BACKUP"
   fi
-  remove_binary_bundle "$BIN"
+  remove_node_binary_bundle "$BIN"
   remove_binary_bundle "$QCLIENT_BIN"
   remove_file_if_exists "$UNIT_FILE"
   remove_file_if_exists "$STATE"

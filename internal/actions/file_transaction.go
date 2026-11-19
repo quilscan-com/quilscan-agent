@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type fileTransactionCandidate struct {
@@ -13,6 +14,7 @@ type fileTransactionCandidate struct {
 	destination string
 	mode        os.FileMode
 	binary      bool
+	linkTarget  string
 }
 
 type preparedFileTransactionCandidate struct {
@@ -112,20 +114,9 @@ func prepareFileTransaction(candidates []fileTransactionCandidate, managed []str
 	tx.managed = managed
 
 	for index, candidate := range candidates {
-		info, err := os.Stat(candidate.source)
-		if err != nil {
-			return fail(fmt.Errorf("stat candidate %s: %w", candidate.source, err))
-		}
-		if !info.Mode().IsRegular() {
-			return fail(fmt.Errorf("candidate %s is not a regular file", candidate.source))
-		}
-		mode := candidate.mode
-		if mode == 0 {
-			mode = info.Mode().Perm()
-		}
 		staged := filepath.Join(root, fmt.Sprintf("candidate-%03d", index))
-		if err := ops.copy(candidate.source, staged, mode); err != nil {
-			return fail(fmt.Errorf("stage candidate %s: %w", candidate.source, err))
+		if err := stageFileCandidate(candidate, staged, ops); err != nil {
+			return fail(fmt.Errorf("stage candidate for %s: %w", candidate.destination, err))
 		}
 		tx.candidates = append(tx.candidates, preparedFileTransactionCandidate{
 			staged:      staged,
@@ -135,28 +126,57 @@ func prepareFileTransaction(candidates []fileTransactionCandidate, managed []str
 	}
 
 	for index, destination := range managed {
-		info, err := os.Stat(destination)
+		info, err := os.Lstat(destination)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err != nil {
 			return fail(fmt.Errorf("stat live file %s: %w", destination, err))
 		}
-		if !info.Mode().IsRegular() {
-			return fail(fmt.Errorf("live file %s is not a regular file", destination))
-		}
 		staged := filepath.Join(root, fmt.Sprintf("backup-%03d", index))
-		if err := ops.copy(destination, staged, info.Mode().Perm()); err != nil {
+		if err := copyTransactionEntry(destination, staged, info.Mode(), ops); err != nil {
 			return fail(fmt.Errorf("back up %s: %w", destination, err))
 		}
 		tx.backups = append(tx.backups, fileTransactionBackup{
 			staged:      staged,
 			destination: destination,
-			mode:        info.Mode().Perm(),
+			mode:        info.Mode(),
 			binary:      destination == binaryDestination,
 		})
 	}
 	return tx, nil
+}
+
+func stageFileCandidate(candidate fileTransactionCandidate, staged string, ops fileTransactionOps) error {
+	if candidate.linkTarget != "" {
+		return os.Symlink(candidate.linkTarget, staged)
+	}
+	info, err := os.Stat(candidate.source)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", candidate.source, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", candidate.source)
+	}
+	mode := candidate.mode
+	if mode == 0 {
+		mode = info.Mode().Perm()
+	}
+	return ops.copy(candidate.source, staged, mode)
+}
+
+func copyTransactionEntry(src, dst string, mode os.FileMode, ops fileTransactionOps) error {
+	if mode&os.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(target, dst)
+	}
+	if !mode.IsRegular() {
+		return fmt.Errorf("%s is not a regular file or symlink", src)
+	}
+	return ops.copy(src, dst, mode.Perm())
 }
 
 func (tx *fileTransaction) Commit() error {
@@ -221,7 +241,7 @@ func (tx *fileTransaction) Rollback() error {
 
 	restore := func(backup fileTransactionBackup) {
 		staged := backup.staged + ".restore"
-		if err := tx.ops.copy(backup.staged, staged, backup.mode); err != nil {
+		if err := copyTransactionEntry(backup.staged, staged, backup.mode, tx.ops); err != nil {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("stage restore %s: %w", backup.destination, err))
 			return
 		}
@@ -282,6 +302,10 @@ func withRollbackOutcome(operation error, rollback func() error) error {
 }
 
 func prepareNodeReleaseTransaction(src, dst string, ops fileTransactionOps) (*fileTransaction, error) {
+	return prepareNamedNodeReleaseTransaction(src, dst, filepath.Base(src), ops)
+}
+
+func prepareNamedNodeReleaseTransaction(src, dst, publishedName string, ops fileTransactionOps) (*fileTransaction, error) {
 	digest := src + ".dgst"
 	if _, err := os.Stat(digest); err != nil {
 		return nil, fmt.Errorf("stat digest: %w", err)
@@ -295,19 +319,34 @@ func prepareNodeReleaseTransaction(src, dst string, ops fileTransactionOps) (*fi
 	}
 	sort.Strings(signatures)
 
+	releaseDir := nodeReleaseDir(dst)
+	if err := os.MkdirAll(releaseDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create installed release directory: %w", err)
+	}
+	if err := checkNodeReleaseDir(releaseDir); err != nil {
+		return nil, err
+	}
+	target := filepath.Join(releaseDir, publishedName)
 	candidates := []fileTransactionCandidate{{
-		source: digest, destination: dst + ".dgst", mode: 0o644,
+		source: digest, destination: target + ".dgst", mode: 0o644,
 	}}
 	for _, signature := range signatures {
 		candidates = append(candidates, fileTransactionCandidate{
 			source:      signature,
-			destination: dst + signature[len(src):],
+			destination: target + signature[len(src):],
 			mode:        0o644,
 		})
 	}
 	candidates = append(candidates, fileTransactionCandidate{
-		source: src, destination: dst, mode: 0o755, binary: true,
+		source: src, destination: target, mode: 0o755,
+	}, fileTransactionCandidate{
+		destination: dst, binary: true, linkTarget: filepath.Join(filepath.Base(releaseDir), publishedName),
 	})
+	if src == dst {
+		// Retain the original sidecars when repairing the installed bundle.
+		// The next regular update collects them through nodeManagedPaths.
+		return prepareFileTransaction(candidates, nil, ops)
+	}
 	managed, err := nodeManagedPaths(dst)
 	if err != nil {
 		return nil, err
@@ -358,6 +397,54 @@ func prepareQClientTransaction(src, dst string, ops fileTransactionOps) (*fileTr
 }
 
 func nodeManagedPaths(binaryPath string) ([]string, error) {
+	paths, err := nodeBundlePaths(binaryPath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(binaryPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return paths, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return paths, nil
+	}
+	target, err := os.Readlink(binaryPath)
+	if err != nil {
+		return nil, err
+	}
+	dir := nodeReleaseDir(binaryPath)
+	if filepath.Dir(target) != filepath.Base(dir) || !strings.HasPrefix(filepath.Base(target), "node-") {
+		return paths, nil
+	}
+	if err := checkNodeReleaseDir(dir); err != nil {
+		return nil, err
+	}
+	releasePaths, err := nodeBundlePaths(filepath.Join(dir, filepath.Base(target)))
+	return append(paths, releasePaths...), err
+}
+
+func nodeReleaseDir(binaryPath string) string {
+	return binaryPath + ".releases"
+}
+
+func checkNodeReleaseDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("installed release path %s is not a directory", dir)
+	}
+	return nil
+}
+
+func nodeBundlePaths(binaryPath string) ([]string, error) {
 	signatures, err := filepath.Glob(binaryPath + ".dgst.sig.*")
 	if err != nil {
 		return nil, fmt.Errorf("glob installed node signatures: %w", err)

@@ -103,7 +103,7 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 			if src == "" {
 				return
 			}
-			if _, err := os.Stat(src); err != nil {
+			if _, err := os.Lstat(src); err != nil {
 				return
 			}
 			dst := filepath.Join(backupDir, filepath.Base(src))
@@ -151,6 +151,9 @@ func NewCleanupResidueHandler(d CleanupDeps) Handler {
 		}
 
 		mvBinaryBundle(d.BinaryPath, "node")
+		if d.BinaryPath != "" {
+			mvBackup(nodeReleaseDir(d.BinaryPath), "node releases")
+		}
 		mvBinaryBundle(d.QClientBinaryPath, "qclient")
 		for _, cfgPath := range cleanupConfigPaths(state, d.ManagedConfigDir) {
 			mvBackup(cfgPath, "managed .config directory")

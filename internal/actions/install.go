@@ -294,11 +294,6 @@ func NewInstallHandler(d InstallDeps) Handler {
 				return err
 			}
 
-			// Quilibrium publishes binaries with version-templated filenames
-			// (node-2.1.0.22-linux-amd64). The service definition needs a stable
-			// binary path, so we move the binary and its digest/signature sidecars
-			// to the same stable path prefix. The node looks for <binary>.dgst at
-			// startup.
 			emit(Status{ID: c.ID, Step: "installing_binary", Progress: 0.55})
 			versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
 			if err := installNodeBinary(versionedBinary, d.BinaryPath); err != nil {
@@ -442,42 +437,16 @@ func NewInstallHandler(d InstallDeps) Handler {
 	}
 }
 
-// installNodeBinary moves the freshly-downloaded versioned binary and its
-// digest/signature sidecars onto the canonical BinaryPath prefix (e.g.
-// /usr/local/bin/quilibrium-node, /usr/local/bin/quilibrium-node.dgst, and
-// /usr/local/bin/quilibrium-node.dgst.sig.N). Falls back to copy when source
-// and destination live on different filesystems (the user might have placed
-// cfgDir on a separate disk for IO isolation).
-//
-// Caller is responsible for ensuring the existing binary, if any, is not
-// currently being executed (ETXTBSY) — for installs there's no running node
-// yet; for updates the caller must stop the service first.
+// installNodeBinary installs the signed release under its published name.
 func installNodeBinary(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fmt.Errorf("mkdir bin dir: %w", err)
-	}
-	stagedSidecars, err := stageNodeSidecars(src, dst)
+	tx, err := prepareNodeReleaseTransaction(src, dst, fileTransactionOps{})
 	if err != nil {
 		return err
 	}
-	sidecarsCommitted := false
-	defer func() {
-		if !sidecarsCommitted {
-			for _, sidecar := range stagedSidecars {
-				_ = os.Remove(sidecar.tmp)
-			}
-		}
-	}()
-
-	if err := moveFile(src, dst, 0o755); err != nil {
-		return err
+	defer func() { _ = tx.Finalize() }()
+	if err := tx.Commit(); err != nil {
+		return withRollbackOutcome(err, tx.Rollback)
 	}
-	for _, sidecar := range stagedSidecars {
-		if err := os.Rename(sidecar.tmp, sidecar.final); err != nil {
-			return fmt.Errorf("install sidecar %s: %w", sidecar.final, err)
-		}
-	}
-	sidecarsCommitted = true
 	return nil
 }
 
@@ -491,40 +460,6 @@ func makeNodeReleaseTempDir(binaryPath string) (string, func(), error) {
 		return "", func() {}, fmt.Errorf("create release temp dir: %w", err)
 	}
 	return dir, func() { _ = os.RemoveAll(dir) }, nil
-}
-
-type stagedNodeSidecar struct {
-	tmp   string
-	final string
-}
-
-func stageNodeSidecars(src, dst string) ([]stagedNodeSidecar, error) {
-	digestSrc := src + ".dgst"
-	if _, err := os.Stat(digestSrc); err != nil {
-		return nil, fmt.Errorf("stat digest: %w", err)
-	}
-	sigSrcs, err := filepath.Glob(src + ".dgst.sig.*")
-	if err != nil {
-		return nil, fmt.Errorf("glob signatures: %w", err)
-	}
-	if len(sigSrcs) == 0 {
-		return nil, fmt.Errorf("no signature files found for %s", filepath.Base(src))
-	}
-
-	sources := append([]string{digestSrc}, sigSrcs...)
-	staged := make([]stagedNodeSidecar, 0, len(sources))
-	for _, source := range sources {
-		final := dst + strings.TrimPrefix(source, src)
-		tmp := final + ".tmp"
-		if err := copyFile(source, tmp, 0o644); err != nil {
-			for _, sidecar := range staged {
-				_ = os.Remove(sidecar.tmp)
-			}
-			return nil, fmt.Errorf("stage sidecar %s: %w", filepath.Base(source), err)
-		}
-		staged = append(staged, stagedNodeSidecar{tmp: tmp, final: final})
-	}
-	return staged, nil
 }
 
 func moveFile(src, dst string, mode os.FileMode) error {

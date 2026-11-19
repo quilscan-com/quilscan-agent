@@ -18,6 +18,7 @@ type NodeUpdateService interface {
 	Start(unit string) error
 	Stop(unit string) error
 	IsActive(unit string) bool
+	CheckReleaseStartup(unit string) error
 }
 
 // NodeUpdaterDeps wires the update_node flow:
@@ -115,6 +116,9 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 
 		emit(Status{ID: c.ID, Step: "starting", Progress: 0.92})
 		if err := d.StartStop.Start(d.UnitName); err != nil {
+			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
+		}
+		if err := d.StartStop.CheckReleaseStartup(d.UnitName); err != nil {
 			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
 
