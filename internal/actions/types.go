@@ -13,6 +13,7 @@ type Command struct {
 type Status struct {
 	ID             string  `json:"id"`
 	Action         string  `json:"action,omitempty"`
+	ActionDetail   string  `json:"action_detail,omitempty"`
 	Step           string  `json:"step"`
 	Progress       float64 `json:"progress,omitempty"`
 	Error          string  `json:"error,omitempty"`

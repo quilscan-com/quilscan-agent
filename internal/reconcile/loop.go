@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/quilscan-com/quilscan-agent/internal/actions"
 	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/download"
 	"github.com/quilscan-com/quilscan-agent/internal/fdlimit"
@@ -107,6 +108,7 @@ type Loop struct {
 	NodeManifestFetcher         func(string) (*nodemanifest.Manifest, error)
 	OfficialArtifactsURL        string
 	OfficialArtifactsFetcher    func(string) (*nodemanifest.OfficialArtifacts, error)
+	MutationGate                *actions.MutationGate
 
 	NodeInfoRunner                func(context.Context, nodeinfo.RunRequest, time.Duration) (*nodeinfo.Info, error)
 	QClientStatusRunner           func(context.Context, qclient.RunRequest, time.Duration) (*qclient.ProverStatus, error)
@@ -421,6 +423,10 @@ func (l *Loop) RunVerifyNow() bool {
 // stamp last_verified_at; if the platform service manager reports the unit
 // running we also pull last_started_at.
 func (l *Loop) runVerify() {
+	identityEpoch, idle := l.MutationGate.NodeIdentityObservation()
+	if !idle {
+		return
+	}
 	l.refreshNodeDiagnostics()
 	state, err := config.LoadState(l.StatePath)
 	if err != nil {
@@ -435,13 +441,15 @@ func (l *Loop) runVerify() {
 		ProcessRunning:    processRunning("quilibrium-node"),
 	})
 	if !detection.HasNode && removableNodeResidue(detection.Residues, l.managedConfigDir()) {
-		if err := config.RemoveState(l.StatePath); err == nil || os.IsNotExist(err) {
-			_ = os.Remove(l.managedConfigDir())
-			state, err = config.LoadState(l.StatePath)
-			if err != nil {
-				return
+		matched := l.MutationGate.WithNodeIdentityObservation(identityEpoch, func() {
+			if removeErr := config.RemoveState(l.StatePath); removeErr == nil || os.IsNotExist(removeErr) {
+				_ = os.Remove(l.managedConfigDir())
+				state, err = config.LoadState(l.StatePath)
+				detection.Residues = []string{}
 			}
-			detection.Residues = []string{}
+		})
+		if !matched || err != nil {
+			return
 		}
 	}
 
@@ -601,16 +609,22 @@ func (l *Loop) runVerify() {
 		UnitDir:  l.UnitDir,
 		UnitName: l.UnitName,
 	}).NodeStatusPatch())
-	if state.ConfigPath != "" || state.NodeVersion != "" || state.PeerID != "" {
+	var current bool
+	matched := l.MutationGate.WithNodeIdentityObservation(identityEpoch, func() {
+		if state.ConfigPath == "" && state.NodeVersion == "" && state.PeerID == "" {
+			current = config.StateIsCurrent(l.StatePath, state)
+			return
+		}
 		persisted, applied, err := config.UpdateStateIfCurrent(l.StatePath, state, func(current *config.State) error {
 			applyVerifyState(current, state)
 			return nil
 		})
-		if err != nil || !applied {
-			return
+		if err == nil && applied {
+			current = true
+			state = persisted
 		}
-		state = persisted
-	} else if !config.StateIsCurrent(l.StatePath, state) {
+	})
+	if !matched || !current {
 		return
 	}
 	l.updateNodeStatus(nodePatch)
@@ -663,6 +677,7 @@ func applyVerifyState(dst, observed *config.State) {
 	dst.NodeBaseVersion = observed.NodeBaseVersion
 	dst.NodeBuildNumber = observed.NodeBuildNumber
 	dst.NodeBinarySHA256 = observed.NodeBinarySHA256
+	dst.VerifiedReleasesNodeSHA256 = observed.VerifiedReleasesNodeSHA256
 	dst.NodeManifestURL = observed.NodeManifestURL
 	dst.NodeManifestCheckedAt = observed.NodeManifestCheckedAt
 	dst.DevNodeSignatureVerified = observed.DevNodeSignatureVerified
@@ -685,7 +700,8 @@ func (l *Loop) readNodeInfo(state *config.State) *nodeinfo.Info {
 		ConfigPath: l.nodeInfoConfigPath(state),
 	}
 	req.WorkDir = nodeCommandWorkDir(req.ConfigPath, l.managedConfigDir())
-	info, err := runner(context.Background(), req, 8*time.Second)
+	// Releases initialize their cryptography before printing node info.
+	info, err := runner(context.Background(), req, 30*time.Second)
 	if err != nil {
 		return nil
 	}
@@ -699,6 +715,11 @@ func (l *Loop) refreshNodeManifestState(state *config.State, now time.Time) map[
 		return patch
 	}
 	previousSHA := state.NodeBinarySHA256
+	verifiedLocalRelease := state.NodeSource == nodemanifest.SourceReleases &&
+		strings.EqualFold(state.VerifiedReleasesNodeSHA256, sha)
+	if !verifiedLocalRelease {
+		state.VerifiedReleasesNodeSHA256 = ""
+	}
 	if previousSHA != "" && !strings.EqualFold(previousSHA, sha) {
 		state.DevNodeSignatureVerified = false
 	}
@@ -731,7 +752,7 @@ func (l *Loop) refreshNodeManifestState(state *config.State, now time.Time) map[
 			patchNodeSourceFromState(patch, state)
 			return patch
 		}
-		if !officialFetched && state.NodeSource == nodemanifest.SourceReleases {
+		if verifiedLocalRelease || (!officialFetched && state.NodeSource == nodemanifest.SourceReleases) {
 			patchNodeSourceFromState(patch, state)
 			return patch
 		}
@@ -766,6 +787,13 @@ func (l *Loop) refreshNodeManifestState(state *config.State, now time.Time) map[
 
 	if officialMatched {
 		applyNodeManifestMatch(state, officialMatch)
+		patchNodeSourceFromState(patch, state)
+		return patch
+	}
+
+	// The backend's hash index can lag behind the official release listing.
+	// A locally verified install remains Releases while its exact bytes match.
+	if verifiedLocalRelease {
 		patchNodeSourceFromState(patch, state)
 		return patch
 	}
@@ -1232,10 +1260,30 @@ func (l *Loop) runVersionPoll() {
 	}
 	fetcher := l.LatestVersionFetcher
 	if fetcher == nil {
-		fetcher = fetchLatestVersion
+		if state.NodeSource == nodemanifest.SourceReleases {
+			fetcher = func(url string) (string, error) {
+				raw, err := readVersionListing(url)
+				if err != nil {
+					return "", err
+				}
+				return release.LatestCompleteNodeVersion(raw, l.Platform)
+			}
+		} else {
+			fetcher = fetchLatestVersion
+		}
 	}
 	latest, err := fetcher(l.LatestVersionURL)
 	if err == nil && latest != "" {
+		if state.NodeSource == nodemanifest.SourceReleases && state.LatestReleasesNodeVersion != latest {
+			saved, applied, err := config.UpdateStateIfCurrent(l.StatePath, state, func(current *config.State) error {
+				current.LatestReleasesNodeVersion = latest
+				return nil
+			})
+			if err != nil || !applied {
+				return
+			}
+			state = saved
+		}
 		available := releaseVersionNewerThan(latest, current)
 		patch["current_node_version"] = current
 		patch["latest_node_version"] = latest
@@ -1437,6 +1485,14 @@ func processRunning(name string) bool {
 }
 
 func fetchLatestVersion(url string) (string, error) {
+	raw, err := readVersionListing(url)
+	if err != nil {
+		return "", err
+	}
+	return parseLatestVersion(raw), nil
+}
+
+func readVersionListing(url string) (string, error) {
 	client := download.NewClient(30 * time.Second)
 	resp, err := client.Get(url)
 	if err != nil {
@@ -1450,7 +1506,7 @@ func fetchLatestVersion(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return parseLatestVersion(string(b)), nil
+	return string(b), nil
 }
 
 func fetchLatestQClientVersion(url, platform string) (string, error) {

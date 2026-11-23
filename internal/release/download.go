@@ -270,6 +270,19 @@ func FetchLatestNodeVersion(baseURL, platform string) (string, error) {
 	return version, nil
 }
 
+// LatestCompleteNodeVersion requires the latest version for the platform to
+// advertise its binary, digest and signatures before it is offered.
+func LatestCompleteNodeVersion(raw, platform string) (string, error) {
+	version := LatestVersionForPrefix(raw, "node", platform)
+	if version == "" {
+		return "", fmt.Errorf("release manifest missing node for %s", platform)
+	}
+	if _, err := FilesForManifest(raw, version, platform); err != nil {
+		return "", err
+	}
+	return version, nil
+}
+
 // DownloadAll fetches every name from baseURL into destDir. Returns the first
 // error encountered and stops.
 func DownloadAll(baseURL string, names []string, destDir string) error {

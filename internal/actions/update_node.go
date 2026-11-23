@@ -4,14 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/quilscan-com/quilscan-agent/internal/config"
 	"github.com/quilscan-com/quilscan-agent/internal/nodemanifest"
+	"github.com/quilscan-com/quilscan-agent/internal/release"
 )
 
 var (
 	ErrDevNodeAutoUpdateRequiresDev = errors.New("Dev Node auto update requires node source dev")
+	ErrReleasesAutoUpdateInactive   = errors.New("Releases Node auto update requires a running node and an enabled newer release")
 )
 
 type NodeUpdateService interface {
@@ -63,6 +66,7 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			return fmt.Errorf("missing version")
 		}
 		automatic, _ := c.Args["automatic"].(bool)
+		releasesAutomatic := isAutomaticReleaseUpdate(c)
 		if d.LoadState == nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: "agent state unavailable"})
 			return fmt.Errorf("LoadState dep missing")
@@ -72,11 +76,21 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			emit(Status{ID: c.ID, Step: "failed", Error: "no install recorded — run install first"})
 			return fmt.Errorf("no install recorded")
 		}
-		if automatic && state.NodeSource != nodemanifest.SourceDev {
+		if releasesAutomatic {
+			if state.NodeSource != nodemanifest.SourceReleases || !state.ReleasesNodeAutoUpdate.Enabled ||
+				version != state.LatestReleasesNodeVersion || !release.VersionNewerThan(version, CurrentReleasesNodeVersion(state)) ||
+				d.StartStop == nil || !d.StartStop.IsActive(d.UnitName) {
+				emit(Status{ID: c.ID, Step: "interrupted", Message: ErrReleasesAutoUpdateInactive.Error()})
+				return ErrReleasesAutoUpdateInactive
+			}
+		} else if automatic && state.NodeSource != nodemanifest.SourceDev {
 			emit(Status{ID: c.ID, Step: "failed", Error: ErrDevNodeAutoUpdateRequiresDev.Error()})
 			return ErrDevNodeAutoUpdateRequiresDev
 		}
 		fromVersion := state.NodeVersion
+		if releasesAutomatic {
+			fromVersion = CurrentReleasesNodeVersion(state)
+		}
 		if state.NodeSource == nodemanifest.SourceDev {
 			return updateDevNode(c, emit, d, state)
 		}
@@ -95,6 +109,14 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		}
 
 		versionedBinary := filepath.Join(releaseDir, fmt.Sprintf("node-%s-%s", version, d.Platform))
+		var releaseSHA string
+		if state.NodeSource == nodemanifest.SourceReleases {
+			releaseSHA, err = nodemanifest.HashFile(versionedBinary)
+			if err != nil {
+				emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
+				return err
+			}
+		}
 		tx, err := prepareNodeReleaseTransaction(versionedBinary, d.BinaryPath, d.transactionOps)
 		if err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
@@ -103,7 +125,11 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		defer func() { _ = tx.Finalize() }()
 
 		wasActive := d.StartStop.IsActive(d.UnitName)
-		emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
+		if releasesAutomatic && !wasActive {
+			emit(Status{ID: c.ID, Step: "interrupted", Message: ErrReleasesAutoUpdateInactive.Error()})
+			return ErrReleasesAutoUpdateInactive
+		}
+		emit(Status{ID: c.ID, Step: "stopping", Progress: 0.60})
 		if err := d.StartStop.Stop(d.UnitName); err != nil {
 			emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 			return err
@@ -118,6 +144,7 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		if err := d.StartStop.Start(d.UnitName); err != nil {
 			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
+		emit(Status{ID: c.ID, Step: "verifying_startup", Progress: 0.96})
 		if err := d.StartStop.CheckReleaseStartup(d.UnitName); err != nil {
 			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
 		}
@@ -130,6 +157,12 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		if _, err := d.UpdateState(func(latest *config.State) error {
 			latest.NodeVersion = version
 			latest.LastStartedAt = startedAt
+			if releaseSHA != "" {
+				latest.InstalledNodeVersion = version
+				latest.NodeBaseVersion = version
+				latest.NodeBinarySHA256 = releaseSHA
+				latest.VerifiedReleasesNodeSHA256 = releaseSHA
+			}
 			return nil
 		}); err != nil {
 			return failNodeUpdate(c, emit, err, tx, d.StartStop, d.UnitName, wasActive)
@@ -147,13 +180,19 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 			// NOT touch latest_node_version — that field reflects upstream
 			// availability and must come from the next poll, not be forged
 			// to match the just-installed version.
-			d.PatchNodeStatus(map[string]interface{}{
+			patch := map[string]interface{}{
 				"current_node_version":  version,
 				"node_info_version":     version,
 				"node_version":          version,
 				"node_update_available": false,
 				"version_polled_at":     time.Now().UTC().Format(time.RFC3339),
-			})
+			}
+			if releaseSHA != "" {
+				patch["installed_node_version"] = version
+				patch["node_base_version"] = version
+				patch["node_binary_sha256"] = releaseSHA
+			}
+			d.PatchNodeStatus(patch)
 		}
 
 		if d.EmitRaw != nil {
@@ -167,6 +206,24 @@ func NewUpdateNodeHandler(d NodeUpdaterDeps) Handler {
 		emit(Status{ID: c.ID, Step: "done", Progress: 1.0})
 		return nil
 	}
+}
+
+func isAutomaticReleaseUpdate(command Command) bool {
+	automatic, _ := command.Args["automatic"].(bool)
+	return automatic && command.Args["source"] == nodemanifest.SourceReleases
+}
+
+// CurrentReleasesNodeVersion uses the higher known version while the installed
+// metadata and runtime report settle, so release automation cannot downgrade
+// or reinstall the current version because one of them lags.
+func CurrentReleasesNodeVersion(state *config.State) string {
+	installed := strings.TrimSpace(state.InstalledNodeVersion)
+	reported := strings.TrimSpace(state.NodeVersion)
+	_, hasInstalled := release.ParseDottedVersion(installed)
+	if !hasInstalled || release.VersionNewerThan(reported, installed) {
+		return reported
+	}
+	return installed
 }
 
 func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.State) error {
@@ -247,7 +304,13 @@ func updateDevNode(c Command, emit Emitter, d NodeUpdaterDeps, state *config.Sta
 
 func failNodeUpdate(c Command, emit Emitter, operation error, tx *fileTransaction, service NodeUpdateService, unit string, wasActive bool) error {
 	err := withRollbackOutcome(operation, func() error {
-		return rollbackNodeUpdate(tx, service, unit, wasActive)
+		if err := rollbackNodeUpdate(tx, service, unit, wasActive); err != nil {
+			return err
+		}
+		if isAutomaticReleaseUpdate(c) && wasActive {
+			return service.CheckReleaseStartup(unit)
+		}
+		return nil
 	})
 	emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 	return err
@@ -271,6 +334,9 @@ func rollbackNodeUpdate(tx *fileTransaction, service NodeUpdateService, unit str
 
 func applyDevInstallResult(state *config.State, result DevNodeInstallResult) {
 	state.NodeSource = nodemanifest.SourceDev
+	state.ReleasesNodeAutoUpdate.Enabled = false
+	state.LatestReleasesNodeVersion = ""
+	state.VerifiedReleasesNodeSHA256 = ""
 	state.InstalledNodeVersion = result.Version
 	state.NodeBaseVersion = result.BaseVersion
 	state.NodeBuildNumber = result.BuildNumber

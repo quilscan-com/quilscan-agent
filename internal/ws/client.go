@@ -5,6 +5,7 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"time"
@@ -39,7 +40,7 @@ type Client struct {
 	Token       string
 	Meta        Meta
 	OnMessage   func([]byte) // called for every inbound frame after auth
-	OnConnected func()       // called once after auth frame is sent on each new connection
+	OnConnected func()       // called once the server acknowledges auth
 
 	mu   sync.Mutex
 	wmu  sync.Mutex
@@ -75,6 +76,25 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 		return err
 	}
 	conn.SetReadLimit(MaxInboundMessageSize)
+	defer conn.Close()
+
+	if err := c.writeJSON(conn, c.authMessage()); err != nil {
+		return err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return err
+	}
+	_, authReply, err := conn.ReadMessage()
+	if err != nil {
+		return err
+	}
+	var auth struct{ Type string }
+	if err := json.Unmarshal(authReply, &auth); err != nil || auth.Type != "auth_ok" {
+		return errors.New("agent authentication was not acknowledged")
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	c.conn = conn
 	c.mu.Unlock()
@@ -82,12 +102,9 @@ func (c *Client) connectAndPump(ctx context.Context) error {
 		c.mu.Lock()
 		c.conn = nil
 		c.mu.Unlock()
-		conn.Close()
 	}()
-
-	// auth
-	if err := c.writeJSON(conn, c.authMessage()); err != nil {
-		return err
+	if c.OnMessage != nil {
+		c.OnMessage(authReply)
 	}
 
 	if c.OnConnected != nil {

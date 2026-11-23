@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"math/big"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ const updateAction = "automatic_update"
 // Deps contains the controller's side effects and time sources.
 type Deps struct {
 	StatePath         string
+	Source            string
+	NodeActive        func() bool
 	LoadState         func(string) (*config.State, error)
 	PersistState      func(string, func(*config.State) error) (*config.State, error)
 	Update            actions.Handler
@@ -53,6 +56,8 @@ type Controller struct {
 
 	mu            sync.Mutex
 	completionMu  sync.Mutex
+	publishMu     sync.Mutex
+	lastPublished map[string]interface{}
 	state         string
 	target        candidate
 	nextAttemptAt time.Time
@@ -82,6 +87,8 @@ type pendingResult struct {
 	target       string
 	completedAt  time.Time
 	failedTarget string
+	lastError    string
+	blockTarget  bool
 	retryTarget  candidate
 	retryDue     time.Time
 	runLifecycle uint64
@@ -95,6 +102,9 @@ var fallbackEventSequence atomic.Uint64
 // NewController applies production defaults while retaining deterministic
 // injection points for tests.
 func NewController(deps Deps) *Controller {
+	if deps.Source == "" {
+		deps.Source = nodemanifest.SourceDev
+	}
 	if deps.LoadState == nil {
 		deps.LoadState = config.LoadState
 	}
@@ -229,12 +239,12 @@ func (c *Controller) Tick() {
 		c.publish(state)
 		return
 	}
-	if !state.DevNodeAutoUpdateEnabled {
+	if !c.settings(state).Enabled {
 		c.setInactive(StateDisabled)
 		c.publish(state)
 		return
 	}
-	target, available := candidateFromState(state)
+	target, available := c.candidateFromState(state)
 	if !available {
 		c.setInactive(StateWatching)
 		c.publish(state)
@@ -242,6 +252,11 @@ func (c *Controller) Tick() {
 	}
 
 	if c.runningNow() {
+		c.publish(state)
+		return
+	}
+	if !c.nodeActive() {
+		c.setInactive(StateWatching)
 		c.publish(state)
 		return
 	}
@@ -324,14 +339,15 @@ func (c *Controller) loadNormalizedState() (*config.State, error) {
 	if err != nil || state == nil {
 		return state, err
 	}
-	if !state.DevNodeAutoUpdateEnabled || state.NodeSource == nodemanifest.SourceDev {
+	if !c.settings(state).Enabled || state.NodeSource == c.deps.Source {
 		c.rememberState(state)
 		return state, nil
 	}
 	updated, err := c.deps.PersistState(c.deps.StatePath, func(current *config.State) error {
-		if current.DevNodeAutoUpdateEnabled && current.NodeSource != nodemanifest.SourceDev {
-			current.DevNodeAutoUpdateEnabled = false
-			current.DevNodeAutoUpdateRevision++
+		settings := c.settings(current)
+		if settings.Enabled && current.NodeSource != c.deps.Source {
+			settings.Enabled = false
+			c.saveSettings(current, settings)
 		}
 		return nil
 	})
@@ -344,7 +360,7 @@ func (c *Controller) loadNormalizedState() (*config.State, error) {
 
 func (c *Controller) execute(target candidate, runLifecycle uint64) {
 	state, err := c.loadNormalizedState()
-	current, available := candidateFromState(state)
+	current, available := c.candidateFromState(state)
 	if err != nil || !available || current != target {
 		c.finishWithoutResult(state, runLifecycle)
 		return
@@ -357,6 +373,14 @@ func (c *Controller) execute(target candidate, runLifecycle uint64) {
 		return
 	}
 	defer release()
+	if c.isReleases() {
+		state, err = c.loadNormalizedState()
+		current, available = c.candidateFromState(state)
+		if err != nil || !available || current != target || !c.nodeActive() {
+			c.finishWithoutResult(state, runLifecycle)
+			return
+		}
+	}
 	command := actions.Command{
 		ID:     commandID,
 		Action: updateAction,
@@ -365,20 +389,27 @@ func (c *Controller) execute(target candidate, runLifecycle uint64) {
 			"automatic": true,
 		},
 	}
+	if c.isReleases() {
+		command.Args["source"] = c.deps.Source
+	}
 	var updateErr error
+	stopping := false
 	if c.deps.Update == nil {
 		updateErr = errors.New("automatic node update handler is unavailable")
 	} else {
 		updateErr = c.deps.Update(command, func(status actions.Status) {
+			stopping = stopping || status.Step == "stopping"
 			status.ID = command.ID
 			status.Action = command.Action
-			if c.deps.EmitCommandStatus != nil {
-				c.deps.EmitCommandStatus(status)
-			}
+			c.emitStatus(status)
 		})
 	}
+	if errors.Is(updateErr, actions.ErrReleasesAutoUpdateInactive) {
+		c.finishWithoutResult(state, runLifecycle)
+		return
+	}
 	if updateErr != nil {
-		c.finishFailure(target, commandID, runLifecycle)
+		c.finishFailure(target, commandID, runLifecycle, updateErr, c.isReleases() && stopping)
 		return
 	}
 	c.finishSuccess(target, commandID, runLifecycle)
@@ -388,21 +419,30 @@ func (c *Controller) tryAcquireAutomaticMutation(commandID string) (func(), bool
 	if c.deps.MutationGate == nil {
 		return func() {}, true
 	}
-	release, blocker, ok := c.deps.MutationGate.TryAcquire(actions.MutationOwner{Action: updateAction, CmdID: commandID})
+	release, blocker, ok := c.deps.MutationGate.TryAcquire(actions.MutationOwner{
+		Action: updateAction, CmdID: commandID, ProtectNodeIdentity: c.isReleases(),
+	})
 	if ok {
 		return release, true
 	}
-	if c.deps.EmitCommandStatus != nil {
-		c.deps.EmitCommandStatus(actions.Status{
-			ID:             commandID,
-			Action:         updateAction,
-			Step:           "rejected",
-			Error:          actions.ErrMutationInProgress.Error(),
-			BlockingCmdID:  blocker.CmdID,
-			BlockingAction: blocker.Action,
-		})
-	}
+	c.emitStatus(actions.Status{
+		ID:             commandID,
+		Action:         updateAction,
+		Step:           "rejected",
+		Error:          actions.ErrMutationInProgress.Error(),
+		BlockingCmdID:  blocker.CmdID,
+		BlockingAction: blocker.Action,
+	})
 	return nil, false
+}
+
+func (c *Controller) emitStatus(status actions.Status) {
+	if c.deps.EmitCommandStatus != nil {
+		if c.isReleases() {
+			status.ActionDetail = c.deps.Source
+		}
+		c.deps.EmitCommandStatus(status)
+	}
 }
 
 func (c *Controller) finishWithoutResult(state *config.State, runLifecycle uint64) {
@@ -412,7 +452,7 @@ func (c *Controller) finishWithoutResult(state *config.State, runLifecycle uint6
 	c.mu.Lock()
 	c.running = false
 	cancel := c.clearAttemptUnlocked()
-	c.state = runtimeStateFor(state)
+	c.state = c.runtimeStateFor(state)
 	c.invalidateRunLifecycleUnlocked(runLifecycle)
 	c.mu.Unlock()
 	callCancel(cancel)
@@ -427,7 +467,7 @@ func (c *Controller) finishContention() {
 	c.mu.Lock()
 	c.running = false
 	cancel := c.clearAttemptUnlocked()
-	c.state = runtimeStateFor(state)
+	c.state = c.runtimeStateFor(state)
 	c.mu.Unlock()
 	callCancel(cancel)
 	if state == nil {
@@ -436,12 +476,19 @@ func (c *Controller) finishContention() {
 	c.publish(state)
 }
 
-func (c *Controller) finishFailure(target candidate, eventID string, runLifecycle uint64) {
+func (c *Controller) finishFailure(target candidate, eventID string, runLifecycle uint64, failure error, blockTarget bool) {
 	completedAt := c.now()
 	record := pendingResult{
 		eventID: eventID, result: "failed", from: target.FromVersion, target: target.TargetVersion,
 		completedAt: completedAt, failedTarget: target.TargetVersion, retryTarget: target,
 		retryDue: completedAt.Add(c.deps.RetryDelay), runLifecycle: runLifecycle,
+	}
+	if c.isReleases() {
+		record.lastError = failure.Error()
+		record.blockTarget = blockTarget
+		if blockTarget {
+			record.retryDue = time.Time{}
+		}
 	}
 	state, pending := c.completeResult(record)
 	if pending {
@@ -453,13 +500,13 @@ func (c *Controller) finishFailure(target candidate, eventID string, runLifecycl
 		}
 		return
 	}
-	current, available := candidateFromState(state)
+	current, available := c.candidateFromState(state)
 	next := record.retryDue
 	var oldCancel func()
 	var token uint64
 	var retry bool
 	c.mu.Lock()
-	if c.lifecycle == runLifecycle && available && current == target {
+	if !record.retryDue.IsZero() && c.lifecycle == runLifecycle && available && current == target {
 		oldCancel = c.detachDueUnlocked()
 		c.running = false
 		c.target = target
@@ -472,7 +519,7 @@ func (c *Controller) finishFailure(target candidate, eventID string, runLifecycl
 	} else {
 		c.running = false
 		oldCancel = c.clearAttemptUnlocked()
-		c.state = runtimeStateFor(state)
+		c.state = c.runtimeStateFor(state)
 		c.invalidateRunLifecycleUnlocked(runLifecycle)
 	}
 	c.mu.Unlock()
@@ -502,7 +549,7 @@ func (c *Controller) finishSuccess(target candidate, eventID string, runLifecycl
 	c.mu.Lock()
 	c.running = false
 	cancel := c.clearAttemptUnlocked()
-	c.state = runtimeStateFor(state)
+	c.state = c.runtimeStateFor(state)
 	c.invalidateRunLifecycleUnlocked(runLifecycle)
 	c.mu.Unlock()
 	callCancel(cancel)
@@ -516,7 +563,7 @@ func (c *Controller) finishWithPending(state *config.State) {
 	c.mu.Lock()
 	c.running = false
 	cancel := c.clearAttemptUnlocked()
-	c.state = runtimeStateFor(state)
+	c.state = c.runtimeStateFor(state)
 	c.mu.Unlock()
 	callCancel(cancel)
 	if state == nil {
@@ -526,12 +573,12 @@ func (c *Controller) finishWithPending(state *config.State) {
 }
 
 func (c *Controller) finishPendingFailure(record pendingResult, state *config.State) {
-	current, available := candidateFromState(state)
+	current, available := c.candidateFromState(state)
 	var cancel func()
 	var token uint64
 	var schedule bool
 	c.mu.Lock()
-	if c.lifecycle == record.runLifecycle && available && current == record.retryTarget {
+	if !record.retryDue.IsZero() && c.lifecycle == record.runLifecycle && available && current == record.retryTarget {
 		cancel = c.detachDueUnlocked()
 		c.running = false
 		c.target = record.retryTarget
@@ -544,7 +591,7 @@ func (c *Controller) finishPendingFailure(record pendingResult, state *config.St
 	} else {
 		c.running = false
 		cancel = c.clearAttemptUnlocked()
-		c.state = runtimeStateFor(state)
+		c.state = c.runtimeStateFor(state)
 		c.invalidateRunLifecycleUnlocked(record.runLifecycle)
 	}
 	c.mu.Unlock()
@@ -597,9 +644,9 @@ func (c *Controller) flushPendingResult(state *config.State) (*config.State, boo
 	if !ok {
 		return state, false
 	}
-	if state == nil || state.ConfigPath == "" || state.NodeSource != nodemanifest.SourceDev {
+	if state == nil || state.ConfigPath == "" || state.NodeSource != c.deps.Source {
 		c.dropPending(record)
-		c.setInactive(runtimeStateFor(state))
+		c.setInactive(c.runtimeStateFor(state))
 		return state, false
 	}
 	updated, err := c.persistResult(record)
@@ -609,7 +656,7 @@ func (c *Controller) flushPendingResult(state *config.State) (*config.State, boo
 	}
 	if errors.Is(err, errPendingResultInapplicable) {
 		c.dropPending(record)
-		c.setInactive(runtimeStateFor(state))
+		c.setInactive(c.runtimeStateFor(state))
 		return state, false
 	}
 	c.holdForPending(state, record)
@@ -627,30 +674,36 @@ func (c *Controller) persistResult(record pendingResult) (*config.State, error) 
 
 func (c *Controller) persistResultUnlocked(record pendingResult) (*config.State, error) {
 	updated, err := c.deps.PersistState(c.deps.StatePath, func(current *config.State) error {
-		if current.ConfigPath == "" || current.NodeSource != nodemanifest.SourceDev {
+		if current.ConfigPath == "" || current.NodeSource != c.deps.Source {
 			return errPendingResultInapplicable
 		}
+		settings := c.settings(current)
 		if record.result == "failed" {
-			if current.DevNodeAutoUpdateLastResult == "success" && !current.DevNodeAutoUpdateLastCompletedAt.Before(record.completedAt) {
+			if settings.LastResult == "success" && !settings.LastCompletedAt.Before(record.completedAt) {
 				return nil
 			}
-			if current.DevNodeAutoUpdateLastFailedTargetVersion == record.failedTarget {
+			if !c.isReleases() && settings.LastFailedTargetVersion == record.failedTarget {
 				return nil
 			}
-			current.DevNodeAutoUpdateLastFailedTargetVersion = record.failedTarget
+			settings.LastFailedTargetVersion = record.failedTarget
+			if record.blockTarget {
+				settings.BlockedVersion = record.failedTarget
+			}
 		} else {
-			current.DevNodeAutoUpdateLastFailedTargetVersion = ""
+			settings.LastFailedTargetVersion = ""
+			settings.BlockedVersion = ""
 		}
 		resultTarget := record.target
-		if record.result == "success" && strings.TrimSpace(current.InstalledNodeVersion) != "" {
+		if !c.isReleases() && record.result == "success" && strings.TrimSpace(current.InstalledNodeVersion) != "" {
 			resultTarget = strings.TrimSpace(current.InstalledNodeVersion)
 		}
-		current.DevNodeAutoUpdateRevision++
-		current.DevNodeAutoUpdateLastEventID = record.eventID
-		current.DevNodeAutoUpdateLastResult = record.result
-		current.DevNodeAutoUpdateLastFromVersion = record.from
-		current.DevNodeAutoUpdateLastTargetVersion = resultTarget
-		current.DevNodeAutoUpdateLastCompletedAt = record.completedAt
+		settings.LastEventID = record.eventID
+		settings.LastResult = record.result
+		settings.LastFromVersion = record.from
+		settings.LastTargetVersion = resultTarget
+		settings.LastCompletedAt = record.completedAt
+		settings.LastError = record.lastError
+		c.saveSettings(current, settings)
 		return nil
 	})
 	if err == nil {
@@ -762,7 +815,7 @@ func samePendingResult(left, right pendingResult) bool {
 }
 
 func (c *Controller) holdForPending(state *config.State, record pendingResult) {
-	current, available := candidateFromState(state)
+	current, available := c.candidateFromState(state)
 	c.mu.Lock()
 	if record.result == "failed" && !record.retryDue.IsZero() && c.lifecycle == record.runLifecycle && available && current == record.retryTarget {
 		c.mu.Unlock()
@@ -773,7 +826,7 @@ func (c *Controller) holdForPending(state *config.State, record pendingResult) {
 		c.target = candidate{}
 		c.nextAttemptAt = time.Time{}
 		c.retrying = false
-		c.state = runtimeStateFor(state)
+		c.state = c.runtimeStateFor(state)
 	}
 	c.mu.Unlock()
 	callCancel(cancel)
@@ -831,7 +884,7 @@ func (c *Controller) attachDueTimer(target candidate, next time.Time, delay time
 func (c *Controller) attachRetryDueTimer(target candidate, next time.Time, delay time.Duration, token, lifecycle uint64) *config.State {
 	cancel := c.deps.Schedule(delay, c.Wake)
 	state, _ := c.loadNormalizedState()
-	current, available := candidateFromState(state)
+	current, available := c.candidateFromState(state)
 	var oldCancel func()
 
 	c.mu.Lock()
@@ -847,7 +900,7 @@ func (c *Controller) attachRetryDueTimer(target candidate, next time.Time, delay
 		cancel = nil
 	} else if matches {
 		oldCancel = c.clearAttemptUnlocked()
-		c.state = runtimeStateFor(state)
+		c.state = c.runtimeStateFor(state)
 		c.invalidateRunLifecycleUnlocked(lifecycle)
 	}
 	c.mu.Unlock()
@@ -890,8 +943,8 @@ func callCancel(cancel func()) {
 	}
 }
 
-func runtimeStateFor(state *config.State) string {
-	if state != nil && state.DevNodeAutoUpdateEnabled && state.NodeSource == nodemanifest.SourceDev {
+func (c *Controller) runtimeStateFor(state *config.State) string {
+	if state != nil && c.settings(state).Enabled && state.NodeSource == c.deps.Source {
 		return StateWatching
 	}
 	return StateDisabled
@@ -902,11 +955,12 @@ func (c *Controller) now() time.Time {
 }
 
 func (c *Controller) newEventID() string {
+	prefix := "auto-" + c.deps.Source + "-node-"
 	var random [10]byte
 	if _, err := cryptorand.Read(random[:]); err == nil {
-		return "auto-dev-node-" + hex.EncodeToString(random[:])
+		return prefix + hex.EncodeToString(random[:])
 	}
-	return fmt.Sprintf("auto-dev-node-%d-%d", c.now().UnixNano(), fallbackEventSequence.Add(1))
+	return fmt.Sprintf("%s%d-%d", prefix, c.now().UnixNano(), fallbackEventSequence.Add(1))
 }
 
 func (c *Controller) publish(state *config.State) {
@@ -925,26 +979,39 @@ func (c *Controller) publish(state *config.State) {
 		targetVersion = ""
 		nextAttempt = time.Time{}
 	}
+	settings := c.settings(state)
+	prefix := c.deps.Source + "_node_auto_update_"
 	completedAt := ""
-	if !state.DevNodeAutoUpdateLastCompletedAt.IsZero() {
-		completedAt = state.DevNodeAutoUpdateLastCompletedAt.UTC().Format(time.RFC3339)
+	if !settings.LastCompletedAt.IsZero() {
+		completedAt = settings.LastCompletedAt.UTC().Format(time.RFC3339)
 	}
 	nextAttemptAt := ""
 	if !nextAttempt.IsZero() {
 		nextAttemptAt = nextAttempt.UTC().Format(time.RFC3339)
 	}
 	patch := map[string]interface{}{
-		"dev_node_auto_update_enabled":             state.DevNodeAutoUpdateEnabled,
-		"dev_node_auto_update_state":               runtimeState,
-		"dev_node_auto_update_target_version":      targetVersion,
-		"dev_node_auto_update_next_attempt_at":     nextAttemptAt,
-		"dev_node_auto_update_last_event_id":       state.DevNodeAutoUpdateLastEventID,
-		"dev_node_auto_update_last_from_version":   state.DevNodeAutoUpdateLastFromVersion,
-		"dev_node_auto_update_last_target_version": state.DevNodeAutoUpdateLastTargetVersion,
-		"dev_node_auto_update_last_completed_at":   completedAt,
+		prefix + "enabled":             settings.Enabled,
+		prefix + "state":               runtimeState,
+		prefix + "target_version":      targetVersion,
+		prefix + "next_attempt_at":     nextAttemptAt,
+		prefix + "last_event_id":       settings.LastEventID,
+		prefix + "last_from_version":   settings.LastFromVersion,
+		prefix + "last_target_version": settings.LastTargetVersion,
+		prefix + "last_completed_at":   completedAt,
 	}
-	if state.DevNodeAutoUpdateLastResult != "" {
-		patch["dev_node_auto_update_last_success"] = state.DevNodeAutoUpdateLastResult == "success"
+	if settings.LastResult != "" {
+		patch[prefix+"last_success"] = settings.LastResult == "success"
+	}
+	if c.isReleases() {
+		patch[prefix+"last_error"] = settings.LastError
+		// Dev already broadcasts the combined snapshot on every tick.
+		// Only send an additional frame when the Releases fields change.
+		c.publishMu.Lock()
+		defer c.publishMu.Unlock()
+		if maps.Equal(patch, c.lastPublished) {
+			return
+		}
+		c.lastPublished = patch
 	}
 	c.deps.PatchNodeStatus(patch)
 }

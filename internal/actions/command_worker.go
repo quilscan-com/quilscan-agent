@@ -121,7 +121,9 @@ func (w *CommandWorker) submitNormalRestart(command Command) error {
 }
 
 func (w *CommandWorker) submitWithGate(command Command) error {
-	release, blocker, ok := w.gate.TryAcquire(MutationOwner{Action: command.Action, CmdID: command.ID})
+	owner := MutationOwner{Action: command.Action, CmdID: command.ID}
+	owner.ProtectNodeIdentity = command.Action == "switch_node_source" || command.Action == "update_node"
+	release, blocker, ok := w.gate.TryAcquire(owner)
 	if !ok {
 		return w.rejectMutation(command, blocker)
 	}

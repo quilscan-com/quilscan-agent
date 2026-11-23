@@ -57,6 +57,10 @@ type State struct {
 	DevNodeAutoUpdateLastCompletedAt         time.Time `yaml:"dev_node_auto_update_last_completed_at,omitempty"`
 	DevNodeAutoUpdateLastFailedTargetVersion string    `yaml:"dev_node_auto_update_last_failed_target_version,omitempty"`
 
+	LatestReleasesNodeVersion  string              `yaml:"latest_releases_node_version,omitempty"`
+	VerifiedReleasesNodeSHA256 string              `yaml:"verified_releases_node_sha256,omitempty"`
+	ReleasesNodeAutoUpdate     NodeAutoUpdateState `yaml:"releases_node_auto_update,omitempty"`
+
 	// Origin: how the node entered our care.
 	InstallSource string `yaml:"install_source,omitempty"` // "fresh" | "migrated"
 	MigratedFrom  string `yaml:"migrated_from,omitempty"`

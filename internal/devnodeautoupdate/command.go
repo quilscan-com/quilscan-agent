@@ -12,6 +12,7 @@ import (
 var (
 	ErrMissingEnabled        = errors.New("enabled must be a boolean")
 	ErrDevSourceOnly         = errors.New("Dev Node automatic updates require node source dev")
+	ErrReleasesSourceOnly    = errors.New("Releases Node automatic updates require node source releases")
 	ErrControllerUnavailable = errors.New("Dev Node automatic update controller is unavailable")
 )
 
@@ -30,12 +31,16 @@ func NewSetEnabledHandler(controller *Controller) actions.Handler {
 			emitSettingFailure(command, emit, ErrMissingEnabled)
 			return ErrMissingEnabled
 		}
-		updated, err := config.UpdateState(controller.deps.StatePath, func(state *config.State) error {
-			if enabled && (state.NodeSource != nodemanifest.SourceDev || state.ConfigPath == "") {
+		updated, err := controller.deps.PersistState(controller.deps.StatePath, func(state *config.State) error {
+			if enabled && (state.NodeSource != controller.deps.Source || state.ConfigPath == "") {
+				if controller.deps.Source == nodemanifest.SourceReleases {
+					return ErrReleasesSourceOnly
+				}
 				return ErrDevSourceOnly
 			}
-			state.DevNodeAutoUpdateEnabled = enabled
-			state.DevNodeAutoUpdateRevision++
+			settings := controller.settings(state)
+			settings.Enabled = enabled
+			controller.saveSettings(state, settings)
 			return nil
 		})
 		if err != nil {

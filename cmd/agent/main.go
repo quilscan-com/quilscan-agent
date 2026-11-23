@@ -38,7 +38,7 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.2.4"
+var version = "1.2.5"
 
 type startStopCtl interface {
 	Start(string) error
@@ -318,7 +318,10 @@ func run() {
 			}
 		},
 	})
-	devAutoController := devnodeautoupdate.NewController(devnodeautoupdate.Deps{
+	nodeCommandStatus := nodeCommandStatusRelay{
+		send: func(status actions.Status) error { return client.Send(statusMessage(status)) },
+	}
+	autoUpdateDeps := devnodeautoupdate.Deps{
 		StatePath:    defaults.StatePath,
 		Update:       nodeUpdateHandler,
 		MutationGate: mutationGate,
@@ -330,7 +333,13 @@ func run() {
 		EmitCommandStatus: func(s actions.Status) {
 			_ = client.Send(statusMessage(s))
 		},
-	})
+	}
+	devAutoController := devnodeautoupdate.NewController(autoUpdateDeps)
+	releasesAutoDeps := autoUpdateDeps
+	releasesAutoDeps.Source = nodemanifest.SourceReleases
+	releasesAutoDeps.NodeActive = func() bool { return sdCtl.IsActive(defaults.NodeServiceName) }
+	releasesAutoDeps.EmitCommandStatus = nodeCommandStatus.emit
+	releasesAutoController := devnodeautoupdate.NewController(releasesAutoDeps)
 
 	d := &actions.Dispatcher{
 		Handlers: map[string]actions.Handler{
@@ -431,8 +440,9 @@ func run() {
 					}
 				},
 			}),
-			"update_node":              nodeUpdateHandler,
-			"set_dev_node_auto_update": devnodeautoupdate.NewSetEnabledHandler(devAutoController),
+			"update_node":                   nodeUpdateHandler,
+			"set_dev_node_auto_update":      devnodeautoupdate.NewSetEnabledHandler(devAutoController),
+			"set_releases_node_auto_update": devnodeautoupdate.NewSetEnabledHandler(releasesAutoController),
 			"switch_node_source": actions.NewSwitchNodeSourceHandler(actions.NodeSourceSwitcherDeps{
 				UnitName:        defaults.NodeServiceName,
 				UnitDir:         defaults.UnitDir,
@@ -484,7 +494,7 @@ func run() {
 		ctx,
 		d,
 		mutationGate,
-		func(status actions.Status) { _ = client.Send(statusMessage(status)) },
+		nodeCommandStatus.emit,
 		func(command actions.Command, commandErr error) {
 			if commandErr != nil {
 				log.Printf("[cmd] finished id=%s action=%s result=failure error=%v", command.ID, command.Action, commandErr)
@@ -608,12 +618,14 @@ func run() {
 		Svc:                  reconcileSvc,
 		NodeManifestURL:      nodemanifest.DefaultURL,
 		OfficialArtifactsURL: nodemanifest.OfficialArtifactsURLFromBackend(cfg.BackendURL),
+		MutationGate:         mutationGate,
 	}
 	if qclientLatestVersionURL != "" {
 		rec.LatestQClientVersionURL = qclientLatestVersionURL
 	}
 	go rec.Run(ctx)
 	go devAutoController.Run(ctx)
+	go releasesAutoController.Run(ctx)
 
 	// netinfo: resolve public IP + country once at startup and every 24h, then
 	// re-send on each WS reconnect via OnConnected so the backend's per-token
@@ -635,6 +647,7 @@ func run() {
 		})
 	}
 	client.OnConnected = func() {
+		nodeCommandStatus.replay()
 		sendNetinfo()
 		_ = client.Send(diskSelectionMessage(diskManager.Snapshot()))
 	}
@@ -938,6 +951,9 @@ func statusMessage(s actions.Status) map[string]interface{} {
 		"progress": s.Progress,
 		"error":    s.Error,
 		"message":  s.Message,
+	}
+	if s.ActionDetail != "" {
+		message["action_detail"] = s.ActionDetail
 	}
 	if s.BlockingCmdID != "" {
 		message["blocking_cmd_id"] = s.BlockingCmdID

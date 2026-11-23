@@ -187,6 +187,7 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 			current.NodeBaseVersion = latest
 			current.NodeBuildNumber = 0
 			current.NodeBinarySHA256 = sha
+			current.VerifiedReleasesNodeSHA256 = sha
 			current.NodeManifestURL = manifestURL
 			current.NodeManifestCheckedAt = checkedAt
 			current.DevNodeSignatureVerified = false
@@ -230,7 +231,7 @@ func switchToReleasesNode(c Command, emit Emitter, d NodeSourceSwitcherDeps, sta
 
 func applyNodeSourceSwitch(c Command, emit Emitter, d NodeSourceSwitcherDeps, bundleTx, serviceTx *fileTransaction, releases bool, persist func() error) error {
 	wasActive := d.StartStop.IsActive(d.UnitName)
-	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.10})
+	emit(Status{ID: c.ID, Step: "stopping", Progress: 0.60})
 	if err := d.StartStop.Stop(d.UnitName); err != nil {
 		emit(Status{ID: c.ID, Step: "failed", Error: err.Error()})
 		return err
@@ -260,6 +261,7 @@ func applyNodeSourceSwitch(c Command, emit Emitter, d NodeSourceSwitcherDeps, bu
 		return failNodeSourceSwitch(c, emit, err, d, bundleTx, bundleChanged, serviceTx, serviceChanged, wasActive)
 	}
 	if releases {
+		emit(Status{ID: c.ID, Step: "verifying_startup", Progress: 0.96})
 		if err := d.StartStop.CheckReleaseStartup(d.UnitName); err != nil {
 			return failNodeSourceSwitch(c, emit, err, d, bundleTx, bundleChanged, serviceTx, serviceChanged, wasActive)
 		}
