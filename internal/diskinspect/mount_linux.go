@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func inspectOpenDirectory(ctx context.Context, dir *os.File, _ string) (Usage, Code) {
+func inspectOpenPath(ctx context.Context, dir *os.File, _ string, file bool) (Usage, Code) {
 	var before unix.Statfs_t
 	if err := unix.Fstatfs(int(dir.Fd()), &before); err != nil || before.Bsize <= 0 {
 		return Usage{}, UnsupportedFilesystem
@@ -26,7 +26,11 @@ func inspectOpenDirectory(ctx context.Context, dir *os.File, _ string) (Usage, C
 	if err != nil {
 		return Usage{}, UnsupportedFilesystem
 	}
-	mount, code := selectLinuxMount(mounts, id)
+	selectMount := selectLinuxMount
+	if file {
+		selectMount = selectLinuxFileMount
+	}
+	mount, code := selectMount(mounts, id)
 	if code != "" {
 		return Usage{}, code
 	}
@@ -45,11 +49,25 @@ func inspectOpenDirectory(ctx context.Context, dir *os.File, _ string) (Usage, C
 	if err != nil {
 		return Usage{}, MountChanged
 	}
-	currentMount, code := selectLinuxMount(current, id)
+	currentMount, code := selectMount(current, id)
 	if code != "" || currentMount != mount {
 		return Usage{}, MountChanged
 	}
 	return usageFromBlocks(mount.mountpoint, mount.filesystem, after.Blocks, after.Bfree, after.Bavail, uint64(after.Bsize))
+}
+
+func selectLinuxFileMount(mounts []mountRecord, id int) (mountRecord, Code) {
+	mount, code := selectLinuxMount(mounts, id)
+	if code != UnsupportedFilesystem {
+		return mount, code
+	}
+	// A Node config on a local bind mount uses the backing filesystem's space.
+	for _, candidate := range mounts {
+		if candidate.id == id && candidate.mountpoint != "" && linuxLocalFilesystem(candidate.filesystem) {
+			return candidate, ""
+		}
+	}
+	return mountRecord{}, code
 }
 
 func descriptorMountID(fd int) (int, error) {

@@ -60,6 +60,16 @@ func ValidatePath(path string) (string, Code) {
 // Inspect checks an existing directory and reports the local mount it belongs
 // to. The open descriptor, rather than a lexical path prefix, is authoritative.
 func Inspect(ctx context.Context, path string) (Usage, Code) {
+	return inspectPath(ctx, path, false)
+}
+
+// InspectFile reports the mount of an existing local file without reading its
+// contents. The caller uses a file path already selected by the Agent.
+func InspectFile(ctx context.Context, path string) (Usage, Code) {
+	return inspectPath(ctx, path, true)
+}
+
+func inspectPath(ctx context.Context, path string, file bool) (Usage, Code) {
 	clean, code := ValidatePath(path)
 	if code != "" {
 		return Usage{}, code
@@ -67,17 +77,23 @@ func Inspect(ctx context.Context, path string) (Usage, Code) {
 	if ctx.Err() != nil {
 		return Usage{}, Timeout
 	}
-	fd, err := unix.Open(clean, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	flags := unix.O_RDONLY | unix.O_CLOEXEC
+	if file {
+		flags |= unix.O_NONBLOCK
+	} else {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := unix.Open(clean, flags, 0)
 	if err != nil {
 		return Usage{}, NotDirectory
 	}
-	dir := os.NewFile(uintptr(fd), clean)
-	defer dir.Close()
-	info, err := dir.Stat()
-	if err != nil || !info.IsDir() {
+	open := os.NewFile(uintptr(fd), clean)
+	defer open.Close()
+	info, err := open.Stat()
+	if err != nil || (file && !info.Mode().IsRegular()) || (!file && !info.IsDir()) {
 		return Usage{}, NotDirectory
 	}
-	usage, code := inspectOpenDirectory(ctx, dir, clean)
+	usage, code := inspectOpenPath(ctx, open, clean, file)
 	if ctx.Err() != nil {
 		return Usage{}, Timeout
 	}

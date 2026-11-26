@@ -16,7 +16,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var diskConfigMu sync.Mutex
+var agentConfigMu sync.Mutex
 var syncConfigDirectoryFunc = syncConfigDirectory
 
 // SaveSelectedDiskMount changes only the selected_disk_mount key in the
@@ -25,8 +25,14 @@ func SaveSelectedDiskMount(path, mountpoint string) error {
 	if !validSelectedDiskMount(mountpoint) {
 		return errors.New("invalid selected disk mountpoint")
 	}
-	diskConfigMu.Lock()
-	defer diskConfigMu.Unlock()
+	return updateAgentConfig(path, false, func(mapping *yaml.Node) error {
+		return setSelectedDiskNode(mapping, mountpoint)
+	})
+}
+
+func updateAgentConfig(path string, private bool, mutate func(*yaml.Node) error) error {
+	agentConfigMu.Lock()
+	defer agentConfigMu.Unlock()
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -40,7 +46,7 @@ func SaveSelectedDiskMount(path, mountpoint string) error {
 	if err != nil {
 		return err
 	}
-	if err := setSelectedDiskNode(mapping, mountpoint); err != nil {
+	if err := mutate(mapping); err != nil {
 		return err
 	}
 	var encoded bytes.Buffer
@@ -60,7 +66,7 @@ func SaveSelectedDiskMount(path, mountpoint string) error {
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	mode := os.FileMode(0o600)
-	if info != nil {
+	if info != nil && !private {
 		mode = info.Mode().Perm()
 	}
 	if err := tmp.Chmod(mode); err != nil {
@@ -94,8 +100,8 @@ func SaveSelectedDiskMount(path, mountpoint string) error {
 	}
 	if err := syncConfigDirectoryFunc(dir); err != nil {
 		// Rename already committed the new config path. Reporting failure here
-		// would leave the caller's active selection out of sync with the file.
-		log.Print("[config] selected disk config committed; directory sync failed, crash durability is uncertain")
+		// would leave the active settings out of sync with the file.
+		log.Print("[config] Agent config committed; directory sync failed, crash durability is uncertain")
 	}
 	return nil
 }

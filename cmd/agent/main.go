@@ -34,11 +34,12 @@ import (
 	"github.com/quilscan-com/quilscan-agent/internal/rpcconfig"
 	"github.com/quilscan-com/quilscan-agent/internal/svcctl"
 	"github.com/quilscan-com/quilscan-agent/internal/systemd"
+	"github.com/quilscan-com/quilscan-agent/internal/telegramnotify"
 	"github.com/quilscan-com/quilscan-agent/internal/token"
 	"github.com/quilscan-com/quilscan-agent/internal/ws"
 )
 
-var version = "1.2.5"
+var version = "1.2.6"
 
 type startStopCtl interface {
 	Start(string) error
@@ -216,6 +217,13 @@ func run() {
 	// without a circular construction (handler is built before the loop value
 	// is assigned, but only invoked once the loop is already running).
 	var rec *reconcile.Loop
+	telegram := telegramnotify.New(defaults.ConfigPath, func(ctx context.Context) svcctl.NodeProcess {
+		return svcctl.ReadNodeProcess(ctx, defaults.NodeServiceName)
+	}, func(status telegramnotify.Status) {
+		if rec != nil {
+			rec.PatchNodeStatus(map[string]interface{}{"telegram_notifications": status})
+		}
+	})
 	logRequestState := &actions.LogRequestState{}
 	invalidateLogRequests := func() {
 		logRequestState.Invalidate()
@@ -301,7 +309,7 @@ func run() {
 			return tryLegacyRecovery(current)
 		})
 	}
-	nodeUpdateHandler := actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
+	nodeUpdateHandler := telegram.NodeOperation("update_node", actions.NewUpdateNodeHandler(actions.NodeUpdaterDeps{
 		UnitName:        defaults.NodeServiceName,
 		BinaryPath:      defaults.NodeBinaryPath,
 		Platform:        platform,
@@ -317,7 +325,7 @@ func run() {
 				rec.PatchNodeStatus(patch)
 			}
 		},
-	})
+	}))
 	nodeCommandStatus := nodeCommandStatusRelay{
 		send: func(status actions.Status) error { return client.Send(statusMessage(status)) },
 	}
@@ -468,7 +476,9 @@ func run() {
 				}
 				return rec.RunVerifyNow()
 			}),
-			"install_qclient": actions.NewInstallQClientHandler(qclientInstallDeps()),
+			"install_qclient":            actions.NewInstallQClientHandler(qclientInstallDeps()),
+			"set_telegram_notifications": telegram.SettingsHandler(ctx),
+			"test_telegram_notification": telegram.TestHandler(ctx),
 			"set_node_diagnostics": actions.NewSetNodeDiagnosticsHandler(actions.SetNodeDiagnosticsDeps{
 				InvalidateLogRequests: invalidateLogRequests,
 				StatePath:             defaults.StatePath,
@@ -483,6 +493,9 @@ func run() {
 				},
 			}),
 		},
+	}
+	for _, action := range []string{"install", "migrate", "start", "stop", "restart_node", "switch_node_source", "repair_fd_limit", "cleanup_residue", "delete_node_store"} {
+		d.Handlers[action] = telegram.NodeOperation(action, d.Handlers[action])
 	}
 
 	var collector *metrics.Collector
@@ -578,6 +591,7 @@ func run() {
 	// keep producing data even during reconnect storms.
 	collector = &metrics.Collector{
 		Sender:        client,
+		Observe:       telegram.Observe,
 		Tick:          3 * time.Second,
 		IdleTick:      60 * time.Second,
 		Started:       startedAt,
@@ -624,6 +638,10 @@ func run() {
 		rec.LatestQClientVersionURL = qclientLatestVersionURL
 	}
 	go rec.Run(ctx)
+	go telegram.Run(ctx, func() string {
+		return recordedNodeConfigFile(defaults.StatePath, defaults.NodeServiceName, defaults.NodeBinaryPath)
+	})
+	go telegram.RunUpdateNotifications(ctx, defaults.StatePath, version)
 	go devAutoController.Run(ctx)
 	go releasesAutoController.Run(ctx)
 
@@ -813,6 +831,18 @@ func hasRecordedNode(statePath, binaryPath string) bool {
 	}
 	st, err := os.Stat(state.ConfigPath)
 	return err == nil && st.IsDir()
+}
+
+func recordedNodeConfigFile(statePath, serviceUnit, binaryPath string) string {
+	state, err := config.LoadState(statePath)
+	if err != nil || state == nil || state.ServiceUnit != serviceUnit || state.BinaryPath != binaryPath ||
+		!filepath.IsAbs(state.ConfigPath) {
+		return ""
+	}
+	if info, err := os.Stat(binaryPath); err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	return filepath.Join(state.ConfigPath, "config.yml")
 }
 
 func ensureNodeLaunchdFileLimit(defaults config.Config) (bool, error) {

@@ -10,14 +10,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func inspectOpenDirectory(ctx context.Context, dir *os.File, cleanPath string) (Usage, Code) {
+func inspectOpenPath(ctx context.Context, dir *os.File, cleanPath string, file bool) (Usage, Code) {
 	var before unix.Statfs_t
 	if err := unix.Fstatfs(int(dir.Fd()), &before); err != nil {
 		return Usage{}, UnsupportedFilesystem
 	}
 	mountpoint := unix.ByteSliceToString(before.Mntonname[:])
 	filesystemType := strings.ToLower(unix.ByteSliceToString(before.Fstypename[:]))
-	if !darwinAllowedMount(cleanPath, mountpoint, filesystemType, before.Flags) {
+	checkPath := cleanPath
+	if file && mountpoint == "/System/Volumes/Data" {
+		checkPath = "/"
+	}
+	if !darwinAllowedMount(checkPath, mountpoint, filesystemType, before.Flags) {
 		return Usage{}, UnsupportedFilesystem
 	}
 	mounts, ok := currentDarwinMounts()
@@ -35,7 +39,7 @@ func inspectOpenDirectory(ctx context.Context, dir *os.File, cleanPath string) (
 	if !ok || !darwinMountPresent(mounts, after) {
 		return Usage{}, MountChanged
 	}
-	if mountpoint == "/System/Volumes/Data" {
+	if mountpoint == "/System/Volumes/Data" && !file {
 		root, err := os.Open("/")
 		if err != nil {
 			return Usage{}, MountChanged
@@ -46,6 +50,9 @@ func inspectOpenDirectory(ctx context.Context, dir *os.File, cleanPath string) (
 		}
 		mountpoint = "/"
 		filesystemType = strings.ToLower(unix.ByteSliceToString(after.Fstypename[:]))
+	}
+	if mountpoint == "/System/Volumes/Data" {
+		mountpoint = "/"
 	}
 	return usageFromBlocks(mountpoint, filesystemType, after.Blocks, after.Bfree, after.Bavail, uint64(after.Bsize))
 }

@@ -17,8 +17,9 @@ type nodeCommandStatusRelay struct {
 
 func (r *nodeCommandStatusRelay) emit(status actions.Status) {
 	releasesUpdate := status.Action == "automatic_update" && status.ActionDetail == nodemanifest.SourceReleases
+	telegramCommand := status.Action == "set_telegram_notifications" || status.Action == "test_telegram_notification"
 	if status.ID == "" || (status.Action != "switch_node_source" && status.Action != "update_node" &&
-		status.Action != "set_releases_node_auto_update" && !releasesUpdate) {
+		status.Action != "set_releases_node_auto_update" && !releasesUpdate && !telegramCommand) {
 		_ = r.send(status)
 		return
 	}

@@ -41,6 +41,7 @@ type ServiceProbe interface {
 // while a browser is actively streaming, and per IdleTick otherwise.
 type Collector struct {
 	Sender   Sender
+	Observe  func(map[string]interface{})
 	Tick     time.Duration
 	IdleTick time.Duration
 	Started  time.Time
@@ -198,6 +199,9 @@ func (c *Collector) ensureModeChLocked() chan struct{} {
 
 func (c *Collector) tick() {
 	frame := c.sample()
+	if c.Observe != nil {
+		c.Observe(frame)
+	}
 	if c.Sender != nil {
 		_ = c.Sender.Send(frame)
 	}

@@ -288,7 +288,7 @@ func DownloadFile(url, dst string) error {
 	if url == "" {
 		return fmt.Errorf("missing url")
 	}
-	client := download.NewClient(5 * time.Minute)
+	client := download.NewClient(20 * time.Minute)
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
